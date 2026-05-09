@@ -30,6 +30,11 @@ anyhow.workspace = true
 thiserror.workspace = true
 derive_more.workspace = true
 
+# s3-backend (optional)
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"], optional = true }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"], optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
+
 [dev-dependencies]
 rand = { workspace = true, features = ["small_rng"] }
 tempfile.workspace = true
@@ -37,3 +42,8 @@ tempfile.workspace = true
 [features]
 default = []
 test-utils = []
+s3-backend = [
+    "dep:aws-config",
+    "dep:aws-sdk-s3",
+    "dep:tokio",
+]

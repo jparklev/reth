@@ -35,6 +35,11 @@ mod backend;
 pub use backend::RemoteJarBackend;
 use backend::{Backend, MmapBackend};
 
+#[cfg(feature = "s3-backend")]
+pub mod s3_backend;
+#[cfg(feature = "s3-backend")]
+pub use s3_backend::{S3JarBackend, S3JarLocator};
+
 /// empty enum for backwards compatibility
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
