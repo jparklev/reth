@@ -15,11 +15,13 @@
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     error::Error as StdError,
     fs::File,
     io::{self, Read, Write},
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tracing::*;
 
@@ -28,6 +30,10 @@ pub mod compression;
 #[cfg(test)]
 use compression::Compression;
 use compression::Compressors;
+
+mod backend;
+pub use backend::RemoteJarBackend;
+use backend::{Backend, MmapBackend};
 
 /// empty enum for backwards compatibility
 #[derive(Debug, Serialize, Deserialize)]
@@ -336,26 +342,21 @@ impl<H: NippyJarHeader> NippyJar<H> {
     }
 }
 
-/// Manages the reading of static file data using memory-mapped files.
+/// Manages the reading of static file data and offsets.
 ///
-/// Holds file and mmap descriptors of the data and offsets files of a `static_file`.
+/// The bytes are served by a pluggable [`Backend`] — local memory-mapped files in the
+/// default case, or a [`RemoteJarBackend`] (e.g. S3 range reads) when constructed via
+/// [`DataReader::new_remote`].
 #[derive(Debug)]
 pub struct DataReader {
-    /// Data file descriptor. Needs to be kept alive as long as `data_mmap` handle.
-    #[expect(dead_code)]
-    data_file: File,
-    /// Mmap handle for data.
-    data_mmap: Mmap,
-    /// Offset file descriptor. Needs to be kept alive as long as `offset_mmap` handle.
-    offset_file: File,
-    /// Mmap handle for offsets.
-    offset_mmap: Mmap,
+    backend: Backend,
     /// Number of bytes that represent one offset.
     offset_size: u8,
 }
 
 impl DataReader {
-    /// Reads the respective data and offsets file and returns [`DataReader`].
+    /// Reads the data and offsets files at `path` (with extension `.off` for offsets) into
+    /// memory-mapped buffers.
     pub fn new(path: impl AsRef<Path>) -> Result<Self, NippyJarError> {
         let data_file = File::open(path.as_ref())?;
         // SAFETY: File is read-only and its descriptor is kept alive as long as the mmap handle.
@@ -365,17 +366,29 @@ impl DataReader {
         // SAFETY: File is read-only and its descriptor is kept alive as long as the mmap handle.
         let offset_mmap = unsafe { Mmap::map(&offset_file)? };
 
-        // First byte is the size of one offset in bytes
-        let offset_size = offset_mmap[0];
+        let backend = Backend::Mmap(MmapBackend { data_file, data_mmap, offset_file, offset_mmap });
+        Self::from_backend(backend)
+    }
 
-        // Ensure that the size of an offset is at most 8 bytes.
+    /// Constructs a [`DataReader`] backed by a [`RemoteJarBackend`].
+    pub fn new_remote(remote: Arc<dyn RemoteJarBackend>) -> Result<Self, NippyJarError> {
+        Self::from_backend(Backend::Remote(remote))
+    }
+
+    fn from_backend(backend: Backend) -> Result<Self, NippyJarError> {
+        // First byte of the offsets file is the size of one offset in bytes.
+        if backend.offsets_len() == 0 {
+            return Err(NippyJarError::OffsetSizeTooSmall { offset_size: 0 })
+        }
+        let offset_size = backend.offset_bytes(0..1)?[0];
+
         if offset_size > 8 {
             return Err(NippyJarError::OffsetSizeTooBig { offset_size })
         } else if offset_size == 0 {
             return Err(NippyJarError::OffsetSizeTooSmall { offset_size })
         }
 
-        Ok(Self { data_file, data_mmap, offset_file, offset_size, offset_mmap })
+        Ok(Self { backend, offset_size })
     }
 
     /// Returns the offset for the requested data index
@@ -388,7 +401,7 @@ impl DataReader {
 
     /// Returns the offset for the requested data index starting from the end
     pub fn reverse_offset(&self, index: usize) -> Result<u64, NippyJarError> {
-        let offsets_file_size = self.offset_file.metadata()?.len() as usize;
+        let offsets_file_size = self.backend.offsets_len();
 
         if offsets_file_size > 1 {
             let from = offsets_file_size - self.offset_size as usize * (index + 1);
@@ -402,8 +415,7 @@ impl DataReader {
     /// Returns total number of offsets in the file.
     /// The size of one offset is determined by the file itself.
     pub fn offsets_count(&self) -> Result<usize, NippyJarError> {
-        Ok((self.offset_file.metadata()?.len().saturating_sub(1) / self.offset_size as u64)
-            as usize)
+        Ok(self.backend.offsets_len().saturating_sub(1) / self.offset_size as usize)
     }
 
     /// Reads one offset-sized (determined by the offset file) u64 at the provided index.
@@ -411,11 +423,12 @@ impl DataReader {
         let mut buffer: [u8; 8] = [0; 8];
 
         let offset_end = index.saturating_add(self.offset_size as usize);
-        if offset_end > self.offset_mmap.len() {
+        if offset_end > self.backend.offsets_len() {
             return Err(NippyJarError::OffsetOutOfBounds { index })
         }
 
-        buffer[..self.offset_size as usize].copy_from_slice(&self.offset_mmap[index..offset_end]);
+        let bytes = self.backend.offset_bytes(index..offset_end)?;
+        buffer[..self.offset_size as usize].copy_from_slice(&bytes);
         Ok(u64::from_le_bytes(buffer))
     }
 
@@ -424,19 +437,22 @@ impl DataReader {
         self.offset_size
     }
 
-    /// Returns the underlying data as a slice of bytes for the provided range.
-    pub fn data(&self, range: Range<usize>) -> &[u8] {
-        &self.data_mmap[range]
+    /// Returns the underlying data for the provided range.
+    ///
+    /// For the local-mmap backend this borrows directly from the mmap (zero-copy).
+    /// For a remote backend the bytes are owned (issued range read).
+    pub fn data(&self, range: Range<usize>) -> Result<Cow<'_, [u8]>, NippyJarError> {
+        self.backend.data_bytes(range)
     }
 
     /// Returns total size of data file.
     pub fn size(&self) -> usize {
-        self.data_mmap.len()
+        self.backend.data_len()
     }
 
     /// Returns total size of offsets file.
     pub fn offsets_size(&self) -> usize {
-        self.offset_mmap.len()
+        self.backend.offsets_len()
     }
 }
 

@@ -92,14 +92,7 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
 
         self.row += 1;
 
-        Ok(Some(
-            row.into_iter()
-                .map(|v| match v {
-                    ValueRange::Mmap(range) => self.reader.data(range),
-                    ValueRange::Internal(range) => &self.internal_buffer[range],
-                })
-                .collect(),
-        ))
+        Ok(Some(row.into_iter().map(|range| &self.internal_buffer[range]).collect()))
     }
 
     /// Returns a row by its number by using a `mask` to only read certain columns from the row.
@@ -133,21 +126,18 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
         }
         self.row += 1;
 
-        Ok(Some(
-            row.into_iter()
-                .map(|v| match v {
-                    ValueRange::Mmap(range) => self.reader.data(range),
-                    ValueRange::Internal(range) => &self.internal_buffer[range],
-                })
-                .collect(),
-        ))
+        Ok(Some(row.into_iter().map(|range| &self.internal_buffer[range]).collect()))
     }
 
     /// Takes the column index and reads the range value for the corresponding column.
+    ///
+    /// All bytes (compressed or uncompressed) are placed into `internal_buffer`; the caller
+    /// receives the byte range within that buffer. Uniform handling lets the cursor stay
+    /// generic over the [`crate::DataReader`] backend (mmap or remote).
     fn read_value(
         &mut self,
         column: usize,
-        row: &mut Vec<ValueRange>,
+        row: &mut Vec<Range<usize>>,
     ) -> Result<(), NippyJarError> {
         // Find out the offset of the column value
         let offset_pos = self.row as usize * self.jar.columns + column;
@@ -161,8 +151,9 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
             value_offset..next_value_offset
         };
 
+        let bytes = self.reader.data(column_offset_range)?;
+        let from = self.internal_buffer.len();
         if let Some(compression) = self.jar.compressor() {
-            let from = self.internal_buffer.len();
             match compression {
                 Compressors::Zstd(z) if z.use_dict => {
                     // If we are here, then for sure we have the necessary dictionaries and they're
@@ -174,34 +165,23 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
                         .expect("dictionary to be loaded");
                     let mut decompressor = Decompressor::with_prepared_dictionary(dictionaries)?;
                     Zstd::decompress_with_dictionary(
-                        self.reader.data(column_offset_range),
+                        &bytes,
                         &mut self.internal_buffer,
                         &mut decompressor,
                     )?;
                 }
                 _ => {
                     // Uses the chosen default decompressor
-                    compression.decompress_to(
-                        self.reader.data(column_offset_range),
-                        &mut self.internal_buffer,
-                    )?;
+                    compression.decompress_to(&bytes, &mut self.internal_buffer)?;
                 }
             }
-            let to = self.internal_buffer.len();
-
-            row.push(ValueRange::Internal(from..to));
         } else {
-            // Not compressed
-            row.push(ValueRange::Mmap(column_offset_range));
+            // Not compressed — copy raw bytes from the backend into the buffer.
+            self.internal_buffer.extend_from_slice(&bytes);
         }
+        let to = self.internal_buffer.len();
 
+        row.push(from..to);
         Ok(())
     }
-}
-
-/// Helper type that stores the range of the decompressed column value either on a `mmap` slice or
-/// on the internal buffer.
-enum ValueRange {
-    Mmap(Range<usize>),
-    Internal(Range<usize>),
 }
