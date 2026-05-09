@@ -466,7 +466,7 @@ mod tests {
     use super::*;
     use compression::Compression;
     use rand::{rngs::SmallRng, seq::SliceRandom, RngCore, SeedableRng};
-    use std::{fs::OpenOptions, io::Read};
+    use std::{fs::OpenOptions, io::Read, ops::Range, sync::Arc};
 
     type ColumnResults<T> = Vec<ColumnResult<T>>;
     type ColumnValues = Vec<Vec<u8>>;
@@ -492,6 +492,41 @@ mod tests {
 
     fn clone_with_result(col: &ColumnValues) -> ColumnResults<Vec<u8>> {
         col.iter().map(|v| Ok(v.clone())).collect()
+    }
+
+    #[derive(Debug)]
+    struct InMemoryRemoteJarBackend {
+        data: Vec<u8>,
+        offsets: Vec<u8>,
+    }
+
+    impl RemoteJarBackend for InMemoryRemoteJarBackend {
+        fn read_offsets(&self, range: Range<usize>) -> Result<Vec<u8>, NippyJarError> {
+            if (range.start > range.end) || (range.end > self.offsets.len()) {
+                return Err(NippyJarError::OffsetOutOfBounds { index: range.end })
+            }
+            Ok(self.offsets[range].to_vec())
+        }
+
+        fn read_data(&self, range: Range<usize>) -> Result<Vec<u8>, NippyJarError> {
+            if (range.start > range.end) || (range.end > self.data.len()) {
+                return Err(NippyJarError::Custom(format!(
+                    "invalid data range {}..{} (size={})",
+                    range.start,
+                    range.end,
+                    self.data.len()
+                )))
+            }
+            Ok(self.data[range].to_vec())
+        }
+
+        fn data_size(&self) -> usize {
+            self.data.len()
+        }
+
+        fn offsets_size(&self) -> usize {
+            self.offsets.len()
+        }
     }
 
     #[test]
@@ -811,6 +846,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_remote_reader_matches_mmap_for_empty_values() {
+        let col1 = vec![b"first".to_vec(), Vec::new(), b"third".to_vec()];
+        let col2 = vec![Vec::new(), b"middle".to_vec(), Vec::new()];
+        let file_path = tempfile::NamedTempFile::new().unwrap();
+
+        NippyJar::new_without_header(2, file_path.path())
+            .freeze(vec![clone_with_result(&col1), clone_with_result(&col2)], col1.len() as u64)
+            .unwrap();
+
+        let loaded_nippy = NippyJar::load_without_header(file_path.path()).unwrap();
+        let remote = InMemoryRemoteJarBackend {
+            data: std::fs::read(file_path.path()).unwrap(),
+            offsets: std::fs::read(loaded_nippy.offsets_path()).unwrap(),
+        };
+        let reader = Arc::new(DataReader::new_remote(Arc::new(remote)).unwrap());
+        let mut cursor = NippyJarCursor::with_reader(&loaded_nippy, reader).unwrap();
+
+        let first = cursor.row_by_number(0).unwrap().unwrap();
+        assert_eq!(first, vec![col1[0].as_slice(), col2[0].as_slice()]);
+
+        let second = cursor.row_by_number(1).unwrap().unwrap();
+        assert_eq!(second, vec![col1[1].as_slice(), col2[1].as_slice()]);
+
+        let third = cursor.row_by_number(2).unwrap().unwrap();
+        assert_eq!(third, vec![col1[2].as_slice(), col2[2].as_slice()]);
     }
 
     #[test]

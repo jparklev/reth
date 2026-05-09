@@ -141,11 +141,16 @@ impl RemoteJarBackend for S3JarBackend {
     }
 
     fn read_data(&self, range: Range<usize>) -> Result<Vec<u8>, NippyJarError> {
-        if range.is_empty() || range.end > self.data_size {
+        let start = range.start;
+        let end = range.end;
+        if start > end || end > self.data_size {
             return Err(NippyJarError::Custom(format!(
                 "invalid data range {}..{} (size={})",
-                range.start, range.end, self.data_size
+                start, end, self.data_size
             )));
+        }
+        if range.is_empty() {
+            return Ok(Vec::new())
         }
         let range_header = format!("bytes={}-{}", range.start, range.end - 1);
         let bucket = self.bucket.clone();

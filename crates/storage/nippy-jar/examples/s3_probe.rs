@@ -135,13 +135,13 @@ impl SimpleRng {
     fn new(seed: u64) -> Self {
         Self(seed.max(1))
     }
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
         self.0
     }
-    fn next_in(&mut self, max: u64) -> u64 {
+    const fn next_in(&mut self, max: u64) -> u64 {
         if max == 0 {
             0
         } else {
