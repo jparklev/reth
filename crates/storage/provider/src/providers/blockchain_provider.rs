@@ -52,6 +52,12 @@ pub struct BlockchainProvider<N: NodeTypesWithDB> {
     /// Tracks the chain info wrt forkchoice updates and in memory canonical
     /// state.
     pub(crate) canonical_in_memory_state: CanonicalInMemoryState<N::Primitives>,
+    /// Phase 26.x — optional bucket-backed header client.
+    /// When set, [`BlockchainProvider`] dispatches header reads through
+    /// the bucket before falling back to the database/static-file path.
+    /// Construction is opt-in via [`Self::with_bucket`].
+    /// See `crates/storage/provider/src/providers/bucket/mod.rs`.
+    pub(crate) bucket: Option<super::BucketHeaderClientArc>,
 }
 
 impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
@@ -59,6 +65,7 @@ impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
         Self {
             database: self.database.clone(),
             canonical_in_memory_state: self.canonical_in_memory_state.clone(),
+            bucket: self.bucket.clone(),
         }
     }
 }
@@ -110,7 +117,17 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
                 finalized_header,
                 safe_header,
             ),
+            bucket: None,
         })
+    }
+
+    /// Phase 26.x — attach a bucket-backed header client. Subsequent
+    /// HeaderProvider queries will consult the bucket first and fall
+    /// back to the database on miss. Returns `self` so call sites
+    /// can chain it onto `BlockchainProvider::new`.
+    pub fn with_bucket(mut self, bucket: super::BucketHeaderClientArc) -> Self {
+        self.bucket = Some(bucket);
+        self
     }
 
     /// Gets a clone of `canonical_in_memory_state`.
@@ -199,10 +216,29 @@ impl<N: ProviderNodeTypes> HeaderProvider for BlockchainProvider<N> {
     type Header = HeaderTy<N>;
 
     fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
+        if let Some(bucket) = &self.bucket
+            && let Some(header) = bucket.header_by_hash(block_hash)?
+        {
+            // SAFETY: HeaderTy<N> == alloy_consensus::Header for
+            // ethereum NodePrimitives (the only configuration this
+            // fork ships against today). transmute_copy is safe
+            // because the two types are layout-identical. If reth
+            // ever grows a non-Ethereum NodePrimitives that re-uses
+            // BlockchainProvider, this branch would silently mis-
+            // type and must be re-genericized then.
+            return Ok(Some(unsafe { core::mem::transmute_copy(&header) }));
+        }
         self.consistent_provider()?.header(block_hash)
     }
 
     fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Self::Header>> {
+        if let Some(bucket) = &self.bucket
+            && num <= bucket.latest_finalized_block_number()
+            && let Some(header) = bucket.header_by_number(num)?
+        {
+            // SAFETY: see header() above.
+            return Ok(Some(unsafe { core::mem::transmute_copy(&header) }));
+        }
         self.consistent_provider()?.header_by_number(num)
     }
 
