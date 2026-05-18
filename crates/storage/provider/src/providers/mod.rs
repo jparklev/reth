@@ -29,6 +29,10 @@ pub use consistent_view::{ConsistentDbView, ConsistentViewError};
 mod blockchain_provider;
 pub use blockchain_provider::BlockchainProvider;
 
+
+mod bucket;
+pub use bucket::{BucketHeaderClient, BucketHeaderClientArc};
+
 mod consistent;
 pub use consistent::ConsistentProvider;
 
