@@ -28,7 +28,7 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Instant};
 
 use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{keccak256, Address, B256, U256};
 use chrono::SecondsFormat;
 use clap::Parser;
 use ed25519_dalek::Signer;
@@ -44,8 +44,8 @@ use reth_db_api::{
 };
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_provider::{
-    BlockNumReader, DatabaseProviderFactory, HeaderProvider, ProviderFactory,
-    providers::ProviderNodeTypes,
+    providers::ProviderNodeTypes, BlockNumReader, DatabaseProviderFactory, HeaderProvider,
+    ProviderFactory,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -115,6 +115,13 @@ struct Cli {
     /// new entry.
     #[arg(long)]
     update_index: bool,
+
+    /// Skip the MDBX walk entirely. Reads an already-emitted
+    /// `manifest.json` from `--out-dir` and only performs the
+    /// upload step. Useful for retrying an upload without paying
+    /// the ~30-min full-state walk cost.
+    #[arg(long)]
+    skip_walk: bool,
 }
 
 fn main() -> eyre::Result<()> {
@@ -146,9 +153,31 @@ fn main() -> eyre::Result<()> {
 async fn async_main(cli: Cli, task_runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     tokio::fs::create_dir_all(&cli.out_dir).await?;
 
-    let env: Environment<_> = cli
-        .env
-        .init::<reth_node_ethereum::node::EthereumNode>(AccessRights::RO, task_runtime)?;
+    // --skip-walk: short-circuit straight to upload. Useful for
+    // retrying an upload without paying the ~30-min walk again.
+    if cli.skip_walk {
+        let manifest_path = cli.out_dir.join("manifest.json");
+        let bytes = tokio::fs::read(&manifest_path)
+            .await
+            .with_context(|| format!("read {} for --skip-walk", manifest_path.display()))?;
+        let manifest: FinalizedStateArtifactManifest =
+            serde_json::from_slice(&bytes).context("parse manifest.json")?;
+        info!(
+            block_number = manifest.block_number,
+            shards = manifest.shards.len(),
+            "loaded existing manifest for --skip-walk upload"
+        );
+        if let Some(bucket) = &cli.upload_bucket {
+            run_upload(&cli, &manifest, bucket.clone()).await?;
+        } else {
+            return Err(eyre!("--skip-walk requires --upload-bucket"));
+        }
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
+        return Ok(());
+    }
+
+    let env: Environment<_> =
+        cli.env.init::<reth_node_ethereum::node::EthereumNode>(AccessRights::RO, task_runtime)?;
     let factory = env.provider_factory.clone();
 
     let provider = factory.database_provider_ro()?;
@@ -185,30 +214,7 @@ async fn async_main(cli: Cli, task_runtime: reth_tasks::Runtime) -> eyre::Result
     tokio::fs::write(cli.out_dir.join("manifest.json"), &manifest_bytes).await?;
 
     if let Some(bucket) = &cli.upload_bucket {
-        let writer_key = cli
-            .writer_key
-            .clone()
-            .ok_or_else(|| eyre!("--writer-key required with --upload-bucket"))?;
-        let endpoint = cli
-            .upload_endpoint
-            .clone()
-            .ok_or_else(|| eyre!("--upload-endpoint required with --upload-bucket"))?;
-        upload(
-            &cli,
-            &manifest,
-            UploadParams {
-                bucket: bucket.clone(),
-                endpoint,
-                region: cli.upload_region.clone(),
-                access_key_env: cli.upload_access_key_env.clone(),
-                secret_key_env: cli.upload_secret_key_env.clone(),
-                writer_key,
-                writer_id: cli.writer_id.clone(),
-                prefix: cli.checkpoint_prefix.clone(),
-                update_index: cli.update_index,
-            },
-        )
-        .await?;
+        run_upload(&cli, &manifest, bucket.clone()).await?;
     }
 
     println!("{}", serde_json::to_string_pretty(&manifest)?);
@@ -699,6 +705,37 @@ fn emit_to_ref(
 }
 
 // ======================== upload ========================
+
+async fn run_upload(
+    cli: &Cli,
+    manifest: &FinalizedStateArtifactManifest,
+    bucket: String,
+) -> eyre::Result<()> {
+    let writer_key = cli
+        .writer_key
+        .clone()
+        .ok_or_else(|| eyre!("--writer-key required with --upload-bucket"))?;
+    let endpoint = cli
+        .upload_endpoint
+        .clone()
+        .ok_or_else(|| eyre!("--upload-endpoint required with --upload-bucket"))?;
+    upload(
+        cli,
+        manifest,
+        UploadParams {
+            bucket,
+            endpoint,
+            region: cli.upload_region.clone(),
+            access_key_env: cli.upload_access_key_env.clone(),
+            secret_key_env: cli.upload_secret_key_env.clone(),
+            writer_key,
+            writer_id: cli.writer_id.clone(),
+            prefix: cli.checkpoint_prefix.clone(),
+            update_index: cli.update_index,
+        },
+    )
+    .await
+}
 
 struct UploadParams {
     bucket: String,
