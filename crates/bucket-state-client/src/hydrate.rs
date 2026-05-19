@@ -87,35 +87,48 @@ pub(crate) async fn materialize_shard(
 ) -> Result<MaterializedShardCounts, BucketStateClientError> {
     let mut counts = MaterializedShardCounts::default();
 
-    let rows_a = vortex_state::decode_accounts_chunk(accounts_bytes).await?;
-    for row in rows_a {
-        let account =
-            Account { nonce: row.nonce, balance: row.balance, bytecode_hash: Some(row.code_hash) };
-        if account_cache.get(&row.hashed_address).is_none() {
-            if is_account_tombstone(&account) {
-                account_cache.insert(row.hashed_address, None);
-            } else {
-                account_cache.insert(row.hashed_address, Some(account));
+    // Empty shard files mean "this family has no rows in this shard."
+    // The checkpointer emits a 0-byte placeholder so per-shard refs
+    // stay schema-consistent. Skip Vortex decode for empties; trying
+    // to parse a 0-byte buffer errors with "Invalid range".
+    if !accounts_bytes.is_empty() {
+        let rows_a = vortex_state::decode_accounts_chunk(accounts_bytes).await?;
+        for row in rows_a {
+            let account = Account {
+                nonce: row.nonce,
+                balance: row.balance,
+                bytecode_hash: Some(row.code_hash),
+            };
+            if account_cache.get(&row.hashed_address).is_none() {
+                if is_account_tombstone(&account) {
+                    account_cache.insert(row.hashed_address, None);
+                } else {
+                    account_cache.insert(row.hashed_address, Some(account));
+                }
             }
+            counts.accounts += 1;
         }
-        counts.accounts += 1;
     }
 
-    let rows_s = vortex_state::decode_storage_chunk(storage_bytes).await?;
-    for row in rows_s {
-        let key = (row.hashed_address, row.hashed_slot);
-        if storage_cache.get(&key).is_none() {
-            storage_cache.insert(key, Some(row.value));
+    if !storage_bytes.is_empty() {
+        let rows_s = vortex_state::decode_storage_chunk(storage_bytes).await?;
+        for row in rows_s {
+            let key = (row.hashed_address, row.hashed_slot);
+            if storage_cache.get(&key).is_none() {
+                storage_cache.insert(key, Some(row.value));
+            }
+            counts.storage += 1;
         }
-        counts.storage += 1;
     }
 
-    let rows_c = vortex_state::decode_code_chunk(code_bytes).await?;
-    for row in rows_c {
-        if code_cache.get(&row.code_hash).is_none() {
-            code_cache.insert(row.code_hash, Some(row.code));
+    if !code_bytes.is_empty() {
+        let rows_c = vortex_state::decode_code_chunk(code_bytes).await?;
+        for row in rows_c {
+            if code_cache.get(&row.code_hash).is_none() {
+                code_cache.insert(row.code_hash, Some(row.code));
+            }
+            counts.code += 1;
         }
-        counts.code += 1;
     }
 
     Ok(counts)
@@ -195,7 +208,10 @@ pub(crate) async fn apply_epoch_deltas(
             // — we still insert so callers see Some(0) rather than fall
             // through (avoids returning the MDBX/static-file's older
             // pre-clear value).
-            storage_cache.insert((keccak256(row.address), keccak256(row.slot.to_be_bytes::<32>())), Some(row.value));
+            storage_cache.insert(
+                (keccak256(row.address), keccak256(row.slot.to_be_bytes::<32>())),
+                Some(row.value),
+            );
             stats.storage_rows += 1;
             if row.block_num > applied {
                 applied = row.block_num;

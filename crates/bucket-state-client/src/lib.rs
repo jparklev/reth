@@ -499,7 +499,8 @@ impl HttpBucketStateClient {
                     // historical-block state queries for those blocks
                     // (conservative: fall through to MDBX).
                     if pinned_block == head_block {
-                        pinned_block_hash = parse_block_hash(&head.latest_finalized_block_hash).ok();
+                        pinned_block_hash =
+                            parse_block_hash(&head.latest_finalized_block_hash).ok();
                     } else {
                         pinned_block_hash = None;
                     }
@@ -776,8 +777,9 @@ impl BucketStateClient for HttpBucketStateClient {
 /// the manifest's String fields into the typed gate.
 fn parse_block_hash(s: &str) -> Result<BlockHash, BucketStateClientError> {
     let trimmed = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(trimmed)
-        .map_err(|err| BucketStateClientError::Decode(format!("invalid hex for block hash {s:?}: {err}")))?;
+    let bytes = hex::decode(trimmed).map_err(|err| {
+        BucketStateClientError::Decode(format!("invalid hex for block hash {s:?}: {err}"))
+    })?;
     if bytes.len() != 32 {
         return Err(BucketStateClientError::Decode(format!(
             "block hash must be 32 bytes, got {} in {s:?}",
@@ -1257,11 +1259,9 @@ mod tests {
     #[test]
     fn pinned_block_hash_matches_manifest_for_fresh_checkpoint() {
         let tempdir = tempfile::tempdir().unwrap();
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(object_store::memory::InMemory::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let hash = BlockHash::from([0x42u8; 32]);
-        let mut manifest =
-            checkpoint_manifest(4, vec![empty_shard_manifest(0)]);
+        let mut manifest = checkpoint_manifest(4, vec![empty_shard_manifest(0)]);
         manifest.block_hash = format!("0x{}", hex::encode(hash.as_slice()));
         let client = test_client(store, manifest, tempdir.path().to_path_buf());
 
