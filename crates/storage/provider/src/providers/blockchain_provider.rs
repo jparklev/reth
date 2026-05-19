@@ -163,19 +163,33 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
     /// `BlockId::Latest` to a concrete block hash before fetching
     /// state — still sees the bucket overlay.
     ///
-    /// `_hint_block_hash` is currently unused but reserved for a
-    /// future tightening that gates the wrap on
-    /// `hash == bucket.pinned_block_hash()` to avoid serving
-    /// stale bucket data for historical state queries.
+    /// `hint_block_hash` gates the wrap so historical state queries
+    /// (block != pinned) bypass the bucket and go straight to MDBX.
+    /// Without this gate, `eth_getBalance(addr, block=N)` for `N` !=
+    /// pinned_block returns the pinned-block balance, which is wrong.
+    ///
+    /// `None` means "caller didn't know which block this is for"
+    /// (`latest()` path resolves to pinned naturally) — we wrap
+    /// unconditionally in that case to preserve the eth_call latest
+    /// dispatch flow.
+    ///
+    /// If the bucket client doesn't expose `pinned_block_hash()`
+    /// (default trait impl returns `None`), we also wrap
+    /// unconditionally — matches pre-gate behavior.
     fn maybe_wrap_with_bucket(
         &self,
         inner: StateProviderBox,
-        _hint_block_hash: Option<BlockHash>,
+        hint_block_hash: Option<BlockHash>,
     ) -> StateProviderBox {
-        if let Some(state_bucket) = &self.state_bucket {
-            return Box::new(super::bucket::BucketStateProvider::new(state_bucket.clone(), inner))
+        let Some(state_bucket) = &self.state_bucket else { return inner };
+        if let (Some(hint), Some(pinned)) = (hint_block_hash, state_bucket.pinned_block_hash())
+            && hint != pinned
+        {
+            // Historical-block query against a different block than
+            // the bucket is pinned to. Bypass bucket; serve from MDBX.
+            return inner;
         }
-        inner
+        Box::new(super::bucket::BucketStateProvider::new(state_bucket.clone(), inner))
     }
 
     /// Phase 26.x item 4 — return logs in the inclusive

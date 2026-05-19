@@ -261,6 +261,12 @@ pub struct HttpBucketStateClient {
     /// Pinned block number = last block whose plain state is fully
     /// materialized in our caches. Always ≤ `head.latest_finalized_block_num`.
     pinned_block: BlockNumber,
+    /// Block hash matching `pinned_block`. Used by `BlockchainProvider`'s
+    /// `maybe_wrap_with_bucket` gate so historical-block queries don't
+    /// accidentally get pinned-block answers. `None` if we couldn't
+    /// derive a hash for `pinned_block` (intermediate epoch advance
+    /// without an authoritative hash).
+    pinned_block_hash: Option<BlockHash>,
     store: Arc<dyn ObjectStore>,
     manifest_dir: String,
     shard_bits: u8,
@@ -463,6 +469,8 @@ impl HttpBucketStateClient {
         );
 
         let mut pinned_block = manifest.block_number;
+        let checkpoint_block_hash = parse_block_hash(&manifest.block_hash).ok();
+        let mut pinned_block_hash = checkpoint_block_hash;
         let mut delta_stats = hydrate::DeltaHydrateStats::default();
 
         // 5. Phase 26.1 epoch-delta replay forward.
@@ -485,6 +493,16 @@ impl HttpBucketStateClient {
                 .await?;
                 if applied > pinned_block {
                     pinned_block = applied;
+                    // Once deltas catch us up to head, adopt the head's
+                    // hash as the pinned hash. Intermediate epoch tips
+                    // get `None` — the bucket then refuses to answer
+                    // historical-block state queries for those blocks
+                    // (conservative: fall through to MDBX).
+                    if pinned_block == head_block {
+                        pinned_block_hash = parse_block_hash(&head.latest_finalized_block_hash).ok();
+                    } else {
+                        pinned_block_hash = None;
+                    }
                 }
             }
             delta_stats.elapsed_ms = delta_t0.elapsed().as_millis() as u64;
@@ -520,6 +538,7 @@ impl HttpBucketStateClient {
         Ok(Self {
             head,
             pinned_block,
+            pinned_block_hash,
             store,
             manifest_dir,
             shard_bits,
@@ -747,6 +766,27 @@ impl BucketStateClient for HttpBucketStateClient {
     fn pinned_block_number(&self) -> BlockNumber {
         self.pinned_block
     }
+
+    fn pinned_block_hash(&self) -> Option<BlockHash> {
+        self.pinned_block_hash
+    }
+}
+
+/// Parse `"0x..."` (or bare hex) into a [`BlockHash`]. Used to lift
+/// the manifest's String fields into the typed gate.
+fn parse_block_hash(s: &str) -> Result<BlockHash, BucketStateClientError> {
+    let trimmed = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(trimmed)
+        .map_err(|err| BucketStateClientError::Decode(format!("invalid hex for block hash {s:?}: {err}")))?;
+    if bytes.len() != 32 {
+        return Err(BucketStateClientError::Decode(format!(
+            "block hash must be 32 bytes, got {} in {s:?}",
+            bytes.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(BlockHash::from(out))
 }
 
 // ============== plumbing helpers ===========================
@@ -1197,6 +1237,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_block_hash_round_trip() {
+        let h = BlockHash::from([0xabu8; 32]);
+        let s = format!("0x{}", hex::encode(h.as_slice()));
+        let parsed = parse_block_hash(&s).expect("parse");
+        assert_eq!(parsed, h);
+
+        // bare hex (no 0x prefix) also accepted
+        let s2 = hex::encode(h.as_slice());
+        let parsed2 = parse_block_hash(&s2).expect("parse no-prefix");
+        assert_eq!(parsed2, h);
+
+        // wrong length rejected
+        assert!(parse_block_hash("0xdead").is_err());
+        // non-hex rejected
+        assert!(parse_block_hash("0xZZ").is_err());
+    }
+
+    #[test]
+    fn pinned_block_hash_matches_manifest_for_fresh_checkpoint() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let hash = BlockHash::from([0x42u8; 32]);
+        let mut manifest =
+            checkpoint_manifest(4, vec![empty_shard_manifest(0)]);
+        manifest.block_hash = format!("0x{}", hex::encode(hash.as_slice()));
+        let client = test_client(store, manifest, tempdir.path().to_path_buf());
+
+        // No deltas applied; pinned hash == checkpoint hash.
+        assert_eq!(client.pinned_block_hash(), Some(hash));
+    }
+
+    #[test]
     fn shard_id_uses_high_order_keccak_prefix_bits() {
         assert_eq!(shard_id(B256::from([0b1010_0000; 32]), 0), 0);
         assert_eq!(shard_id(B256::from([0b1010_0000; 32]), 1), 1);
@@ -1252,6 +1325,7 @@ mod tests {
                 epoch_manifest_sha256: String::new(),
             },
             pinned_block: manifest.block_number,
+            pinned_block_hash: parse_block_hash(&manifest.block_hash).ok(),
             store,
             manifest_dir: "checkpoints/100".into(),
             shard_bits,

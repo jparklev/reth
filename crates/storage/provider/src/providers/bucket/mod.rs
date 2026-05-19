@@ -197,6 +197,20 @@ pub trait BucketStateClient: BucketHeaderClient {
     fn pinned_block_number(&self) -> BlockNumber {
         0
     }
+
+    /// The block hash this state client is pinned to.
+    /// `BlockchainProvider::maybe_wrap_with_bucket` gates the bucket
+    /// overlay on `hint_block_hash == pinned_block_hash`, so historical
+    /// state queries (block != pinned) fall through to MDBX directly
+    /// instead of being answered with the pinned block's state.
+    ///
+    /// Defaults to `None` for trait impls that don't expose their
+    /// pinned hash; in that case the wrap proceeds unconditionally
+    /// (matching pre-gate behavior — useful for tests + the
+    /// `latest()` path that doesn't have a hint yet).
+    fn pinned_block_hash(&self) -> Option<BlockHash> {
+        None
+    }
 }
 
 /// Convenience type alias for the optional bucket state client field
