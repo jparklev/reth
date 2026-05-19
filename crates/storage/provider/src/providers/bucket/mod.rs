@@ -25,7 +25,8 @@
 //! and live in the same module when they ship.
 
 use alloy_consensus::Header;
-use alloy_primitives::{BlockHash, BlockNumber};
+use alloy_primitives::{BlockHash, BlockNumber, TxHash};
+use reth_ethereum_primitives::TransactionSigned;
 use reth_storage_errors::provider::ProviderResult;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -63,6 +64,25 @@ pub trait BucketHeaderClient: Send + Sync + Debug {
     /// coverage (no point asking the bucket first if it's
     /// guaranteed to miss).
     fn latest_finalized_block_number(&self) -> BlockNumber;
+
+    /// Get the transaction for `hash` from the bucket. Returns
+    /// `Ok(None)` if the bucket doesn't cover the tx (e.g. the tx
+    /// lives outside the warm-epochs window) — the dispatch site
+    /// falls through to the database path on `None`.
+    ///
+    /// Default impl returns `Ok(None)` so older trait implementers
+    /// don't have to support it; the production
+    /// `HttpBucketHeaderClient` will override.
+    ///
+    /// Stage: spike (transaction_by_hash is the next item on the
+    /// FULL-VORTEX-RETH-READ-NODE roadmap in
+    /// `jparklev/relay@docs/FULL-VORTEX-RETH-READ-NODE.md`).
+    fn transaction_by_hash(
+        &self,
+        _hash: TxHash,
+    ) -> ProviderResult<Option<TransactionSigned>> {
+        Ok(None)
+    }
 }
 
 /// Convenience type alias used by `BlockchainProvider` when carrying
