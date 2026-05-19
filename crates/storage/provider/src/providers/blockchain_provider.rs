@@ -58,6 +58,11 @@ pub struct BlockchainProvider<N: NodeTypesWithDB> {
     /// Construction is opt-in via [`Self::with_bucket`].
     /// See `crates/storage/provider/src/providers/bucket/mod.rs`.
     pub(crate) bucket: Option<super::BucketHeaderClientArc>,
+    /// Phase 26.x - optional bucket-backed state client.
+    /// When set, BlockchainProvider's latest() / pinned-finalized
+    /// StateProvider lookups consult the bucket's in-memory plain
+    /// state (checkpoint + epoch deltas) before the MDBX path.
+    pub(crate) state_bucket: Option<super::BucketStateClientArc>,
 }
 
 impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
@@ -66,6 +71,7 @@ impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
             database: self.database.clone(),
             canonical_in_memory_state: self.canonical_in_memory_state.clone(),
             bucket: self.bucket.clone(),
+            state_bucket: self.state_bucket.clone(),
         }
     }
 }
@@ -118,6 +124,7 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
                 safe_header,
             ),
             bucket: None,
+            state_bucket: None,
         })
     }
 
@@ -128,6 +135,49 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
     pub fn with_bucket(mut self, bucket: super::BucketHeaderClientArc) -> Self {
         self.bucket = Some(bucket);
         self
+    }
+
+    /// Phase 26.x - attach a bucket-backed state client. Subsequent
+    /// latest() / pinned-finalized StateProvider queries will
+    /// consult the bucket's in-memory plain state (checkpoint + epoch
+    /// deltas) before the MDBX path. Returns self so call sites
+    /// can chain it.
+    pub fn with_state_bucket(mut self, state_bucket: super::BucketStateClientArc) -> Self {
+        self.state_bucket = Some(state_bucket);
+        self
+    }
+
+    /// Phase 26.x item 4 — return logs in the inclusive
+    /// `from_block..=to_block` range from the attached bucket, if any.
+    /// Returns `Ok(None)` when:
+    /// - no bucket is configured;
+    /// - the requested upper bound is beyond the bucket's finalized
+    ///   coverage (the bucket only serves finalized data).
+    ///
+    /// The bucket dispatch decodes signed `logs` chunks (parquet
+    /// or Vortex), probes per-chunk Bloom side-tables (Phase 22
+    /// sprint 3) to skip non-matching chunks, and applies the
+    /// `addresses` + `topics` filter. Results are sorted by
+    /// `(block_number, log_index)` for deterministic output.
+    ///
+    /// Callers (e.g. `EthFilter::get_logs_in_block_range_inner`)
+    /// should treat `Ok(Some(_))` as authoritative for the range and
+    /// skip the receipts-based scan path.
+    pub fn bucket_logs_in_range(
+        &self,
+        from_block: BlockNumber,
+        to_block: BlockNumber,
+        addresses: &[Address],
+        topics: &[Vec<B256>; 4],
+    ) -> ProviderResult<Option<Vec<alloy_rpc_types_eth::Log>>> {
+        let Some(bucket) = &self.bucket else {
+            return Ok(None);
+        };
+        if to_block > bucket.latest_finalized_block_number() {
+            return Ok(None);
+        }
+        let logs = bucket.logs_in_range(from_block, to_block, addresses, topics)?;
+        Ok(Some(logs))
     }
 
     /// Gets a clone of `canonical_in_memory_state`.
@@ -209,6 +259,25 @@ impl<N: ProviderNodeTypes> RocksDBProviderFactory for BlockchainProvider<N> {
     #[cfg(all(unix, feature = "rocksdb"))]
     fn commit_pending_rocksdb_batches(&self) -> ProviderResult<()> {
         unimplemented!("BlockchainProvider wraps ProviderFactory - use DatabaseProvider::commit_pending_rocksdb_batches instead")
+    }
+}
+
+impl<N: ProviderNodeTypes> reth_storage_api::BucketLogsLookup for BlockchainProvider<N> {
+    fn bucket_logs_in_range(
+        &self,
+        filter: &alloy_rpc_types_eth::Filter,
+        from_block: u64,
+        to_block: u64,
+    ) -> ProviderResult<Option<Vec<alloy_rpc_types_eth::Log>>> {
+        // Translate alloy `Filter` (FilterSet over Address + 4 Topics)
+        // into the flat (Vec<Address>, [Vec<B256>; 4]) shape the
+        // BucketHeaderClient takes.
+        let addresses: Vec<Address> = filter.address.iter().copied().collect();
+        let mut topics: [Vec<B256>; 4] = Default::default();
+        for (idx, topic_set) in filter.topics.iter().enumerate().take(4) {
+            topics[idx] = topic_set.iter().copied().collect();
+        }
+        Self::bucket_logs_in_range(self, from_block, to_block, &addresses, &topics)
     }
 }
 
@@ -436,6 +505,24 @@ impl<N: ProviderNodeTypes> TransactionsProvider for BlockchainProvider<N> {
         &self,
         id: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Transaction>>> {
+        if let Some(bucket) = &self.bucket {
+            let num = match id {
+                BlockHashOrNumber::Number(n) => Some(n),
+                BlockHashOrNumber::Hash(h) => bucket
+                    .header_by_hash(h)?
+                    .map(|header| header.number),
+            };
+            if let Some(num) = num
+                && let Some(txs) = bucket.transactions_by_block(num)?
+            {
+                // SAFETY: TxTy<N> == reth_ethereum_primitives::TransactionSigned
+                // for the Ethereum NodePrimitives this fork ships
+                // against; same `transmute_copy` shape used in
+                // `transaction_by_hash` above. Re-genericize the
+                // bucket trait if the fork grows non-Ethereum support.
+                return Ok(Some(unsafe { core::mem::transmute_copy(&txs) }));
+            }
+        }
         self.consistent_provider()?.transactions_by_block(id)
     }
 
@@ -473,6 +560,15 @@ impl<N: ProviderNodeTypes> ReceiptProvider for BlockchainProvider<N> {
     }
 
     fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Receipt>> {
+        if let Some(bucket) = &self.bucket
+            && let Some(receipt) = bucket.receipt_by_hash(hash)?
+        {
+            // SAFETY: ReceiptTy<N> == reth_ethereum_primitives::Receipt
+            // for Ethereum NodePrimitives — the only configuration
+            // this fork ships against today. Same `transmute_copy`
+            // shape used for TxTy in `transaction_by_hash` above.
+            return Ok(Some(unsafe { core::mem::transmute_copy(&receipt) }));
+        }
         self.consistent_provider()?.receipt_by_hash(hash)
     }
 
@@ -480,6 +576,20 @@ impl<N: ProviderNodeTypes> ReceiptProvider for BlockchainProvider<N> {
         &self,
         block: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Receipt>>> {
+        if let Some(bucket) = &self.bucket {
+            let num = match block {
+                BlockHashOrNumber::Number(n) => Some(n),
+                BlockHashOrNumber::Hash(h) => bucket
+                    .header_by_hash(h)?
+                    .map(|header| header.number),
+            };
+            if let Some(num) = num
+                && let Some(receipts) = bucket.receipts_by_block(num)?
+            {
+                // SAFETY: see `receipt_by_hash` above.
+                return Ok(Some(unsafe { core::mem::transmute_copy(&receipts) }));
+            }
+        }
         self.consistent_provider()?.receipts_by_block(block)
     }
 
@@ -560,13 +670,24 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
     fn latest(&self) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", "Getting latest block state provider");
         // use latest state provider if the head state exists
-        if let Some(state) = self.canonical_in_memory_state.head_state() {
+        let inner: StateProviderBox = if let Some(state) = self.canonical_in_memory_state.head_state() {
             trace!(target: "providers::blockchain", "Using head state for latest state provider");
-            Ok(self.block_state_provider(&state)?.boxed())
+            self.block_state_provider(&state)?.boxed()
         } else {
             trace!(target: "providers::blockchain", "Using database state for latest state provider");
-            self.database.latest()
+            self.database.latest()?
+        };
+        // Phase 26.x - bucket-mode state reads. When attached, the
+        // bucket holds in-memory plain state pinned at a finalized
+        // block; we wrap the inner StateProvider so account/storage/
+        // bytecode lookups consult the bucket first.
+        if let Some(state_bucket) = &self.state_bucket {
+            return Ok(Box::new(super::bucket::BucketStateProvider::new(
+                state_bucket.clone(),
+                inner,
+            )));
         }
+        Ok(inner)
     }
 
     /// Returns a [`StateProviderBox`] indexed by the given block number or tag.

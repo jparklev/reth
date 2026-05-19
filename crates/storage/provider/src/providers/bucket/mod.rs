@@ -25,8 +25,10 @@
 //! and live in the same module when they ship.
 
 use alloy_consensus::Header;
-use alloy_primitives::{BlockHash, BlockNumber, TxHash};
-use reth_ethereum_primitives::TransactionSigned;
+use alloy_primitives::{Address, B256, BlockHash, BlockNumber, Bytes, TxHash, U256};
+use alloy_rpc_types_eth::Log;
+use reth_ethereum_primitives::{Receipt, TransactionSigned};
+use reth_primitives_traits::Account;
 use reth_storage_errors::provider::ProviderResult;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -83,11 +85,130 @@ pub trait BucketHeaderClient: Send + Sync + Debug {
     ) -> ProviderResult<Option<TransactionSigned>> {
         Ok(None)
     }
+
+    /// Get the receipt for `tx_hash` from the bucket. `Ok(None)`
+    /// when the bucket doesn't cover the tx — falls through to the
+    /// database path.
+    ///
+    /// Default impl returns `Ok(None)`; the production
+    /// `HttpBucketHeaderClient` overrides with a vortex_receipts +
+    /// vortex_logs decode.
+    fn receipt_by_hash(&self, _tx_hash: TxHash) -> ProviderResult<Option<Receipt>> {
+        Ok(None)
+    }
+
+    /// Get all transactions in a finalized block. `Ok(None)` when
+    /// the block isn't covered — falls through to the database
+    /// path. Returns transactions sorted by `tx_idx`.
+    ///
+    /// Default impl returns `Ok(None)` so partial implementers
+    /// remain valid.
+    fn transactions_by_block(
+        &self,
+        _num: BlockNumber,
+    ) -> ProviderResult<Option<Vec<TransactionSigned>>> {
+        Ok(None)
+    }
+
+    /// Get all receipts in a finalized block. `Ok(None)` when not
+    /// covered — falls through to the database path. Returns
+    /// receipts sorted by `tx_idx`, each populated with its logs
+    /// from the same block's `vortex_logs` chunk.
+    fn receipts_by_block(
+        &self,
+        _num: BlockNumber,
+    ) -> ProviderResult<Option<Vec<Receipt>>> {
+        Ok(None)
+    }
+
+    /// Return all logs in the inclusive block range `from..=to`
+    /// matching the given `addresses` allowlist (empty = any) and
+    /// `topics` slot constraints (`topics[i]` empty = any). The
+    /// bucket implementation is responsible for:
+    /// - identifying the epochs the range spans;
+    /// - probing per-chunk Bloom side-tables (Phase 22 sprint 3) to
+    ///   skip chunks that can't possibly match;
+    /// - pushing the filter down into the chunk decoder where the
+    ///   format supports it (Vortex `with_filter`/`select`);
+    /// - filtering remaining rows by block_num + filter predicate;
+    /// - sorting by `(block_num, log_idx)` for deterministic output.
+    ///
+    /// Default impl returns `Ok(Vec::new())` so older implementers
+    /// don't have to support it — the dispatch site falls back to
+    /// the regular DB path.
+    ///
+    /// Stage: item 4 of the FULL-VORTEX-RETH-READ-NODE roadmap in
+    /// `jparklev/relay@docs/FULL-VORTEX-RETH-READ-NODE.md`.
+    fn logs_in_range(
+        &self,
+        _from_block: BlockNumber,
+        _to_block: BlockNumber,
+        _addresses: &[Address],
+        _topics: &[Vec<B256>; 4],
+    ) -> ProviderResult<Vec<Log>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Convenience type alias used by `BlockchainProvider` when carrying
 /// an optional bucket client.
 pub type BucketHeaderClientArc = Arc<dyn BucketHeaderClient>;
+
+/// Phase 26.x — bucket-backed plain-state reader.
+///
+/// Sibling to [`BucketHeaderClient`]: implementers hydrate the
+/// canonical plain-state at a chosen finalized checkpoint, optionally
+/// fast-forward by replaying signed epoch deltas, and serve point
+/// reads from in-memory HashMaps.
+///
+/// The trait is `BucketHeaderClient`-extending so a single
+/// implementation can advertise both surfaces and `BlockchainProvider`
+/// can fall through cleanly when only the state side is wired.
+///
+/// Methods are sync to fit reth's [`StateProvider`] shape (also sync).
+/// The async hydration happens up front at boot; the lookups are
+/// HashMap reads.
+///
+/// `account_info` returns reth's [`Account`] (no bytecode body) — the
+/// bytecode is fetched separately via `code_by_hash`. The dispatch
+/// wrapper in `BlockchainProvider` glues these into a
+/// [`reth_storage_api::StateProvider`].
+pub trait BucketStateClient: BucketHeaderClient {
+    /// Plain-state account read. Returns `Ok(None)` if the bucket
+    /// doesn't cover the account at the pinned block (callers should
+    /// fall back to MDBX). All-zero / `KECCAK_EMPTY` rows are treated
+    /// as tombstones and surface as `Ok(None)`.
+    fn account(&self, _addr: Address) -> ProviderResult<Option<Account>> {
+        Ok(None)
+    }
+
+    /// Plain-state storage slot read. Returns `Ok(None)` when the
+    /// slot was untouched at the pinned block (callers fall back).
+    /// Zero values for slots that *were* touched are returned as
+    /// `Ok(Some(U256::ZERO))` (the writer-side delta encoder treats
+    /// `value=0` as "cleared", and the reader preserves that).
+    fn storage(&self, _addr: Address, _slot: U256) -> ProviderResult<Option<U256>> {
+        Ok(None)
+    }
+
+    /// Plain-state code read, content-addressed by `code_hash`.
+    /// Returns `Ok(None)` when the bucket doesn't know the blob.
+    fn code_by_hash(&self, _code_hash: B256) -> ProviderResult<Option<Bytes>> {
+        Ok(None)
+    }
+
+    /// The block number this state client is pinned to (= the
+    /// checkpoint's block_number plus all deltas applied forward).
+    /// `BlockchainProvider` uses this as a coverage gate (no point
+    /// asking the bucket for a future block's state).
+    fn pinned_block_number(&self) -> BlockNumber {
+        0
+    }
+}
+
+/// Convenience type alias for the optional bucket state client field
+/// on `BlockchainProvider`.
+pub type BucketStateClientArc = Arc<dyn BucketStateClient>;
 
 #[cfg(test)]
 mod tests {
@@ -141,4 +262,70 @@ mod tests {
         let client = MockClient { latest: 1, header };
         assert_dyn(&client);
     }
+
+    /// `BucketStateClient` must be dyn-compatible too; this catches
+    /// regressions if someone adds a generic method later.
+    #[test]
+    fn bucket_state_client_is_dyn_compatible() {
+        #[derive(Debug)]
+        struct S;
+        impl BucketHeaderClient for S {
+            fn header_by_number(&self, _: BlockNumber) -> ProviderResult<Option<Header>> {
+                Ok(None)
+            }
+            fn latest_finalized_block_number(&self) -> BlockNumber { 0 }
+        }
+        impl BucketStateClient for S {}
+        fn assert_dyn(_x: &dyn BucketStateClient) {}
+        assert_dyn(&S);
+    }
+
+    /// Default impls on the block-data surface (receipt_by_hash,
+    /// transactions_by_block, receipts_by_block) must surface as
+    /// `Ok(None)` so the dispatch site falls through cleanly when
+    /// the implementer doesn't override them.
+    #[test]
+    fn bucket_header_client_block_defaults_return_none() {
+        #[derive(Debug)]
+        struct S;
+        impl BucketHeaderClient for S {
+            fn header_by_number(&self, _: BlockNumber) -> ProviderResult<Option<Header>> {
+                Ok(None)
+            }
+            fn latest_finalized_block_number(&self) -> BlockNumber { 0 }
+        }
+        let s = S;
+        assert!(s.transaction_by_hash(B256::ZERO).unwrap().is_none());
+        assert!(s.receipt_by_hash(B256::ZERO).unwrap().is_none());
+        assert!(s.transactions_by_block(0).unwrap().is_none());
+        assert!(s.receipts_by_block(0).unwrap().is_none());
+        // Default logs_in_range returns empty (back compat).
+        let logs = s
+            .logs_in_range(0, 1, &[], &[Vec::new(), Vec::new(), Vec::new(), Vec::new()])
+            .unwrap();
+        assert!(logs.is_empty());
+    }
+
+    /// Default impls on `BucketStateClient` should surface as `None`
+    /// so a partial implementer is safe.
+    #[test]
+    fn bucket_state_client_defaults_return_none() {
+        #[derive(Debug)]
+        struct S;
+        impl BucketHeaderClient for S {
+            fn header_by_number(&self, _: BlockNumber) -> ProviderResult<Option<Header>> {
+                Ok(None)
+            }
+            fn latest_finalized_block_number(&self) -> BlockNumber { 0 }
+        }
+        impl BucketStateClient for S {}
+        let s = S;
+        assert!(s.account(Address::ZERO).unwrap().is_none());
+        assert!(s.storage(Address::ZERO, U256::ZERO).unwrap().is_none());
+        assert!(s.code_by_hash(B256::ZERO).unwrap().is_none());
+        assert_eq!(s.pinned_block_number(), 0);
+    }
 }
+
+mod state_provider;
+pub use state_provider::BucketStateProvider;

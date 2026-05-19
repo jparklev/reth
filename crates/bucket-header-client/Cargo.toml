@@ -18,7 +18,12 @@ vortex-io = { git = "https://github.com/jparklev/vortex.git", branch = "develop"
 
 # alloy + std
 alloy-consensus = { version = "1.0", features = ["serde"] }
+alloy-eips = { version = "1.0", features = ["serde"] }
 alloy-primitives = "1.5.7"
+alloy-rpc-types-eth = { version = "1.6.3", default-features = false, features = ["serde"] }
+
+# reth primitives (Receipt, TransactionSigned types we return).
+reth-ethereum-primitives = { path = "../ethereum/primitives", features = ["serde"] }
 
 # IO + crypto
 object_store = { version = "0.13", features = ["aws"] }
@@ -27,6 +32,11 @@ ed25519-dalek = "2"
 sha2 = "0.10"
 base64 = "0.22"
 hex = "0.4"
+
+# Parquet log chunk decode + Bloom (SBBF) probing (Phase 22 sprint 3).
+parquet = { version = "=54.3.1", default-features = false, features = ["arrow", "snap", "zstd"] }
+arrow = { version = "=54.3.1", default-features = false }
+bytes = "1"
 
 # Async + parsing
 tokio = { version = "1", features = ["full"] }
@@ -40,3 +50,6 @@ arc-swap = "1"
 thiserror = "2"
 tracing = "0.1"
 eyre = "0.6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
