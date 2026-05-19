@@ -82,3 +82,8 @@ pub use storage::{DefaultStorageValues, StorageArgs};
 
 mod error;
 pub mod types;
+
+/// BucketArgs for bucket-mode header reads (Phase 26.x).
+mod bucket;
+pub use bucket::BucketArgs;
+

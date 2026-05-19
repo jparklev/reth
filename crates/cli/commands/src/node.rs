@@ -9,6 +9,7 @@ use reth_db::init_db;
 use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
+        BucketArgs,
         DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, MetricArgs,
         NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs,
         TxPoolArgs,
@@ -119,6 +120,10 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "Storage")]
     pub storage: StorageArgs,
 
+    /// All bucket-mode (S3-backed header reads) related arguments
+    #[command(flatten, next_help_heading = "Bucket")]
+    pub bucket: BucketArgs,
+
     /// Additional cli arguments
     #[command(flatten, next_help_heading = "Extension")]
     pub ext: Ext,
@@ -175,6 +180,7 @@ where
             era,
             static_files,
             storage,
+            bucket,
             ext,
         } = self;
 
@@ -199,6 +205,7 @@ where
             era,
             static_files,
             storage,
+            bucket,
         };
 
         let data_dir = node_config.datadir();

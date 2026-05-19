@@ -2,8 +2,8 @@
 
 use crate::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
+        BucketArgs, DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs,
+        PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
     utils::get_single_header,
@@ -154,6 +154,13 @@ pub struct NodeConfig<ChainSpec> {
 
     /// All storage related arguments with --storage prefix
     pub storage: StorageArgs,
+
+    /// Phase 26.x — bucket-mode header read args. When
+    /// `bucket.bucket_url` is set, the engine launch path
+    /// attaches a `BucketHeaderClient` to `BlockchainProvider`
+    /// so header queries can be served from S3 without
+    /// touching local `static_files/headers_*`.
+    pub bucket: BucketArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -186,6 +193,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era: EraArgs::default(),
             static_files: StaticFilesArgs::default(),
             storage: StorageArgs::default(),
+            bucket: BucketArgs::default(),
         }
     }
 
@@ -261,6 +269,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era,
             static_files,
             storage,
+            bucket,
             ..
         } = self;
         NodeConfig {
@@ -281,6 +290,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era,
             static_files,
             storage,
+            bucket,
         }
     }
 
@@ -579,6 +589,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era: self.era,
             static_files: self.static_files,
             storage: self.storage,
+            bucket: self.bucket.clone(),
         }
     }
 
@@ -621,6 +632,7 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             era: self.era.clone(),
             static_files: self.static_files,
             storage: self.storage,
+            bucket: self.bucket.clone(),
         }
     }
 }
