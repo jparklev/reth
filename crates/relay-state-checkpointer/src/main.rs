@@ -134,10 +134,11 @@ async fn async_main() -> eyre::Result<()> {
     }
     tokio::fs::create_dir_all(&cli.out_dir).await?;
 
-    let runtime = reth_tasks::Runtime::new()?;
+    let task_runtime =
+        reth_tasks::RuntimeBuilder::new(reth_tasks::RuntimeConfig::default()).build()?;
     let env: Environment<_> = cli
         .env
-        .init::<reth_node_ethereum::node::EthereumNode>(AccessRights::RO, runtime)?;
+        .init::<reth_node_ethereum::node::EthereumNode>(AccessRights::RO, task_runtime)?;
     let factory = env.provider_factory.clone();
 
     let provider = factory.database_provider_ro()?;
