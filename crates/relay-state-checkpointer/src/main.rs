@@ -345,10 +345,20 @@ where
     );
 
     // ---- storage ----
+    // Cap per-shard storage rows to avoid OOM on shards containing
+    // fat contracts (a single Uniswap V3 pool with millions of
+    // position slots will land entirely in one addr_hash shard).
+    // Excess slots are skipped with a WARN. Fix path: per-shard
+    // sub-chunk streaming + multi-ref manifest. Tracked as a
+    // follow-up — single-ref schema can't represent split shards
+    // today.
+    const MAX_STORAGE_ROWS_PER_SHARD: usize = 5_000_000;
+
     let storage_start = Instant::now();
     let mut storage_cursor = tx.cursor_dup_read::<HashedStorages>()?;
     let mut current_shard: Option<u32> = None;
     let mut buf: Vec<(B256, B256, U256)> = Vec::new();
+    let mut current_shard_skipped: u64 = 0;
 
     // walk over a dup table yields (key, value) per duplicate row; for
     // HashedStorages: key = keccak(addr), value = StorageEntry { key:
@@ -374,12 +384,25 @@ where
 
         if Some(shard) != current_shard {
             if let Some(prev) = current_shard.take() {
+                if current_shard_skipped > 0 {
+                    warn!(
+                        shard = prev,
+                        skipped = current_shard_skipped,
+                        max = MAX_STORAGE_ROWS_PER_SHARD,
+                        "storage shard exceeded row cap — extra rows dropped (sub-shard streaming TODO)"
+                    );
+                }
                 let emit = flush_storage(cli, prev, std::mem::take(&mut buf)).await?;
                 dump.storage_shards.push(emit);
+                current_shard_skipped = 0;
             }
             current_shard = Some(shard);
         }
 
+        if buf.len() >= MAX_STORAGE_ROWS_PER_SHARD {
+            current_shard_skipped += 1;
+            continue;
+        }
         buf.push((h_addr, entry.key, entry.value));
         dump.total_storage += 1;
 
