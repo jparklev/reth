@@ -717,7 +717,7 @@ impl BucketStateClient for HttpBucketStateClient {
 
     fn storage(&self, addr: Address, slot: U256) -> ProviderResult<Option<U256>> {
         let hashed_address = keccak256(addr);
-        let hashed_slot = keccak256(slot);
+        let hashed_slot = keccak256(slot.to_be_bytes::<32>());
         let key = (hashed_address, hashed_slot);
         if let Some(cached) = self.storage_cache.get(&key) {
             return Ok(cached);
@@ -1104,7 +1104,7 @@ mod tests {
         let addr = Address::from([0x33; 20]);
         let slot = U256::from(0x44);
         let hashed_addr = keccak256(addr);
-        let hashed_slot = keccak256(slot);
+        let hashed_slot = keccak256(slot.to_be_bytes::<32>());
         let code = Bytes::from_static(b"bucket-code");
         let code_hash = keccak256(code.as_ref());
         let account = Account { nonce: 1, balance: U256::from(2), bytecode_hash: Some(code_hash) };
@@ -1158,7 +1158,7 @@ mod tests {
         let addr = Address::from([0x66; 20]);
         let slot = U256::from(0x77);
         let hashed_addr = keccak256(addr);
-        let hashed_slot = keccak256(slot);
+        let hashed_slot = keccak256(slot.to_be_bytes::<32>());
         let checkpoint_code = Bytes::from_static(b"old-code");
         let checkpoint_code_hash = keccak256(checkpoint_code.as_ref());
         let delta_code = Bytes::from_static(b"new-code");

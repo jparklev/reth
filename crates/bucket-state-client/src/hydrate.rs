@@ -195,7 +195,7 @@ pub(crate) async fn apply_epoch_deltas(
             // — we still insert so callers see Some(0) rather than fall
             // through (avoids returning the MDBX/static-file's older
             // pre-clear value).
-            storage_cache.insert((keccak256(row.address), keccak256(row.slot)), Some(row.value));
+            storage_cache.insert((keccak256(row.address), keccak256(row.slot.to_be_bytes::<32>())), Some(row.value));
             stats.storage_rows += 1;
             if row.block_num > applied {
                 applied = row.block_num;
