@@ -118,11 +118,6 @@ struct Cli {
 }
 
 fn main() -> eyre::Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    runtime.block_on(async_main())
-}
-
-async fn async_main() -> eyre::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
             |_| tracing_subscriber::EnvFilter::new("info,relay_state_checkpointer=debug,reth=warn"),
@@ -132,10 +127,25 @@ async fn async_main() -> eyre::Result<()> {
     if cli.shard_bits > 16 {
         return Err(eyre!("--shard-bits must be ≤ 16; got {}", cli.shard_bits));
     }
-    tokio::fs::create_dir_all(&cli.out_dir).await?;
 
+    // Use a single reth_tasks::Runtime for the whole binary — its
+    // tokio handle is what `EnvironmentArgs::init` wants. Driving
+    // async work via `runtime.handle().block_on(...)` and dropping
+    // the runtime *outside* of any async context avoids the
+    // "Cannot drop a runtime in a context where blocking is not
+    // allowed" panic that happens when a nested tokio runtime
+    // shuts down while inside an outer runtime's async block.
     let task_runtime =
         reth_tasks::RuntimeBuilder::new(reth_tasks::RuntimeConfig::default()).build()?;
+    let handle = task_runtime.handle().clone();
+    let result = handle.block_on(async_main(cli, task_runtime.clone()));
+    drop(task_runtime);
+    result
+}
+
+async fn async_main(cli: Cli, task_runtime: reth_tasks::Runtime) -> eyre::Result<()> {
+    tokio::fs::create_dir_all(&cli.out_dir).await?;
+
     let env: Environment<_> = cli
         .env
         .init::<reth_node_ethereum::node::EthereumNode>(AccessRights::RO, task_runtime)?;
