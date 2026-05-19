@@ -31,7 +31,7 @@ pub use blockchain_provider::BlockchainProvider;
 
 
 mod bucket;
-pub use bucket::{BucketHeaderClient, BucketHeaderClientArc};
+pub use bucket::{BucketHeaderClient, BucketHeaderClientArc, BucketStateClient, BucketStateClientArc, BucketStateProvider};
 
 mod consistent;
 pub use consistent::ConsistentProvider;
