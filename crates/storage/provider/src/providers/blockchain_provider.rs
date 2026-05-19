@@ -409,6 +409,17 @@ impl<N: ProviderNodeTypes> TransactionsProvider for BlockchainProvider<N> {
     }
 
     fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
+        if let Some(bucket) = &self.bucket
+            && let Some(tx) = bucket.transaction_by_hash(hash)?
+        {
+            // SAFETY: TxTy<N> == reth_ethereum_primitives::TransactionSigned
+            // for ethereum NodePrimitives — the only NodePrimitives
+            // configuration this fork ships against today. Same
+            // transmute_copy trick used for HeaderTy<N> above; if the
+            // fork grows non-Ethereum support, re-genericize the
+            // bucket trait then.
+            return Ok(Some(unsafe { core::mem::transmute_copy(&tx) }));
+        }
         self.consistent_provider()?.transaction_by_hash(hash)
     }
 
