@@ -26,6 +26,7 @@ use reth_trie::{
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
 use revm_database::BundleState;
+use tracing::debug;
 
 /// StateProvider decorator that consults a [`BucketStateClient`]
 /// before delegating to an inner [`StateProvider`].
@@ -77,8 +78,24 @@ impl std::fmt::Debug for BucketStateProvider {
 impl AccountReader for BucketStateProvider {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
         match self.bucket.account(*address)? {
-            Some(acc) => Ok(Some(acc)),
-            None => self.inner.basic_account(address),
+            Some(acc) => {
+                debug!(
+                    target: "providers::bucket",
+                    %address,
+                    nonce = acc.nonce,
+                    balance = %acc.balance,
+                    "BucketStateProvider::basic_account hit"
+                );
+                Ok(Some(acc))
+            }
+            None => {
+                debug!(
+                    target: "providers::bucket",
+                    %address,
+                    "BucketStateProvider::basic_account miss → inner"
+                );
+                self.inner.basic_account(address)
+            }
         }
     }
 }
@@ -88,8 +105,19 @@ impl AccountReader for BucketStateProvider {
 impl BytecodeReader for BucketStateProvider {
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
         if let Some(bytes) = self.bucket.code_by_hash(*code_hash)? {
+            debug!(
+                target: "providers::bucket",
+                %code_hash,
+                len = bytes.len(),
+                "BucketStateProvider::bytecode_by_hash hit"
+            );
             return Ok(Some(Bytecode::new_raw(bytes)));
         }
+        debug!(
+            target: "providers::bucket",
+            %code_hash,
+            "BucketStateProvider::bytecode_by_hash miss → inner"
+        );
         self.inner.bytecode_by_hash(code_hash)
     }
 }
@@ -213,8 +241,25 @@ impl StateProvider for BucketStateProvider {
     ) -> ProviderResult<Option<StorageValue>> {
         let slot = U256::from_be_bytes(storage_key.0);
         match self.bucket.storage(account, slot)? {
-            Some(value) => Ok(Some(value)),
-            None => self.inner.storage(account, storage_key),
+            Some(value) => {
+                debug!(
+                    target: "providers::bucket",
+                    %account,
+                    %slot,
+                    %value,
+                    "BucketStateProvider::storage hit"
+                );
+                Ok(Some(value))
+            }
+            None => {
+                debug!(
+                    target: "providers::bucket",
+                    %account,
+                    %slot,
+                    "BucketStateProvider::storage miss → inner"
+                );
+                self.inner.storage(account, storage_key)
+            }
         }
     }
 
@@ -335,5 +380,126 @@ mod tests {
         fn latest<P: crate::StateProviderFactory>(p: &P) -> ProviderResult<Box<dyn StateProvider + Send + 'static>> {
             p.latest()
         }
+    }
+
+    /// A bucket client that records every read it serves so a test
+    /// can assert "this dispatch path actually exercised the bucket".
+    #[derive(Debug, Default)]
+    struct CountingBucket {
+        accounts_seen: std::sync::Mutex<Vec<Address>>,
+        storage_seen: std::sync::Mutex<Vec<(Address, U256)>>,
+        code_seen: std::sync::Mutex<Vec<B256>>,
+        // Optional pre-populated values; if absent, returns None.
+        accounts: std::collections::HashMap<Address, Account>,
+        storage: std::collections::HashMap<(Address, U256), U256>,
+        code: std::collections::HashMap<B256, Bytes>,
+    }
+
+    impl BucketHeaderClient for CountingBucket {
+        fn header_by_number(&self, _: BlockNumber) -> ProviderResult<Option<Header>> {
+            Ok(None)
+        }
+        fn latest_finalized_block_number(&self) -> BlockNumber {
+            42
+        }
+    }
+
+    impl BucketStateClient for CountingBucket {
+        fn account(&self, addr: Address) -> ProviderResult<Option<Account>> {
+            self.accounts_seen.lock().unwrap().push(addr);
+            Ok(self.accounts.get(&addr).copied())
+        }
+        fn storage(&self, addr: Address, slot: U256) -> ProviderResult<Option<U256>> {
+            self.storage_seen.lock().unwrap().push((addr, slot));
+            Ok(self.storage.get(&(addr, slot)).copied())
+        }
+        fn code_by_hash(&self, h: B256) -> ProviderResult<Option<Bytes>> {
+            self.code_seen.lock().unwrap().push(h);
+            Ok(self.code.get(&h).cloned())
+        }
+        fn pinned_block_number(&self) -> BlockNumber {
+            42
+        }
+    }
+
+    /// Sanity check that the three hot-path StateProvider methods
+    /// (basic_account / storage / bytecode_by_hash) flow through
+    /// the bucket before falling back to the inner provider. This
+    /// is the dispatch surface revm exercises during `eth_call` and
+    /// `eth_estimateGas`.
+    #[test]
+    fn bucket_state_provider_records_dispatch_for_eth_call_surface() {
+        use crate::test_utils::MockEthProvider;
+        let inner = MockEthProvider::default();
+        let inner_state = StateProviderFactoryTestHelper::latest(&inner).expect("latest");
+
+        let usdc = Address::from([0xaa; 20]);
+        let vitalik = Address::from([0xbb; 20]);
+        let code = Bytes::from(vec![0x60, 0x80, 0x60, 0x40]);
+        let code_hash = alloy_primitives::keccak256(&code);
+        let balance_slot = U256::from(0xbf4954u64);
+
+        let bucket = CountingBucket {
+            accounts: [
+                (
+                    usdc,
+                    Account { nonce: 1, balance: U256::ZERO, bytecode_hash: Some(code_hash) },
+                ),
+                (
+                    vitalik,
+                    Account {
+                        nonce: 5_894,
+                        balance: U256::from(5_676_727_086_076_375_109u128),
+                        bytecode_hash: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            storage: [((usdc, balance_slot), U256::from(0x1c804u64))]
+                .into_iter()
+                .collect(),
+            code: [(code_hash, code.clone())].into_iter().collect(),
+            ..Default::default()
+        };
+        // Take the inspection handles before moving the bucket into
+        // the Arc — the Arc itself doesn't let us reach back into the
+        // struct fields.
+        let bucket = Arc::new(bucket);
+        let inspect = bucket.clone();
+        let provider = BucketStateProvider::new(
+            bucket as BucketStateClientArc,
+            inner_state,
+        );
+
+        // 1. basic_account hit + bytecode hit + storage hit, simulating
+        //    revm's "load contract, run balanceOf" sequence.
+        let acc = provider.basic_account(&usdc).unwrap().expect("usdc present");
+        assert_eq!(acc.nonce, 1);
+        assert_eq!(acc.bytecode_hash, Some(code_hash));
+        let bytecode = provider.bytecode_by_hash(&code_hash).unwrap().expect("code");
+        assert_eq!(bytecode.original_byte_slice(), code.as_ref());
+        let stored = provider
+            .storage(usdc, B256::from(balance_slot.to_be_bytes::<32>()))
+            .unwrap()
+            .expect("slot");
+        assert_eq!(stored, U256::from(0x1c804u64));
+        // 2. miss → fall-through. An unknown address must still hit the
+        //    bucket FIRST (so the bucket can answer if it ever gains
+        //    coverage) but resolve to None via the inner provider.
+        let stranger = Address::from([0xcc; 20]);
+        assert!(provider.basic_account(&stranger).unwrap().is_none());
+
+        // Inspect the recorded dispatch.
+        let accounts_seen = inspect.accounts_seen.lock().unwrap();
+        let storage_seen = inspect.storage_seen.lock().unwrap();
+        let code_seen = inspect.code_seen.lock().unwrap();
+        assert_eq!(accounts_seen.len(), 2, "two basic_account calls dispatched");
+        assert_eq!(accounts_seen[0], usdc);
+        assert_eq!(accounts_seen[1], stranger);
+        assert_eq!(storage_seen.len(), 1, "one storage call dispatched");
+        assert_eq!(storage_seen[0], (usdc, balance_slot));
+        assert_eq!(code_seen.len(), 1, "one bytecode_by_hash call dispatched");
+        assert_eq!(code_seen[0], code_hash);
     }
 }

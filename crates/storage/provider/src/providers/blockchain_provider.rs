@@ -147,6 +147,36 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
         self
     }
 
+    /// Phase 26.x item 6 — wrap an inner [`StateProviderBox`] with a
+    /// [`BucketStateProvider`] when a bucket client is attached.
+    ///
+    /// The wrap is unconditional once a bucket is present; misses in
+    /// the bucket fall through to the inner provider, so the worst
+    /// case is "one extra HashMap lookup per read". This is the
+    /// shared wrap point used by `latest()`, `history_by_block_hash`,
+    /// `history_by_block_number`, and `state_by_block_hash` so that
+    /// the eth_call / eth_estimateGas code path — which resolves
+    /// `BlockId::Latest` to a concrete block hash before fetching
+    /// state — still sees the bucket overlay.
+    ///
+    /// `_hint_block_hash` is currently unused but reserved for a
+    /// future tightening that gates the wrap on
+    /// `hash == bucket.pinned_block_hash()` to avoid serving
+    /// stale bucket data for historical state queries.
+    fn maybe_wrap_with_bucket(
+        &self,
+        inner: StateProviderBox,
+        _hint_block_hash: Option<BlockHash>,
+    ) -> StateProviderBox {
+        if let Some(state_bucket) = &self.state_bucket {
+            return Box::new(super::bucket::BucketStateProvider::new(
+                state_bucket.clone(),
+                inner,
+            ))
+        }
+        inner
+    }
+
     /// Phase 26.x item 4 — return logs in the inclusive
     /// `from_block..=to_block` range from the attached bucket, if any.
     /// Returns `Ok(None)` when:
@@ -681,13 +711,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
         // bucket holds in-memory plain state pinned at a finalized
         // block; we wrap the inner StateProvider so account/storage/
         // bytecode lookups consult the bucket first.
-        if let Some(state_bucket) = &self.state_bucket {
-            return Ok(Box::new(super::bucket::BucketStateProvider::new(
-                state_bucket.clone(),
-                inner,
-            )));
-        }
-        Ok(inner)
+        Ok(self.maybe_wrap_with_bucket(inner, None))
     }
 
     /// Returns a [`StateProviderBox`] indexed by the given block number or tag.
@@ -731,18 +755,22 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
         let hash = provider
             .block_hash(block_number)?
             .ok_or_else(|| ProviderError::HeaderNotFound(block_number.into()))?;
-        provider.into_state_provider_at_block_hash(hash)
+        let inner = provider.into_state_provider_at_block_hash(hash)?;
+        Ok(self.maybe_wrap_with_bucket(inner, Some(hash)))
     }
 
     fn history_by_block_hash(&self, block_hash: BlockHash) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", ?block_hash, "Getting history by block hash");
-        self.consistent_provider()?.into_state_provider_at_block_hash(block_hash)
+        let inner = self.consistent_provider()?.into_state_provider_at_block_hash(block_hash)?;
+        Ok(self.maybe_wrap_with_bucket(inner, Some(block_hash)))
     }
 
     fn state_by_block_hash(&self, hash: BlockHash) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", ?hash, "Getting state by block hash");
         if let Ok(state) = self.history_by_block_hash(hash) {
-            // This could be tracked by a historical block
+            // This could be tracked by a historical block.
+            // `history_by_block_hash` already wraps with bucket
+            // when applicable, so we just forward.
             Ok(state)
         } else if let Ok(Some(pending)) = self.pending_state_by_hash(hash) {
             // .. or this could be the pending state
@@ -2783,6 +2811,216 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    // ================================================================
+    // Phase 26.x item 6 — eth_call / eth_estimateGas dispatch tests.
+    //
+    // These exercise the seam where `eth_call` resolves
+    // `BlockId::Latest` to a concrete block hash (see
+    // `EthCall::evm_env_at` in `crates/rpc/rpc-eth-api/src/helpers/
+    // state.rs`) and then asks for state by that hash. Without the
+    // bucket wrap on `state_by_block_hash` / `history_by_block_hash`,
+    // the bucket overlay was bypassed and `eth_call` returned 0x.
+    // ================================================================
+
+    use crate::providers::{BucketHeaderClient, BucketStateClient, BucketStateClientArc};
+    use alloy_consensus::Header;
+    use alloy_primitives::{Address, Bytes, U256};
+    use reth_primitives_traits::Account;
+    use std::sync::Mutex;
+
+    /// A bucket client that records every read it serves and returns
+    /// sentinel values for a single seeded account/slot/code-hash
+    /// triple. Lets a test assert "the bucket was actually
+    /// consulted on this dispatch path".
+    #[derive(Debug)]
+    struct SpyBucket {
+        sentinel_addr: Address,
+        sentinel_account: Account,
+        sentinel_slot: U256,
+        sentinel_slot_value: U256,
+        sentinel_code_hash: B256,
+        sentinel_code: Bytes,
+        pinned: u64,
+        account_calls: Mutex<Vec<Address>>,
+        storage_calls: Mutex<Vec<(Address, U256)>>,
+        code_calls: Mutex<Vec<B256>>,
+    }
+
+    impl BucketHeaderClient for SpyBucket {
+        fn header_by_number(
+            &self,
+            _: BlockNumber,
+        ) -> reth_storage_errors::provider::ProviderResult<Option<Header>> {
+            Ok(None)
+        }
+        fn latest_finalized_block_number(&self) -> BlockNumber {
+            self.pinned
+        }
+    }
+
+    impl BucketStateClient for SpyBucket {
+        fn account(
+            &self,
+            addr: Address,
+        ) -> reth_storage_errors::provider::ProviderResult<Option<Account>> {
+            self.account_calls.lock().unwrap().push(addr);
+            if addr == self.sentinel_addr {
+                Ok(Some(self.sentinel_account))
+            } else {
+                Ok(None)
+            }
+        }
+        fn storage(
+            &self,
+            addr: Address,
+            slot: U256,
+        ) -> reth_storage_errors::provider::ProviderResult<Option<U256>> {
+            self.storage_calls.lock().unwrap().push((addr, slot));
+            if addr == self.sentinel_addr && slot == self.sentinel_slot {
+                Ok(Some(self.sentinel_slot_value))
+            } else {
+                Ok(None)
+            }
+        }
+        fn code_by_hash(
+            &self,
+            h: B256,
+        ) -> reth_storage_errors::provider::ProviderResult<Option<Bytes>> {
+            self.code_calls.lock().unwrap().push(h);
+            if h == self.sentinel_code_hash {
+                Ok(Some(self.sentinel_code.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+        fn pinned_block_number(&self) -> BlockNumber {
+            self.pinned
+        }
+    }
+
+    fn make_spy_bucket() -> Arc<SpyBucket> {
+        let code: Bytes = vec![0x60, 0x80, 0x60, 0x40].into();
+        let code_hash = alloy_primitives::keccak256(&code);
+        Arc::new(SpyBucket {
+            sentinel_addr: Address::from([0xaa; 20]),
+            sentinel_account: Account {
+                nonce: 7,
+                balance: U256::from(123u64),
+                bytecode_hash: Some(code_hash),
+            },
+            sentinel_slot: U256::from(0xbeefu64),
+            sentinel_slot_value: U256::from(0xdeadu64),
+            sentinel_code_hash: code_hash,
+            sentinel_code: code,
+            pinned: 25_124_931,
+            account_calls: Mutex::new(Vec::new()),
+            storage_calls: Mutex::new(Vec::new()),
+            code_calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Item 6 — eth_call resolves `BlockId::Latest` to a concrete
+    /// block hash and then asks for state via `state_by_block_hash`.
+    /// This test exercises that wrap point and asserts the bucket
+    /// gets consulted.
+    #[test]
+    fn bucket_overlay_wraps_state_by_block_hash() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+        let spy = make_spy_bucket();
+        let provider =
+            provider.with_state_bucket(spy.clone() as BucketStateClientArc);
+        let canonical = in_memory_blocks.last().unwrap().hash();
+
+        // Drive `state_by_block_hash` (the eth_call→evm_env_at→
+        // state_at_block_id path) and confirm the bucket was hit
+        // for an account lookup.
+        let state = provider.state_by_block_hash(canonical)?;
+        let acc = state.basic_account(&spy.sentinel_addr)?.expect("present");
+        assert_eq!(acc.balance, U256::from(123u64));
+
+        // bytecode_by_hash hit
+        let bytecode = state
+            .bytecode_by_hash(&spy.sentinel_code_hash)?
+            .expect("code present");
+        assert_eq!(bytecode.original_byte_slice(), spy.sentinel_code.as_ref());
+
+        // storage hit, then storage miss → fall-through
+        let stored = state
+            .storage(spy.sentinel_addr, B256::from(spy.sentinel_slot.to_be_bytes::<32>()))?
+            .expect("slot present");
+        assert_eq!(stored, U256::from(0xdeadu64));
+        let _ = state.storage(spy.sentinel_addr, B256::random());
+
+        // basic_account miss → fall-through (inner returns None for
+        // random addrs in the test provider).
+        let other = Address::random();
+        let _ = state.basic_account(&other);
+
+        // Assertions on the recorded dispatch.
+        let account_calls = spy.account_calls.lock().unwrap();
+        let storage_calls = spy.storage_calls.lock().unwrap();
+        let code_calls = spy.code_calls.lock().unwrap();
+        assert!(
+            account_calls.contains(&spy.sentinel_addr),
+            "bucket basic_account dispatch did not fire for sentinel addr"
+        );
+        assert!(
+            account_calls.contains(&other),
+            "bucket basic_account dispatch did not fire for miss addr"
+        );
+        assert!(
+            storage_calls.iter().any(|(a, s)| *a == spy.sentinel_addr && *s == spy.sentinel_slot),
+            "bucket storage dispatch did not fire for sentinel slot"
+        );
+        assert!(
+            code_calls.contains(&spy.sentinel_code_hash),
+            "bucket bytecode_by_hash dispatch did not fire for sentinel code"
+        );
+        Ok(())
+    }
+
+    /// Item 6 — `latest()` is the historical wrap point. Both that
+    /// and `state_by_block_hash` must surface the bucket overlay,
+    /// otherwise eth_getBalance and eth_call diverge in coverage.
+    #[test]
+    fn bucket_overlay_wraps_latest_and_history_by_block_hash() -> eyre::Result<()> {
+        let mut rng = generators::rng();
+        let (provider, _, in_memory_blocks, _) = provider_with_random_blocks(
+            &mut rng,
+            TEST_BLOCKS_COUNT,
+            TEST_BLOCKS_COUNT,
+            BlockRangeParams::default(),
+        )?;
+        let spy = make_spy_bucket();
+        let provider =
+            provider.with_state_bucket(spy.clone() as BucketStateClientArc);
+
+        // latest()
+        let latest = provider.latest()?;
+        let _ = latest.basic_account(&spy.sentinel_addr)?;
+
+        // history_by_block_hash — same dispatch shape eth_call uses
+        // for an explicit BlockId::Hash query.
+        let hash = in_memory_blocks.last().unwrap().hash();
+        let by_hash = provider.history_by_block_hash(hash)?;
+        let _ = by_hash.basic_account(&spy.sentinel_addr)?;
+
+        let calls = spy.account_calls.lock().unwrap();
+        assert!(
+            calls.iter().filter(|a| **a == spy.sentinel_addr).count() >= 2,
+            "bucket basic_account must fire for both latest() and \
+             history_by_block_hash; saw {:?}",
+            calls
+        );
         Ok(())
     }
 }

@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use chrono::SecondsFormat;
 use clap::Parser;
 use ed25519_dalek::Signer;
@@ -50,7 +50,7 @@ use alloy_consensus::constants::KECCAK_EMPTY;
 use object_store::ObjectStoreExt;
 use reth_cli_commands::common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs};
 use reth_db_api::cursor::{DbCursorRO, DbDupCursorRO};
-use reth_db_api::tables::{Bytecodes, PlainAccountState, PlainStorageState};
+use reth_db_api::tables::{Bytecodes, HashedAccounts, HashedStorages, PlainAccountState, PlainStorageState};
 use reth_db_api::transaction::DbTx;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_provider::providers::ProviderNodeTypes;
@@ -96,6 +96,22 @@ struct Cli {
     /// of incompleteness.
     #[arg(long, default_value_t = 0usize)]
     max_storage_per_account: usize,
+
+    /// Additional account address to force-include in the
+    /// checkpoint (repeatable). Useful for targeted spike runs
+    /// where you want a known contract / EOA (e.g. USDC, vitalik)
+    /// in the bucket even when `--max-accounts` would skip past
+    /// them. The account row plus its bytecode are emitted; storage
+    /// for these addresses follows `--max-storage-per-account`.
+    #[arg(long = "account", value_name = "ADDR")]
+    extra_accounts: Vec<String>,
+
+    /// Additional storage slot to force-include, of the form
+    /// `0xADDR:0xSLOT` (repeatable). Useful for seeding known
+    /// state mappings like `balances[user]` without dumping the
+    /// whole contract's storage table.
+    #[arg(long = "slot", value_name = "ADDR:SLOT")]
+    extra_slots: Vec<String>,
 
     // ---- Upload (optional) ----
     /// When set, after writing local artifacts the binary uploads
@@ -267,6 +283,13 @@ where
     let mut account_cursor = tx.cursor_read::<PlainAccountState>()?;
     let mut storage_cursor = tx.cursor_dup_read::<PlainStorageState>()?;
     let mut bytecode_cursor = tx.cursor_read::<Bytecodes>()?;
+    // Phase 26.x — reth's "optimized" / storage_v2 mode wipes
+    // PlainAccountState / PlainStorageState in favor of HashedAccounts
+    // / HashedStorages keyed by `keccak256(addr)` / `keccak256(slot)`.
+    // For targeted (`--account` / `--slot`) lookups we transparently
+    // fall back to the hashed tables.
+    let mut hashed_account_cursor = tx.cursor_read::<HashedAccounts>()?;
+    let mut hashed_storage_cursor = tx.cursor_dup_read::<HashedStorages>()?;
 
     let row_cap = if cli.max_accounts == 0 {
         usize::MAX
@@ -329,6 +352,134 @@ where
             );
         }
     }
+
+    // ---- Pass 2: force-include extra accounts/slots ----
+    // Phase 26.x — lets a spike-run target specific contracts/EOAs
+    // (e.g. USDC + vitalik) without dumping the surrounding 300M
+    // accounts.
+    let already_seeded: HashSet<Address> = out
+        .shards
+        .iter()
+        .flat_map(|s| s.accounts.iter().map(|(a, ..)| *a))
+        .collect();
+
+    for raw in &cli.extra_accounts {
+        let addr: Address = raw.parse().with_context(|| {
+            format!("--account: invalid address {raw:?}")
+        })?;
+        if already_seeded.contains(&addr) {
+            continue;
+        }
+        // Plain first, then hashed (storage_v2 path).
+        let account = match account_cursor.seek_exact(addr)? {
+            Some((_, a)) => Some(a),
+            None => {
+                let h = keccak256(addr);
+                hashed_account_cursor.seek_exact(h)?.map(|(_, a)| a)
+            }
+        };
+        let Some(account) = account else {
+            warn!(address = %addr, "extra account not found in PlainAccountState or HashedAccounts");
+            continue;
+        };
+        let code_hash = account.bytecode_hash.unwrap_or(KECCAK_EMPTY);
+        let shard = shard_for(addr, cli.shard_bits);
+        out.shards[shard]
+            .accounts
+            .push((addr, account.nonce, account.balance, code_hash));
+        out.total_accounts += 1;
+        if account.bytecode_hash.is_some()
+            && code_hash != KECCAK_EMPTY
+            && seen_code.insert(code_hash)
+        {
+            if let Some((_, bytecode)) = bytecode_cursor.seek_exact(code_hash)? {
+                out.shards[shard]
+                    .code
+                    .push((code_hash, bytecode.original_byte_slice().to_vec()));
+                out.total_code += 1;
+            }
+        }
+        // Walk storage rows for the targeted account up to the cap.
+        // PlainStorageState first, fall back to HashedStorages.
+        let mut entry = storage_cursor.seek_exact(addr)?;
+        let mut per_acct = 0usize;
+        let mut found_plain = false;
+        while let Some((haddr, sub)) = entry {
+            if haddr != addr || per_acct >= per_acct_cap {
+                break;
+            }
+            let slot = U256::from_be_slice(sub.key.as_slice());
+            out.shards[shard].storage.push((addr, slot, sub.value));
+            out.total_storage += 1;
+            per_acct += 1;
+            found_plain = true;
+            entry = storage_cursor.next_dup()?;
+        }
+        if !found_plain {
+            // HashedStorages is keyed by keccak256(addr); the slot
+            // inner key is keccak256(slot). We don't have a reverse
+            // map from hashed slot back to plain slot, so we can
+            // only emit storage rows that were explicitly named via
+            // `--slot ADDR:SLOT`. That's handled in the next loop.
+        }
+        info!(address = %addr, "extra account seeded");
+    }
+
+    for raw in &cli.extra_slots {
+        let Some((a_raw, s_raw)) = raw.split_once(':') else {
+            return Err(eyre!("--slot expects ADDR:SLOT, got {raw:?}"));
+        };
+        let addr: Address = a_raw
+            .parse()
+            .with_context(|| format!("--slot: invalid address {a_raw:?}"))?;
+        let slot: U256 = U256::from_str_radix(
+            s_raw.trim_start_matches("0x"),
+            16,
+        )
+        .with_context(|| format!("--slot: invalid slot {s_raw:?}"))?;
+        let target_key_be: [u8; 32] = slot.to_be_bytes();
+        let target_key = B256::from(target_key_be);
+        let shard = shard_for(addr, cli.shard_bits);
+        let mut found = false;
+        // PlainStorageState first.
+        let mut entry = storage_cursor.seek_exact(addr)?;
+        while let Some((haddr, sub)) = entry {
+            if haddr != addr {
+                break;
+            }
+            if sub.key == target_key {
+                out.shards[shard].storage.push((addr, slot, sub.value));
+                out.total_storage += 1;
+                found = true;
+                info!(address = %addr, slot = %slot, value = %sub.value, "extra slot seeded (plain)");
+                break;
+            }
+            entry = storage_cursor.next_dup()?;
+        }
+        if !found {
+            // HashedStorages fallback: dup table keyed by
+            // keccak256(addr), inner key keccak256(slot).
+            let h_addr = keccak256(addr);
+            let h_slot = keccak256(target_key);
+            let mut h_entry = hashed_storage_cursor.seek_by_key_subkey(h_addr, h_slot)?;
+            // seek_by_key_subkey may land on a higher subkey if the
+            // exact slot isn't present.
+            while let Some(sub) = h_entry {
+                if sub.key != h_slot {
+                    break;
+                }
+                out.shards[shard].storage.push((addr, slot, sub.value));
+                out.total_storage += 1;
+                found = true;
+                info!(address = %addr, slot = %slot, value = %sub.value, "extra slot seeded (hashed)");
+                break;
+            }
+        }
+        if !found {
+            warn!(address = %addr, slot = %slot, "extra slot not found in PlainStorageState or HashedStorages");
+        }
+    }
+
     Ok(out)
 }
 
