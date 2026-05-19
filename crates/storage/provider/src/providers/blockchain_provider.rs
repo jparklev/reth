@@ -382,6 +382,17 @@ impl<N: ProviderNodeTypes> HeaderProvider for BlockchainProvider<N> {
 
 impl<N: ProviderNodeTypes> BlockHashReader for BlockchainProvider<N> {
     fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>> {
+        // Bucket-mode: if the bucket covers this block, derive the
+        // hash from its header. Allows queries like
+        // `eth_getBalance(addr, <number>)` to resolve historic blocks
+        // when the local node hasn't synced them (--dev mode, fresh
+        // datadir alongside a checkpoint, etc.).
+        if let Some(bucket) = &self.bucket
+            && number <= bucket.latest_finalized_block_number()
+            && let Some(header) = bucket.header_by_number(number)?
+        {
+            return Ok(Some(header.hash_slow()));
+        }
         self.consistent_provider()?.block_hash(number)
     }
 
