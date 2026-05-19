@@ -13,15 +13,15 @@ path = "src/main.rs"
 # Reth — re-use the EnvironmentArgs/AccessRights bootstrap from the
 # existing CLI commands instead of re-deriving the 5-arg
 # ProviderFactory::new wiring.
-reth-cli-commands = { path = "../cli/commands" }
-reth-ethereum-cli = { path = "../ethereum/cli", default-features = false }
-reth-provider = { path = "../storage/provider" }
-reth-db-api = { path = "../storage/db-api" }
-reth-storage-api = { path = "../storage/storage-api" }
-reth-primitives-traits = { path = "../primitives-traits" }
-reth-node-types = { path = "../node/types" }
-reth-storage-errors = { path = "../storage/errors" }
-reth-node-ethereum = { path = "../ethereum/node" }
+reth-cli-commands.workspace = true
+reth-ethereum-cli.workspace = true
+reth-provider.workspace = true
+reth-db-api.workspace = true
+reth-storage-api.workspace = true
+reth-primitives-traits.workspace = true
+reth-node-types.workspace = true
+reth-storage-errors.workspace = true
+reth-node-ethereum.workspace = true
 
 # Vortex — same git fork the relay project uses, byte-equivalent
 # column layouts shared with relay-rpc readers.
@@ -30,8 +30,8 @@ vortex-file = { git = "https://github.com/jparklev/vortex.git", branch = "develo
 vortex-buffer = { git = "https://github.com/jparklev/vortex.git", branch = "develop" }
 
 # Alloy primitives
-alloy-consensus = { version = "1.0", features = ["serde"] }
-alloy-primitives = "1.5.7"
+alloy-consensus = { workspace = true, features = ["serde"] }
+alloy-primitives = { workspace = true }
 
 # Crypto / IO
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }

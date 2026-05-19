@@ -7,10 +7,10 @@ description = "Phase 26.x: HTTP/Vortex implementer of reth_provider::BucketState
 
 [dependencies]
 # Trait we implement (extends BucketHeaderClient).
-reth-provider = { path = "../storage/provider" }
-reth-storage-errors = { path = "../storage/errors" }
-reth-primitives-traits = { path = "../primitives-traits" }
-reth-ethereum-primitives = { path = "../ethereum/primitives" }
+reth-provider.workspace = true
+reth-storage-errors.workspace = true
+reth-primitives-traits.workspace = true
+reth-ethereum-primitives.workspace = true
 
 # Vortex for chunk decode (same fork the rest of the project uses).
 vortex = { git = "https://github.com/jparklev/vortex.git", branch = "develop", features = ["object_store", "tokio", "files"] }
@@ -19,8 +19,8 @@ vortex-buffer = { git = "https://github.com/jparklev/vortex.git", branch = "deve
 vortex-io = { git = "https://github.com/jparklev/vortex.git", branch = "develop", features = ["object_store"] }
 
 # alloy + std
-alloy-consensus = { version = "1.0", features = ["serde"] }
-alloy-primitives = "1.5.7"
+alloy-consensus = { workspace = true, features = ["serde"] }
+alloy-primitives = { workspace = true }
 
 # IO + crypto
 object_store = { version = "0.13", features = ["aws"] }

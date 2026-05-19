@@ -226,6 +226,8 @@ fn rows_to_header(
         excess_blob_gas: excess_blob_gas[row].map(|v| v as u64),
         parent_beacon_block_root: parent_beacon_b,
         requests_hash: requests_hash_b,
+        block_access_list_hash: None,
+        slot_number: None,
     })
 }
 

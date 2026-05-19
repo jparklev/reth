@@ -7,8 +7,8 @@ description = "Phase 26.x: HTTP/Vortex implementer of reth_provider::BucketHeade
 
 [dependencies]
 # Trait we implement
-reth-provider = { path = "../storage/provider" }
-reth-storage-errors = { path = "../storage/errors" }
+reth-provider.workspace = true
+reth-storage-errors.workspace = true
 
 # Vortex for chunk decode (same git fork the rest of the project uses).
 vortex = { git = "https://github.com/jparklev/vortex.git", branch = "develop", features = ["object_store", "tokio", "files"] }
@@ -17,13 +17,13 @@ vortex-buffer = { git = "https://github.com/jparklev/vortex.git", branch = "deve
 vortex-io = { git = "https://github.com/jparklev/vortex.git", branch = "develop", features = ["object_store"] }
 
 # alloy + std
-alloy-consensus = { version = "1.0", features = ["serde"] }
-alloy-eips = { version = "1.0", features = ["serde"] }
-alloy-primitives = "1.5.7"
-alloy-rpc-types-eth = { version = "1.6.3", default-features = false, features = ["serde"] }
+alloy-consensus = { workspace = true, features = ["serde"] }
+alloy-eips = { workspace = true, features = ["serde"] }
+alloy-primitives = { workspace = true }
+alloy-rpc-types-eth = { workspace = true, features = ["serde"] }
 
 # reth primitives (Receipt, TransactionSigned types we return).
-reth-ethereum-primitives = { path = "../ethereum/primitives", features = ["serde"] }
+reth-ethereum-primitives.workspace = true
 
 # IO + crypto
 object_store = { version = "0.13", features = ["aws"] }

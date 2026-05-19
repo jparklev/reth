@@ -22,8 +22,8 @@ use reth_storage_api::{
 };
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::{
-    updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
-    MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
+    updates::TrieUpdates, AccountProof, ExecutionWitnessMode, HashedPostState, HashedStorage,
+    MultiProof, MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
 use revm_database::BundleState;
 use tracing::debug;
@@ -218,8 +218,9 @@ impl StateProofProvider for BucketStateProvider {
         &self,
         input: TrieInput,
         target: HashedPostState,
+        mode: ExecutionWitnessMode,
     ) -> ProviderResult<Vec<Bytes>> {
-        self.inner.witness(input, target)
+        self.inner.witness(input, target, mode)
     }
 }
 
@@ -261,16 +262,6 @@ impl StateProvider for BucketStateProvider {
                 self.inner.storage(account, storage_key)
             }
         }
-    }
-
-    fn storage_by_hashed_key(
-        &self,
-        address: Address,
-        hashed_storage_key: StorageKey,
-    ) -> ProviderResult<Option<StorageValue>> {
-        // The bucket is keyed by plain (unhashed) slot, so we can't
-        // serve this variant — always fall through.
-        self.inner.storage_by_hashed_key(address, hashed_storage_key)
     }
 }
 
