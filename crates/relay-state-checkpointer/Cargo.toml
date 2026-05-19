@@ -22,6 +22,7 @@ reth-primitives-traits.workspace = true
 reth-node-types.workspace = true
 reth-storage-errors.workspace = true
 reth-node-ethereum.workspace = true
+reth-tasks.workspace = true
 
 # Vortex — same git fork the relay project uses, byte-equivalent
 # column layouts shared with relay-rpc readers.

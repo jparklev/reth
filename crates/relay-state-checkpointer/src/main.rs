@@ -28,7 +28,7 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Instant};
 
 use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::{keccak256, Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use chrono::SecondsFormat;
 use clap::Parser;
 use ed25519_dalek::Signer;
@@ -38,14 +38,14 @@ use object_store::{
 };
 use reth_cli_commands::common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs};
 use reth_db_api::{
-    cursor::{DbCursorRO, DbDupCursorRO},
+    cursor::DbCursorRO,
     tables::{Bytecodes, HashedAccounts, HashedStorages},
     transaction::DbTx,
 };
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_provider::{
-    providers::ProviderNodeTypes, BlockNumReader, DatabaseProviderFactory, HeaderProvider,
-    ProviderFactory, StaticFileProviderFactory,
+    BlockNumReader, DatabaseProviderFactory, HeaderProvider, ProviderFactory,
+    providers::ProviderNodeTypes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -134,8 +134,10 @@ async fn async_main() -> eyre::Result<()> {
     }
     tokio::fs::create_dir_all(&cli.out_dir).await?;
 
-    let env: Environment<_> =
-        cli.env.init::<reth_node_ethereum::node::EthereumNode>(AccessRights::RO)?;
+    let runtime = reth_tasks::Runtime::new()?;
+    let env: Environment<_> = cli
+        .env
+        .init::<reth_node_ethereum::node::EthereumNode>(AccessRights::RO, runtime)?;
     let factory = env.provider_factory.clone();
 
     let provider = factory.database_provider_ro()?;
