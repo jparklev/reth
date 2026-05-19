@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber, Bloom, Bytes, U256};
+use alloy_rpc_types_eth::Log;
 use arc_swap::ArcSwap;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -30,6 +31,7 @@ use ed25519_dalek::Verifier;
 use object_store::{ObjectStore, ObjectStoreExt};
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_provider::{BucketHeaderClient, BucketHeaderClientArc};
 use reth_storage_errors::db::DatabaseError;
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
@@ -38,7 +40,13 @@ use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
+mod log_decode;
+mod logs_decode;
+mod receipt_decode;
+mod tx_decode;
 mod vortex_decode;
+
+pub use logs_decode::{chunk_bloom_skips_filter, LogScanFilter};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BucketClientError {
@@ -81,9 +89,32 @@ pub struct EpochManifest {
     pub last_block_num: u64,
     pub blocks: Vec<ManifestBlock>,
     #[serde(default)]
+    pub epoch_artifacts: std::collections::BTreeMap<String, ManifestChunkRef>,
+    #[serde(default)]
+    pub tx_index: Option<ManifestIndex>,
+    #[serde(default)]
+    pub block_hash_index: Option<ManifestIndex>,
+    #[serde(default)]
     pub previous_epoch_manifest_url: Option<String>,
     #[serde(default)]
     pub previous_epoch_manifest_sha256: Option<String>,
+}
+
+/// Signed external index reference (e.g. `tx_index.json`,
+/// `block_hash_index.json`). The URL points to a JSON map and is
+/// pinned by the sha256 — both signed by the writer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestIndex {
+    pub url: String,
+    pub sha256: String,
+}
+
+/// Per-tx location in the bucket: which finalized block it lives in
+/// and its `idx` within that block's `transactions` chunk.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TxIndexEntry {
+    pub block_num: u64,
+    pub tx_index: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +163,12 @@ impl ManifestChunkRef {
     pub fn is_vortex(&self) -> bool {
         matches!(self, Self::Descriptor(d) if d.format == "vortex")
     }
+    pub fn is_parquet(&self) -> bool {
+        match self {
+            Self::Path(_) => true,
+            Self::Descriptor(d) => d.format.is_empty() || d.format == "parquet",
+        }
+    }
     pub fn footer_metadata(&self) -> Option<&str> {
         match self {
             Self::Descriptor(d) => d.vortex_footer_metadata_b64.as_deref(),
@@ -158,6 +195,10 @@ struct Snapshot {
     epochs: Vec<EpochManifest>,
     block_to_epoch: HashMap<u64, usize>,
     block_hash_to_num: HashMap<String, u64>,
+    /// `0x...` hex tx hash → (block_num, tx_idx). Built at boot
+    /// from the signed per-epoch `tx_index.json` artifacts. Empty
+    /// when no warm epoch ships `tx_index` (older writer output).
+    tx_hash_to_location: HashMap<String, TxIndexEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -303,9 +344,43 @@ impl HttpBucketHeaderClient {
                 block_hash_to_num.insert(blk.hash.clone(), blk.num);
             }
         }
+
+        // Load per-epoch `tx_index.json` (signed) into an in-memory
+        // tx_hash → (block_num, tx_idx) map. Each epoch's index is
+        // verified against the writer's ed25519 key AND its sha256
+        // is pinned by the epoch manifest. Epochs missing an index
+        // entry are skipped silently — they predate the writer
+        // emitting tx_index artifacts.
+        let mut tx_hash_to_location: HashMap<String, TxIndexEntry> = HashMap::new();
+        let mut tx_index_loaded_epochs = 0usize;
+        for e in &epochs {
+            let Some(index_ref) = &e.tx_index else { continue };
+            let bytes = fetch_object(&store, &index_ref.url).await?;
+            let sig = fetch_object(&store, &format!("{}.sig", index_ref.url)).await?;
+            verify_signature(&writer_pubkey, &bytes, &sig)?;
+            let got = format!("{:x}", Sha256::digest(&bytes));
+            if got != index_ref.sha256 {
+                return Err(BucketClientError::Trust(format!(
+                    "tx_index sha mismatch for {}: expected {}, got {got}",
+                    index_ref.url, index_ref.sha256
+                )));
+            }
+            let parsed: HashMap<String, TxIndexEntry> =
+                serde_json::from_slice(&bytes).map_err(|err| {
+                    BucketClientError::Backend(format!(
+                        "decode tx_index {}: {err}",
+                        index_ref.url
+                    ))
+                })?;
+            tx_hash_to_location.extend(parsed);
+            tx_index_loaded_epochs += 1;
+        }
+
         info!(
             warm_epochs = epochs.len(),
             blocks = block_to_epoch.len(),
+            tx_index_loaded_epochs,
+            indexed_txs = tx_hash_to_location.len(),
             latest_finalized = head.latest_finalized_block_num,
             "bucket-header-client snapshot loaded"
         );
@@ -317,6 +392,7 @@ impl HttpBucketHeaderClient {
                 epochs,
                 block_to_epoch,
                 block_hash_to_num,
+                tx_hash_to_location,
             }),
             writer_pubkey,
         })
@@ -393,6 +469,345 @@ impl HttpBucketHeaderClient {
             ..Default::default()
         }))
     }
+
+    /// Helper: locate the `(epoch_idx, block_meta, chunk_ref)`
+    /// triplet for a given block + chunk kind, returning `None` if
+    /// the snapshot doesn't cover the block or the block is missing
+    /// that chunk kind. Used by tx/receipt/by-block paths.
+    fn locate_chunk<'a>(
+        snap: &'a Snapshot,
+        num: u64,
+        kind: &str,
+    ) -> Option<(&'a EpochManifest, &'a ManifestBlock, &'a ManifestChunkRef)> {
+        let epoch_idx = snap.block_to_epoch.get(&num).copied()?;
+        let epoch = snap.epochs.get(epoch_idx)?;
+        let block = epoch.blocks.iter().find(|b| b.num == num)?;
+        let chunk = block.chunks.get(kind)?;
+        Some((epoch, block, chunk))
+    }
+
+    /// Decode all transactions in `block_num` from the bucket's
+    /// `transactions` chunk. Returns `Ok(None)` if the block is not
+    /// covered or the chunk isn't a Vortex chunk (Parquet fallback
+    /// would require pulling parquet decode for txs into this
+    /// crate; not in scope for items 1-3).
+    async fn fetch_transactions_by_block(
+        &self,
+        block_num: BlockNumber,
+    ) -> Result<Option<Vec<TransactionSigned>>, BucketClientError> {
+        let snap = self.snapshot.load();
+        let Some((_, _, chunk_ref)) = Self::locate_chunk(&snap, block_num, "transactions") else {
+            return Ok(None);
+        };
+        if !chunk_ref.is_vortex() {
+            // The live mainnet bucket may still ship parquet for
+            // `transactions` chunks; we don't ship a parquet path
+            // for transactions in this crate. Fall through so the
+            // caller can hit MDBX instead.
+            debug!(
+                block_num,
+                chunk = chunk_ref.path(),
+                "transactions chunk is not vortex; falling through"
+            );
+            return Ok(None);
+        }
+        let path = format!("chunks/{}", chunk_ref.path());
+        let decoded = tx_decode::decode_transactions_chunk(
+            Arc::clone(&self.store),
+            ObjectPath::from(path.as_str()),
+            block_num,
+            chunk_ref.size_bytes(),
+            chunk_ref.footer_metadata(),
+            chunk_ref.preload_ranges(),
+        )
+        .await
+        .map_err(|err| BucketClientError::Decode {
+            block: block_num,
+            reason: format!("vortex transactions: {err}"),
+        })?;
+        Ok(Some(decoded.into_iter().map(|d| d.tx).collect()))
+    }
+
+    /// Decode all receipts in `block_num`, joining logs from the
+    /// block's `logs` chunk. Returns `Ok(None)` if either chunk is
+    /// missing or non-Vortex.
+    async fn fetch_receipts_by_block(
+        &self,
+        block_num: BlockNumber,
+    ) -> Result<Option<Vec<reth_ethereum_primitives::Receipt>>, BucketClientError> {
+        let snap = self.snapshot.load();
+        let Some((_, _, receipts_chunk)) = Self::locate_chunk(&snap, block_num, "receipts") else {
+            return Ok(None);
+        };
+        let logs_chunk = Self::locate_chunk(&snap, block_num, "logs").map(|(_, _, c)| c.clone());
+        let txs_chunk = Self::locate_chunk(&snap, block_num, "transactions").map(|(_, _, c)| c.clone());
+        let receipts_chunk = receipts_chunk.clone();
+        drop(snap);
+
+        if !receipts_chunk.is_vortex() {
+            debug!(
+                block_num,
+                chunk = receipts_chunk.path(),
+                "receipts chunk is not vortex; falling through"
+            );
+            return Ok(None);
+        }
+
+        // Decode logs for this block (or empty if no logs chunk /
+        // not vortex). Receipts can still be returned with no logs
+        // when the block had zero log-emitting transactions; we
+        // treat missing logs as "no logs", not as an error.
+        let logs_by_tx_idx = if let Some(chunk_ref) = logs_chunk {
+            if chunk_ref.is_vortex() {
+                let path = format!("chunks/{}", chunk_ref.path());
+                let decoded = log_decode::decode_logs_chunk(
+                    Arc::clone(&self.store),
+                    ObjectPath::from(path.as_str()),
+                    block_num,
+                    chunk_ref.size_bytes(),
+                    chunk_ref.footer_metadata(),
+                    chunk_ref.preload_ranges(),
+                )
+                .await
+                .map_err(|err| BucketClientError::Decode {
+                    block: block_num,
+                    reason: format!("vortex logs: {err}"),
+                })?;
+                receipt_decode::group_logs_by_tx_idx(decoded)
+            } else {
+                std::collections::BTreeMap::new()
+            }
+        } else {
+            std::collections::BTreeMap::new()
+        };
+
+        // Decode tx-types alongside (needed for Receipt.tx_type).
+        // Parquet-only transactions fall back to assuming legacy
+        // tx_type=0 — better than failing the entire receipt fetch.
+        let tx_types_by_tx_idx = if let Some(chunk_ref) = txs_chunk {
+            if chunk_ref.is_vortex() {
+                let path = format!("chunks/{}", chunk_ref.path());
+                let decoded = tx_decode::decode_transactions_chunk(
+                    Arc::clone(&self.store),
+                    ObjectPath::from(path.as_str()),
+                    block_num,
+                    chunk_ref.size_bytes(),
+                    chunk_ref.footer_metadata(),
+                    chunk_ref.preload_ranges(),
+                )
+                .await
+                .map_err(|err| BucketClientError::Decode {
+                    block: block_num,
+                    reason: format!("vortex transactions (tx_types): {err}"),
+                })?;
+                use alloy_consensus::Transaction as _;
+                decoded
+                    .into_iter()
+                    .map(|d| (d.tx_idx, d.tx.tx_type() as u8))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            } else {
+                std::collections::BTreeMap::new()
+            }
+        } else {
+            std::collections::BTreeMap::new()
+        };
+
+        let path = format!("chunks/{}", receipts_chunk.path());
+        let decoded = receipt_decode::decode_receipts_chunk(
+            Arc::clone(&self.store),
+            ObjectPath::from(path.as_str()),
+            block_num,
+            receipts_chunk.size_bytes(),
+            receipts_chunk.footer_metadata(),
+            receipts_chunk.preload_ranges(),
+            &logs_by_tx_idx,
+            &tx_types_by_tx_idx,
+        )
+        .await
+        .map_err(|err| BucketClientError::Decode {
+            block: block_num,
+            reason: format!("vortex receipts: {err}"),
+        })?;
+        Ok(Some(decoded.into_iter().map(|d| d.receipt).collect()))
+    }
+
+    /// Fetch a single transaction by hash. Uses the boot-loaded
+    /// tx_index to locate `(block_num, tx_idx)`, then decodes the
+    /// transactions chunk and picks the matching row.
+    async fn fetch_transaction_by_hash(
+        &self,
+        hash: alloy_primitives::TxHash,
+    ) -> Result<Option<TransactionSigned>, BucketClientError> {
+        let snap = self.snapshot.load();
+        let key = format!("0x{}", hex::encode(hash.as_slice()));
+        let Some(entry) = snap.tx_hash_to_location.get(&key).copied() else {
+            return Ok(None);
+        };
+        drop(snap);
+        let Some(txs) = self.fetch_transactions_by_block(entry.block_num).await? else {
+            return Ok(None);
+        };
+        // Decoded txs are sorted by tx_idx. Find the entry matching
+        // the index column from tx_index.json.
+        Ok(txs.into_iter().nth(entry.tx_index as usize))
+    }
+
+    /// Fetch a single receipt by tx hash.
+    async fn fetch_receipt_by_hash(
+        &self,
+        hash: alloy_primitives::TxHash,
+    ) -> Result<Option<reth_ethereum_primitives::Receipt>, BucketClientError> {
+        let snap = self.snapshot.load();
+        let key = format!("0x{}", hex::encode(hash.as_slice()));
+        let Some(entry) = snap.tx_hash_to_location.get(&key).copied() else {
+            return Ok(None);
+        };
+        drop(snap);
+        let Some(receipts) = self.fetch_receipts_by_block(entry.block_num).await? else {
+            return Ok(None);
+        };
+        Ok(receipts.into_iter().nth(entry.tx_index as usize))
+    }
+
+    /// PHASE26.x — fetch logs for the inclusive range and apply the
+    /// filter. Used by `BucketHeaderClient::logs_in_range`.
+    async fn fetch_logs_in_range(
+        &self,
+        from_block: BlockNumber,
+        to_block: BlockNumber,
+        filter: &LogScanFilter,
+    ) -> Result<Vec<Log>, BucketClientError> {
+        if to_block < from_block {
+            return Ok(Vec::new());
+        }
+        let snap = self.snapshot.load();
+        // Identify epochs that overlap the requested range.
+        let mut epoch_indices: Vec<usize> = (from_block..=to_block)
+            .filter_map(|num| snap.block_to_epoch.get(&num).copied())
+            .collect();
+        epoch_indices.sort_unstable();
+        epoch_indices.dedup();
+        if epoch_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pre-build block_num -> canonical hash so decoded logs
+        // can advertise the block_hash field correctly.
+        let mut block_hashes: HashMap<u64, B256> = HashMap::new();
+        for &idx in &epoch_indices {
+            for blk in &snap.epochs[idx].blocks {
+                if blk.num >= from_block && blk.num <= to_block {
+                    if let Ok(h) = parse_b256_hex(&blk.hash) {
+                        block_hashes.insert(blk.num, h);
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<Log> = Vec::new();
+        for &idx in &epoch_indices {
+            let epoch = &snap.epochs[idx];
+            // Prefer the per-epoch aggregated `logs` artifact when
+            // present: 1 GET per epoch vs up to 32 (one per block).
+            if let Some(epoch_logs) = epoch.epoch_artifacts.get("logs") {
+                let chunk_ref = epoch_logs.clone();
+                let path = format!("chunks/{}", chunk_ref.path());
+                let bytes = fetch_object(&self.store, &path).await?;
+                // Bloom probe — chunk-level skip when the filter is
+                // selective and the SBBF proves a miss.
+                if logs_decode::chunk_bloom_skips_filter(&bytes, filter) {
+                    debug!(epoch = epoch.epoch, "epoch logs chunk bloom-skipped");
+                    continue;
+                }
+                if chunk_ref.is_parquet() {
+                    let rows = logs_decode::decode_log_chunk_parquet(
+                        bytes,
+                        from_block,
+                        to_block,
+                        filter,
+                        &block_hashes,
+                    )
+                    .map_err(|err| BucketClientError::Backend(format!(
+                        "decode epoch logs (epoch {}): {err}", epoch.epoch
+                    )))?;
+                    out.extend(rows);
+                } else if chunk_ref.is_vortex() {
+                    // Vortex epoch-logs format. Today the live
+                    // mainnet bucket emits parquet for epoch logs;
+                    // when Vortex epoch artifacts ship this is the
+                    // pushdown path.
+                    let rows = vortex_decode::decode_log_chunk(
+                        Arc::clone(&self.store),
+                        ObjectPath::from(path.as_str()),
+                        chunk_ref.size_bytes(),
+                        chunk_ref.footer_metadata(),
+                        chunk_ref.preload_ranges(),
+                        from_block,
+                        to_block,
+                        filter,
+                        &block_hashes,
+                    )
+                    .await
+                    .map_err(|err| BucketClientError::Backend(format!(
+                        "decode vortex epoch logs (epoch {}): {err}", epoch.epoch
+                    )))?;
+                    out.extend(rows);
+                }
+                continue;
+            }
+
+            // Per-block fanout fallback — fetch every block's logs
+            // chunk in the requested range.
+            for blk in &epoch.blocks {
+                if blk.num < from_block || blk.num > to_block {
+                    continue;
+                }
+                let Some(chunk_ref) = blk.chunks.get("logs") else {
+                    continue;
+                };
+                let path = format!("chunks/{}", chunk_ref.path());
+                let bytes = fetch_object(&self.store, &path).await?;
+                if logs_decode::chunk_bloom_skips_filter(&bytes, filter) {
+                    debug!(block = blk.num, "block logs chunk bloom-skipped");
+                    continue;
+                }
+                if chunk_ref.is_parquet() {
+                    let rows = logs_decode::decode_log_chunk_parquet(
+                        bytes,
+                        from_block,
+                        to_block,
+                        filter,
+                        &block_hashes,
+                    )
+                    .map_err(|err| BucketClientError::Backend(format!(
+                        "decode block-logs (block {}): {err}", blk.num
+                    )))?;
+                    out.extend(rows);
+                } else if chunk_ref.is_vortex() {
+                    let rows = vortex_decode::decode_log_chunk(
+                        Arc::clone(&self.store),
+                        ObjectPath::from(path.as_str()),
+                        chunk_ref.size_bytes(),
+                        chunk_ref.footer_metadata(),
+                        chunk_ref.preload_ranges(),
+                        from_block,
+                        to_block,
+                        filter,
+                        &block_hashes,
+                    )
+                    .await
+                    .map_err(|err| BucketClientError::Backend(format!(
+                        "decode vortex block-logs (block {}): {err}", blk.num
+                    )))?;
+                    out.extend(rows);
+                }
+            }
+        }
+
+        // Final sort by (block_num, log_idx) for deterministic order.
+        out.sort_by_key(|l| (l.block_number.unwrap_or_default(), l.log_index.unwrap_or_default()));
+        Ok(out)
+    }
 }
 
 impl BucketHeaderClient for HttpBucketHeaderClient {
@@ -401,9 +816,10 @@ impl BucketHeaderClient for HttpBucketHeaderClient {
         // pipeline always is. If not (e.g. some tests), fall back
         // to None so reth's normal database path takes over.
         match Handle::try_current() {
-            Ok(handle) => handle
-                .block_on(async { self.fetch_header(num).await })
-                .map_err(Into::into),
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(async { self.fetch_header(num).await })
+            })
+            .map_err(Into::into),
             Err(_) => Ok(None),
         }
     }
@@ -420,6 +836,85 @@ impl BucketHeaderClient for HttpBucketHeaderClient {
 
     fn latest_finalized_block_number(&self) -> BlockNumber {
         self.snapshot.load().head.latest_finalized_block_num
+    }
+
+    fn transaction_by_hash(
+        &self,
+        hash: alloy_primitives::TxHash,
+    ) -> ProviderResult<Option<TransactionSigned>> {
+        match Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(async { self.fetch_transaction_by_hash(hash).await })
+            })
+            .map_err(Into::into),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn receipt_by_hash(
+        &self,
+        hash: alloy_primitives::TxHash,
+    ) -> ProviderResult<Option<reth_ethereum_primitives::Receipt>> {
+        match Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(async { self.fetch_receipt_by_hash(hash).await })
+            })
+            .map_err(Into::into),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn transactions_by_block(
+        &self,
+        num: BlockNumber,
+    ) -> ProviderResult<Option<Vec<TransactionSigned>>> {
+        match Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(async { self.fetch_transactions_by_block(num).await })
+            })
+            .map_err(Into::into),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn receipts_by_block(
+        &self,
+        num: BlockNumber,
+    ) -> ProviderResult<Option<Vec<reth_ethereum_primitives::Receipt>>> {
+        match Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(async { self.fetch_receipts_by_block(num).await })
+            })
+            .map_err(Into::into),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn logs_in_range(
+        &self,
+        from_block: BlockNumber,
+        to_block: BlockNumber,
+        addresses: &[Address],
+        topics: &[Vec<B256>; 4],
+    ) -> ProviderResult<Vec<Log>> {
+        let filter = LogScanFilter {
+            addresses: addresses.to_vec(),
+            topics: [
+                topics[0].clone(),
+                topics[1].clone(),
+                topics[2].clone(),
+                topics[3].clone(),
+            ],
+        };
+        match Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    self.fetch_logs_in_range(from_block, to_block, &filter).await
+                })
+            })
+            .map_err(Into::into),
+            Err(_) => Ok(Vec::new()),
+        }
     }
 }
 
@@ -491,7 +986,19 @@ mod tests {
         // legacy parquet path-only
         let p: ManifestChunkRef = serde_json::from_str("\"ab/abcdef\"").expect("parse path-only");
         assert!(!p.is_vortex());
+        assert!(p.is_parquet());
         assert_eq!(p.path(), "ab/abcdef");
+
+        // descriptor with explicit parquet format
+        let pdesc: ManifestChunkRef = serde_json::from_value(serde_json::json!({
+            "path": "cd/cdef",
+            "format": "parquet",
+            "version": 1,
+            "size_bytes": 99
+        }))
+        .expect("parse parquet desc");
+        assert!(!pdesc.is_vortex());
+        assert!(pdesc.is_parquet());
     }
 
     #[test]
@@ -515,5 +1022,30 @@ mod tests {
         let mut bad = payload.to_vec();
         bad[0] = b'M';
         assert!(verify_signature(&pubkey, &bad, &sig).is_err());
+    }
+
+    #[test]
+    fn epoch_manifest_deserializes_with_epoch_artifacts() {
+        let json = serde_json::json!({
+            "chain_id": 1,
+            "epoch": 448739,
+            "first_block_num": 25124823,
+            "last_block_num": 25124854,
+            "blocks": [],
+            "epoch_artifacts": {
+                "logs": {
+                    "format": "parquet",
+                    "path": "27/27408af36f550c3d6490e5328f5c331e74ae30a06abc3ce8411d272bcb561518",
+                    "size_bytes": 972372,
+                    "version": 1
+                }
+            }
+        });
+        let m: EpochManifest = serde_json::from_value(json).expect("parse");
+        assert_eq!(m.epoch, 448739);
+        assert_eq!(m.epoch_artifacts.len(), 1);
+        let logs_ref = m.epoch_artifacts.get("logs").unwrap();
+        assert!(logs_ref.is_parquet());
+        assert_eq!(logs_ref.size_bytes(), Some(972372));
     }
 }
