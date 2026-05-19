@@ -112,6 +112,7 @@ members = [
     "crates/storage/libmdbx-rs/mdbx-sys/",
     "crates/storage/nippy-jar/",
     "crates/storage/provider/",
+    "crates/relay-state-checkpointer/",
     "crates/storage/storage-api/",
     "crates/storage/zstd-compressors/",
     "crates/tasks/",

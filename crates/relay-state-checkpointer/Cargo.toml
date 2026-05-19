@@ -1,0 +1,54 @@
+[package]
+name = "relay-state-checkpointer"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Phase 26.2: full plain-state checkpoint emitter — reads a local reth datadir, writes signed Vortex artifacts to an S3 bucket."
+
+[[bin]]
+name = "relay-state-checkpointer"
+path = "src/main.rs"
+
+[dependencies]
+# Reth — re-use the EnvironmentArgs/AccessRights bootstrap from the
+# existing CLI commands instead of re-deriving the 5-arg
+# ProviderFactory::new wiring.
+reth-cli-commands = { path = "../cli/commands" }
+reth-ethereum-cli = { path = "../ethereum/cli", default-features = false }
+reth-provider = { path = "../storage/provider" }
+reth-db-api = { path = "../storage/db-api" }
+reth-storage-api = { path = "../storage/storage-api" }
+reth-primitives-traits = { path = "../primitives-traits" }
+reth-node-types = { path = "../node/types" }
+reth-storage-errors = { path = "../storage/errors" }
+reth-node-ethereum = { path = "../ethereum/node" }
+
+# Vortex — same git fork the relay project uses, byte-equivalent
+# column layouts shared with relay-rpc readers.
+vortex = { git = "https://github.com/jparklev/vortex.git", branch = "develop", features = ["tokio", "files"] }
+vortex-file = { git = "https://github.com/jparklev/vortex.git", branch = "develop" }
+vortex-buffer = { git = "https://github.com/jparklev/vortex.git", branch = "develop" }
+
+# Alloy primitives
+alloy-consensus = { version = "1.0", features = ["serde"] }
+alloy-primitives = "1.5.7"
+
+# Crypto / IO
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+sha2 = "0.10"
+hex = "0.4"
+object_store = { version = "0.13", features = ["aws"] }
+
+# Async runtime + CLI
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+eyre = "0.6"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
