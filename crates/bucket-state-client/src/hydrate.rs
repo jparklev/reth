@@ -23,7 +23,7 @@ use reth_primitives_traits::Account;
 
 use crate::EpochManifest;
 use sha2::{Digest, Sha256};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::{fetch_object, vortex_state, BucketStateClientError};
 
@@ -75,12 +75,12 @@ pub(crate) struct MaterializedShardCounts {
     pub code: u64,
 }
 
-/// Decode the three checkpoint chunks for one shard and merge them into
-/// the hash-keyed caches.
+/// Decode the checkpoint chunks for one shard and merge them into the
+/// hash-keyed caches.
 pub(crate) async fn materialize_shard(
-    accounts_bytes: Vec<u8>,
-    storage_bytes: Vec<u8>,
-    code_bytes: Vec<u8>,
+    accounts_chunks: Vec<Vec<u8>>,
+    storage_chunks: Vec<Vec<u8>>,
+    code_chunks: Vec<Vec<u8>>,
     account_cache: &Cache<B256, Option<Account>>,
     storage_cache: &Cache<(B256, B256), Option<U256>>,
     code_cache: &Cache<B256, Option<Bytes>>,
@@ -88,10 +88,12 @@ pub(crate) async fn materialize_shard(
     let mut counts = MaterializedShardCounts::default();
 
     // Empty shard files mean "this family has no rows in this shard."
-    // The checkpointer emits a 0-byte placeholder so per-shard refs
-    // stay schema-consistent. Skip Vortex decode for empties; trying
-    // to parse a 0-byte buffer errors with "Invalid range".
-    if !accounts_bytes.is_empty() {
+    // Skip Vortex decode for empties; trying to parse a 0-byte buffer
+    // errors with "Invalid range".
+    for accounts_bytes in accounts_chunks {
+        if accounts_bytes.is_empty() {
+            continue;
+        }
         let rows_a = vortex_state::decode_accounts_chunk(accounts_bytes).await?;
         for row in rows_a {
             let account = Account {
@@ -110,7 +112,10 @@ pub(crate) async fn materialize_shard(
         }
     }
 
-    if !storage_bytes.is_empty() {
+    for storage_bytes in storage_chunks {
+        if storage_bytes.is_empty() {
+            continue;
+        }
         let rows_s = vortex_state::decode_storage_chunk(storage_bytes).await?;
         for row in rows_s {
             let key = (row.hashed_address, row.hashed_slot);
@@ -121,7 +126,10 @@ pub(crate) async fn materialize_shard(
         }
     }
 
-    if !code_bytes.is_empty() {
+    for code_bytes in code_chunks {
+        if code_bytes.is_empty() {
+            continue;
+        }
         let rows_c = vortex_state::decode_code_chunk(code_bytes).await?;
         for row in rows_c {
             if code_cache.get(&row.code_hash).is_none() {

@@ -8541,6 +8541,7 @@ dependencies = [
  "reth-provider",
  "reth-storage-api",
  "reth-storage-errors",
+ "reth-tasks",
  "serde",
  "serde_json",
  "sha2",

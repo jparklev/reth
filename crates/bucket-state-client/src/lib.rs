@@ -17,7 +17,7 @@
 //! 3. Fetch `<prefix>/index.json[.sig]`, verify, parse as `CheckpointIndex`.
 //! 4. Pick the most recent entry ≤ `target_block` (default = head's `latest_finalized_block_num`).
 //! 5. Fetch the entry's `manifest.json[.sig]`, verify sig + sha, parse.
-//! 6. Validate the checkpoint manifest is v2 + hashed-keyed.
+//! 6. Validate the checkpoint manifest is v3 + hashed-keyed.
 //! 7. Scan the local disk cache for already-downloaded shards. Do not fetch or decode checkpoint
 //!    shards during boot.
 //! 8. Walk forward through epoch manifests from `checkpoint.block_number + 1 ..
@@ -190,9 +190,9 @@ pub struct StateArtifactRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardManifest {
     pub shard: u32,
-    pub accounts: StateArtifactRef,
-    pub storage: StateArtifactRef,
-    pub code: StateArtifactRef,
+    pub accounts: Vec<StateArtifactRef>,
+    pub storage: Vec<StateArtifactRef>,
+    pub code: Vec<StateArtifactRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -590,30 +590,9 @@ impl HttpBucketStateClient {
             BucketStateClientError::Decode(format!("checkpoint manifest has no shard {shard}"))
         })?;
         let shard_dir = self.shard_cache_dir(shard);
-        let accounts = self
-            .chunk_bytes_from_disk_or_bucket(
-                &shard_dir,
-                "accounts.vortex",
-                &manifest.accounts.object_key,
-                &manifest.accounts.content_sha256,
-            )
-            .await?;
-        let storage = self
-            .chunk_bytes_from_disk_or_bucket(
-                &shard_dir,
-                "storage.vortex",
-                &manifest.storage.object_key,
-                &manifest.storage.content_sha256,
-            )
-            .await?;
-        let code = self
-            .chunk_bytes_from_disk_or_bucket(
-                &shard_dir,
-                "code.vortex",
-                &manifest.code.object_key,
-                &manifest.code.content_sha256,
-            )
-            .await?;
+        let accounts = self.chunk_bytes_for_refs(&shard_dir, &manifest.accounts).await?;
+        let storage = self.chunk_bytes_for_refs(&shard_dir, &manifest.storage).await?;
+        let code = self.chunk_bytes_for_refs(&shard_dir, &manifest.code).await?;
         let counts = hydrate::materialize_shard(
             accounts,
             storage,
@@ -634,6 +613,27 @@ impl HttpBucketStateClient {
             "checkpoint shard materialized"
         );
         Ok(())
+    }
+
+    async fn chunk_bytes_for_refs(
+        &self,
+        shard_dir: &Path,
+        refs: &[StateArtifactRef],
+    ) -> Result<Vec<Vec<u8>>, BucketStateClientError> {
+        let mut chunks = Vec::with_capacity(refs.len());
+        for (idx, artifact) in refs.iter().enumerate() {
+            let file_name = artifact_cache_file_name(artifact, idx);
+            chunks.push(
+                self.chunk_bytes_from_disk_or_bucket(
+                    shard_dir,
+                    &file_name,
+                    &artifact.object_key,
+                    &artifact.content_sha256,
+                )
+                .await?,
+            );
+        }
+        Ok(chunks)
     }
 
     async fn chunk_bytes_from_disk_or_bucket(
@@ -804,9 +804,9 @@ where
 fn validate_checkpoint_manifest(
     manifest: &FinalizedStateArtifactManifest,
 ) -> Result<(), BucketStateClientError> {
-    if manifest.version != 2 {
+    if manifest.version != 3 {
         return Err(BucketStateClientError::Decode(format!(
-            "unsupported checkpoint manifest version {}; bucket-state-client requires version 2 hashed checkpoints",
+            "unsupported checkpoint manifest version {}; bucket-state-client requires version 3 hashed checkpoints",
             manifest.version
         )));
     }
@@ -818,11 +818,11 @@ fn validate_checkpoint_manifest(
     }
     if manifest.shards.is_empty() {
         return Err(BucketStateClientError::Decode(
-            "checkpoint manifest v2 must contain hashed shards".into(),
+            "checkpoint manifest v3 must contain hashed shards".into(),
         ));
     }
     let shard_bits = manifest.shard_bits.ok_or_else(|| {
-        BucketStateClientError::Decode("checkpoint manifest v2 missing shard_bits".into())
+        BucketStateClientError::Decode("checkpoint manifest v3 missing shard_bits".into())
     })?;
     if shard_bits > 32 {
         return Err(BucketStateClientError::Decode(format!(
@@ -847,10 +847,7 @@ fn scan_cached_shards(checkpoint_cache_dir: &Path) -> DashSet<u32> {
             continue;
         };
         let dir = entry.path();
-        if dir.join("accounts.vortex").is_file() &&
-            dir.join("storage.vortex").is_file() &&
-            dir.join("code.vortex").is_file()
-        {
+        if dir.is_dir() {
             loaded.insert(shard);
         }
     }
@@ -869,6 +866,15 @@ fn shard_id(hash: B256, shard_bits: u8) -> u32 {
         prefix = (prefix << 1) | u32::from((byte >> bit_in_byte) & 1);
     }
     prefix
+}
+
+fn artifact_cache_file_name(artifact: &StateArtifactRef, fallback_idx: usize) -> String {
+    Path::new(&artifact.object_key)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("chunk-{fallback_idx:04}.vortex"))
 }
 
 fn build_object_store(
@@ -1169,9 +1175,13 @@ mod tests {
         assert_eq!(client.storage(addr, slot).unwrap(), Some(U256::from(3)));
         assert_eq!(client.code_by_hash(code_hash).unwrap(), Some(code.clone()));
         assert!(client.materialized_shards.contains(&0));
-        assert!(client.shard_cache_dir(0).join("accounts.vortex").is_file());
+        assert!(client.shard_cache_dir(0).join("accounts-part-0000.vortex").is_file());
 
-        for object in ["accounts-0000.vortex", "storage-0000.vortex", "code-0000.vortex"] {
+        for object in [
+            "shard-0000/accounts-part-0000.vortex",
+            "shard-0000/storage-part-0000.vortex",
+            "shard-0000/code-part-0000.vortex",
+        ] {
             store.delete(&ObjectPath::from(format!("{manifest_dir}/{object}"))).await.unwrap();
         }
 
@@ -1181,15 +1191,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn shard_load_decodes_multiple_storage_sub_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
+        let manifest_dir = "checkpoints/100";
+        let addr = Address::from([0x34; 20]);
+        let slot_a = U256::from(0x45);
+        let slot_b = U256::from(0x46);
+        let hashed_addr = keccak256(addr);
+        let hashed_slot_a = keccak256(slot_a.to_be_bytes::<32>());
+        let hashed_slot_b = keccak256(slot_b.to_be_bytes::<32>());
+        let mut shard = empty_shard_manifest(0);
+        let mut storage_ref_a = artifact_ref(0, "storage", 0);
+        put_chunk(
+            &store,
+            manifest_dir,
+            &mut storage_ref_a,
+            storage_chunk(&[(hashed_addr, hashed_slot_a, U256::from(11))]).await,
+        )
+        .await;
+        shard.storage.push(storage_ref_a);
+        let mut storage_ref_b = artifact_ref(0, "storage", 1);
+        put_chunk(
+            &store,
+            manifest_dir,
+            &mut storage_ref_b,
+            storage_chunk(&[(hashed_addr, hashed_slot_b, U256::from(12))]).await,
+        )
+        .await;
+        shard.storage.push(storage_ref_b);
+        let client = test_client(
+            Arc::clone(&store),
+            checkpoint_manifest(0, vec![shard]),
+            tmp.path().to_path_buf(),
+        );
+
+        assert_eq!(client.storage(addr, slot_a).unwrap(), Some(U256::from(11)));
+        assert_eq!(client.storage(addr, slot_b).unwrap(), Some(U256::from(12)));
+        assert!(client.materialized_shards.contains(&0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn shard_load_failure_propagates() {
         let tmp = tempfile::tempdir().unwrap();
         let client = test_client(
             Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>,
-            checkpoint_manifest(0, vec![empty_shard_manifest(0)]),
+            checkpoint_manifest(0, vec![referenced_shard_manifest(0)]),
             tmp.path().to_path_buf(),
         );
         let err = client.account(Address::from([0x55; 20])).unwrap_err();
-        assert!(err.to_string().contains("GET checkpoints/100/accounts-0000.vortex"));
+        assert!(err
+            .to_string()
+            .contains("GET checkpoints/100/shard-0000/accounts-part-0000.vortex"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1231,11 +1284,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_v1_is_rejected() {
+    fn manifest_pre_v3_is_rejected() {
         let mut manifest = checkpoint_manifest(0, vec![empty_shard_manifest(0)]);
-        manifest.version = 1;
-        let err = validate_checkpoint_manifest(&manifest).unwrap_err();
-        assert!(err.to_string().contains("requires version 2 hashed checkpoints"));
+        for version in [1, 2] {
+            manifest.version = version;
+            let err = validate_checkpoint_manifest(&manifest).unwrap_err();
+            assert!(err.to_string().contains("requires version 3 hashed checkpoints"));
+        }
     }
 
     #[test]
@@ -1346,7 +1401,7 @@ mod tests {
         shards: Vec<ShardManifest>,
     ) -> FinalizedStateArtifactManifest {
         FinalizedStateArtifactManifest {
-            version: 2,
+            version: 3,
             chain_id: 1,
             block_number: 100,
             block_hash: "0x00".into(),
@@ -1361,22 +1416,26 @@ mod tests {
     }
 
     fn empty_shard_manifest(shard: u32) -> ShardManifest {
+        ShardManifest { shard, accounts: Vec::new(), storage: Vec::new(), code: Vec::new() }
+    }
+
+    fn referenced_shard_manifest(shard: u32) -> ShardManifest {
         ShardManifest {
             shard,
-            accounts: artifact_ref(shard, "accounts"),
-            storage: artifact_ref(shard, "storage"),
-            code: artifact_ref(shard, "code"),
+            accounts: vec![artifact_ref(shard, "accounts", 0)],
+            storage: vec![artifact_ref(shard, "storage", 0)],
+            code: vec![artifact_ref(shard, "code", 0)],
         }
     }
 
-    fn artifact_ref(shard: u32, kind: &str) -> StateArtifactRef {
+    fn artifact_ref(shard: u32, kind: &str, part: usize) -> StateArtifactRef {
         StateArtifactRef {
             chain_id: 1,
             kind: kind.into(),
             from_block: 100,
             to_block: 100,
             state_root: None,
-            object_key: format!("{kind}-{shard:04}.vortex"),
+            object_key: format!("shard-{shard:04}/{kind}-part-{part:04}.vortex"),
             index_key: None,
             content_sha256: String::new(),
             shard: Some(shard),
@@ -1397,9 +1456,15 @@ mod tests {
         let storage_bytes = storage_chunk(storage).await;
         let code_bytes = code_chunk(code).await;
         let mut manifest = empty_shard_manifest(shard);
-        put_chunk(store, manifest_dir, &mut manifest.accounts, accounts_bytes).await;
-        put_chunk(store, manifest_dir, &mut manifest.storage, storage_bytes).await;
-        put_chunk(store, manifest_dir, &mut manifest.code, code_bytes).await;
+        let mut accounts_ref = artifact_ref(shard, "accounts", 0);
+        put_chunk(store, manifest_dir, &mut accounts_ref, accounts_bytes).await;
+        manifest.accounts.push(accounts_ref);
+        let mut storage_ref = artifact_ref(shard, "storage", 0);
+        put_chunk(store, manifest_dir, &mut storage_ref, storage_bytes).await;
+        manifest.storage.push(storage_ref);
+        let mut code_ref = artifact_ref(shard, "code", 0);
+        put_chunk(store, manifest_dir, &mut code_ref, code_bytes).await;
+        manifest.code.push(code_ref);
         manifest
     }
 

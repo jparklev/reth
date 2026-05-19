@@ -203,8 +203,9 @@ async fn async_main(cli: Cli, task_runtime: reth_tasks::Runtime) -> eyre::Result
         accounts = dump.total_accounts,
         storage_rows = dump.total_storage,
         code_blobs = dump.total_code,
-        shards = dump.account_shards.len(),
-        code_shards = dump.code_shards.len(),
+        account_chunks = dump.account_chunks.len(),
+        storage_chunks = dump.storage_chunks.len(),
+        code_chunks = dump.code_chunks.len(),
         elapsed_secs = start.elapsed().as_secs(),
         "hash-keyed state dump complete"
     );
@@ -260,11 +261,20 @@ fn shard_range(shard_id: u32, bits: u8) -> (B256, B256) {
     (B256::from(min), B256::from(max))
 }
 
-// ============== dump (streaming, shard-by-shard) ==============
+// ============== dump (streaming, shard-by-shard, multi-chunk) ==============
+
+/// Per-(shard, family) flush threshold. When a shard's in-memory
+/// buffer reaches this size, we emit it as the next "part" sub-chunk
+/// and start a fresh buffer for the same shard. Fat contracts (e.g.
+/// Uniswap V3 pools with millions of slots, all landing in one
+/// addr_hash shard) used to OOM with a single buffer — sub-chunking
+/// caps peak memory at ~one chunk's worth.
+const FLUSH_THRESHOLD_ROWS: usize = 1_000_000;
 
 #[derive(Default)]
-struct ShardEmit {
+struct ChunkEmit {
     shard: u32,
+    part: u32,
     object_key: String,
     bytes_written: u64,
     sha256_hex: String,
@@ -275,9 +285,9 @@ struct ShardEmit {
 
 #[derive(Default)]
 struct StateDump {
-    account_shards: Vec<ShardEmit>,
-    storage_shards: Vec<ShardEmit>,
-    code_shards: Vec<ShardEmit>,
+    account_chunks: Vec<ChunkEmit>,
+    storage_chunks: Vec<ChunkEmit>,
+    code_chunks: Vec<ChunkEmit>,
     total_accounts: u64,
     total_storage: u64,
     total_code: u64,
@@ -296,6 +306,7 @@ where
     let acct_start = Instant::now();
     let mut accounts_cursor = tx.cursor_read::<HashedAccounts>()?;
     let mut current_shard: Option<u32> = None;
+    let mut next_part: u32 = 0;
     let mut buf: Vec<(B256, u64, U256, B256)> = Vec::new();
     let mut code_hashes_seen: HashSet<B256> = HashSet::new();
     let max_accounts = if cli.max_accounts == 0 { u64::MAX } else { cli.max_accounts as u64 };
@@ -309,11 +320,14 @@ where
         let shard = shard_for_hash(h_addr, cli.shard_bits) as u32;
 
         if Some(shard) != current_shard {
-            if let Some(prev) = current_shard.take() {
-                let emit = flush_accounts(cli, prev, std::mem::take(&mut buf)).await?;
-                dump.account_shards.push(emit);
+            if let Some(prev) = current_shard.take() &&
+                !buf.is_empty()
+            {
+                let chunk = flush_accounts(cli, prev, next_part, std::mem::take(&mut buf)).await?;
+                dump.account_chunks.push(chunk);
             }
             current_shard = Some(shard);
+            next_part = 0;
         }
 
         let code_hash = account.bytecode_hash.unwrap_or(KECCAK_EMPTY);
@@ -322,6 +336,12 @@ where
         }
         buf.push((h_addr, account.nonce, account.balance, code_hash));
         dump.total_accounts += 1;
+
+        if buf.len() >= FLUSH_THRESHOLD_ROWS {
+            let chunk = flush_accounts(cli, shard, next_part, std::mem::take(&mut buf)).await?;
+            dump.account_chunks.push(chunk);
+            next_part += 1;
+        }
 
         if dump.total_accounts.is_multiple_of(500_000) {
             info!(
@@ -332,33 +352,26 @@ where
             );
         }
     }
-    if let Some(prev) = current_shard.take() {
-        let emit = flush_accounts(cli, prev, std::mem::take(&mut buf)).await?;
-        dump.account_shards.push(emit);
+    if let Some(prev) = current_shard.take() &&
+        !buf.is_empty()
+    {
+        let chunk = flush_accounts(cli, prev, next_part, std::mem::take(&mut buf)).await?;
+        dump.account_chunks.push(chunk);
     }
     info!(
         accounts = dump.total_accounts,
-        shards = dump.account_shards.len(),
+        chunks = dump.account_chunks.len(),
         code_hashes_referenced = code_hashes_seen.len(),
         elapsed_secs = acct_start.elapsed().as_secs(),
         "accounts dump complete"
     );
 
     // ---- storage ----
-    // Cap per-shard storage rows to avoid OOM on shards containing
-    // fat contracts (a single Uniswap V3 pool with millions of
-    // position slots will land entirely in one addr_hash shard).
-    // Excess slots are skipped with a WARN. Fix path: per-shard
-    // sub-chunk streaming + multi-ref manifest. Tracked as a
-    // follow-up — single-ref schema can't represent split shards
-    // today.
-    const MAX_STORAGE_ROWS_PER_SHARD: usize = 5_000_000;
-
     let storage_start = Instant::now();
     let mut storage_cursor = tx.cursor_dup_read::<HashedStorages>()?;
     let mut current_shard: Option<u32> = None;
+    let mut next_part: u32 = 0;
     let mut buf: Vec<(B256, B256, U256)> = Vec::new();
-    let mut current_shard_skipped: u64 = 0;
 
     // walk over a dup table yields (key, value) per duplicate row; for
     // HashedStorages: key = keccak(addr), value = StorageEntry { key:
@@ -368,43 +381,34 @@ where
         let (h_addr, entry) = row?;
         let shard = shard_for_hash(h_addr, cli.shard_bits) as u32;
 
-        // Skip storage for accounts past the --max-accounts cap. We
-        // identify those by shard ID > last account shard (since
-        // sorted), OR by comparing within the current shard against
-        // the highest account hash emitted. For simplicity: if
-        // max_accounts capped us mid-walk, the last account shard
-        // emit captures the cutoff; storage shards beyond it are
-        // skipped entirely.
+        // Skip storage past the --max-accounts cap (shard ID > last
+        // account shard emitted).
         if cli.max_accounts > 0 {
-            let last_acct_shard = dump.account_shards.last().map(|s| s.shard).unwrap_or(0);
+            let last_acct_shard = dump.account_chunks.last().map(|c| c.shard).unwrap_or(0);
             if shard > last_acct_shard {
                 break;
             }
         }
 
         if Some(shard) != current_shard {
-            if let Some(prev) = current_shard.take() {
-                if current_shard_skipped > 0 {
-                    warn!(
-                        shard = prev,
-                        skipped = current_shard_skipped,
-                        max = MAX_STORAGE_ROWS_PER_SHARD,
-                        "storage shard exceeded row cap — extra rows dropped (sub-shard streaming TODO)"
-                    );
-                }
-                let emit = flush_storage(cli, prev, std::mem::take(&mut buf)).await?;
-                dump.storage_shards.push(emit);
-                current_shard_skipped = 0;
+            if let Some(prev) = current_shard.take() &&
+                !buf.is_empty()
+            {
+                let chunk = flush_storage(cli, prev, next_part, std::mem::take(&mut buf)).await?;
+                dump.storage_chunks.push(chunk);
             }
             current_shard = Some(shard);
+            next_part = 0;
         }
 
-        if buf.len() >= MAX_STORAGE_ROWS_PER_SHARD {
-            current_shard_skipped += 1;
-            continue;
-        }
         buf.push((h_addr, entry.key, entry.value));
         dump.total_storage += 1;
+
+        if buf.len() >= FLUSH_THRESHOLD_ROWS {
+            let chunk = flush_storage(cli, shard, next_part, std::mem::take(&mut buf)).await?;
+            dump.storage_chunks.push(chunk);
+            next_part += 1;
+        }
 
         if dump.total_storage.is_multiple_of(2_000_000) {
             info!(
@@ -415,13 +419,15 @@ where
             );
         }
     }
-    if let Some(prev) = current_shard.take() {
-        let emit = flush_storage(cli, prev, std::mem::take(&mut buf)).await?;
-        dump.storage_shards.push(emit);
+    if let Some(prev) = current_shard.take() &&
+        !buf.is_empty()
+    {
+        let chunk = flush_storage(cli, prev, next_part, std::mem::take(&mut buf)).await?;
+        dump.storage_chunks.push(chunk);
     }
     info!(
         storage = dump.total_storage,
-        shards = dump.storage_shards.len(),
+        chunks = dump.storage_chunks.len(),
         elapsed_secs = storage_start.elapsed().as_secs(),
         "storage dump complete"
     );
@@ -433,16 +439,20 @@ where
     sorted.sort();
 
     let mut current_shard: Option<u32> = None;
+    let mut next_part: u32 = 0;
     let mut buf: Vec<(B256, Vec<u8>)> = Vec::new();
     for code_hash in sorted {
         let shard = shard_for_hash(code_hash, cli.shard_bits) as u32;
 
         if Some(shard) != current_shard {
-            if let Some(prev) = current_shard.take() {
-                let emit = flush_code(cli, prev, std::mem::take(&mut buf)).await?;
-                dump.code_shards.push(emit);
+            if let Some(prev) = current_shard.take() &&
+                !buf.is_empty()
+            {
+                let chunk = flush_code(cli, prev, next_part, std::mem::take(&mut buf)).await?;
+                dump.code_chunks.push(chunk);
             }
             current_shard = Some(shard);
+            next_part = 0;
         }
 
         match bytecode_cursor.seek_exact(code_hash)? {
@@ -454,14 +464,22 @@ where
                 warn!(?code_hash, "referenced code_hash missing from Bytecodes");
             }
         }
+
+        if buf.len() >= FLUSH_THRESHOLD_ROWS {
+            let chunk = flush_code(cli, shard, next_part, std::mem::take(&mut buf)).await?;
+            dump.code_chunks.push(chunk);
+            next_part += 1;
+        }
     }
-    if let Some(prev) = current_shard.take() {
-        let emit = flush_code(cli, prev, std::mem::take(&mut buf)).await?;
-        dump.code_shards.push(emit);
+    if let Some(prev) = current_shard.take() &&
+        !buf.is_empty()
+    {
+        let chunk = flush_code(cli, prev, next_part, std::mem::take(&mut buf)).await?;
+        dump.code_chunks.push(chunk);
     }
     info!(
         code_blobs = dump.total_code,
-        shards = dump.code_shards.len(),
+        chunks = dump.code_chunks.len(),
         elapsed_secs = code_start.elapsed().as_secs(),
         "code dump complete"
     );
@@ -476,18 +494,20 @@ fn shard_dir(out_dir: &std::path::Path, shard: u32) -> PathBuf {
 async fn flush_accounts(
     cli: &Cli,
     shard: u32,
+    part: u32,
     rows: Vec<(B256, u64, U256, B256)>,
-) -> eyre::Result<ShardEmit> {
+) -> eyre::Result<ChunkEmit> {
     let dir = shard_dir(&cli.out_dir, shard);
     tokio::fs::create_dir_all(&dir).await?;
     let bytes = vortex_writer::accounts_chunk(&rows).await?;
     let key_min = rows.first().map(|r| r.0);
     let key_max = rows.last().map(|r| r.0);
-    let path = dir.join("accounts.vortex");
-    let object_key = format!("shard-{shard:04}/accounts.vortex");
+    let object_key = format!("shard-{shard:04}/accounts-part-{part:04}.vortex");
+    let path = cli.out_dir.join(&object_key);
     tokio::fs::write(&path, &bytes).await?;
-    Ok(ShardEmit {
+    Ok(ChunkEmit {
         shard,
+        part,
         object_key,
         bytes_written: bytes.len() as u64,
         sha256_hex: format!("{:x}", Sha256::digest(&bytes)),
@@ -500,18 +520,20 @@ async fn flush_accounts(
 async fn flush_storage(
     cli: &Cli,
     shard: u32,
+    part: u32,
     rows: Vec<(B256, B256, U256)>,
-) -> eyre::Result<ShardEmit> {
+) -> eyre::Result<ChunkEmit> {
     let dir = shard_dir(&cli.out_dir, shard);
     tokio::fs::create_dir_all(&dir).await?;
     let bytes = vortex_writer::storage_chunk(&rows).await?;
     let key_min = rows.first().map(|r| r.0);
     let key_max = rows.last().map(|r| r.0);
-    let path = dir.join("storage.vortex");
-    let object_key = format!("shard-{shard:04}/storage.vortex");
+    let object_key = format!("shard-{shard:04}/storage-part-{part:04}.vortex");
+    let path = cli.out_dir.join(&object_key);
     tokio::fs::write(&path, &bytes).await?;
-    Ok(ShardEmit {
+    Ok(ChunkEmit {
         shard,
+        part,
         object_key,
         bytes_written: bytes.len() as u64,
         sha256_hex: format!("{:x}", Sha256::digest(&bytes)),
@@ -521,17 +543,23 @@ async fn flush_storage(
     })
 }
 
-async fn flush_code(cli: &Cli, shard: u32, rows: Vec<(B256, Vec<u8>)>) -> eyre::Result<ShardEmit> {
+async fn flush_code(
+    cli: &Cli,
+    shard: u32,
+    part: u32,
+    rows: Vec<(B256, Vec<u8>)>,
+) -> eyre::Result<ChunkEmit> {
     let dir = shard_dir(&cli.out_dir, shard);
     tokio::fs::create_dir_all(&dir).await?;
     let bytes = vortex_writer::code_chunk(&rows).await?;
     let key_min = rows.first().map(|r| r.0);
     let key_max = rows.last().map(|r| r.0);
-    let path = dir.join("code.vortex");
-    let object_key = format!("shard-{shard:04}/code.vortex");
+    let object_key = format!("shard-{shard:04}/code-part-{part:04}.vortex");
+    let path = cli.out_dir.join(&object_key);
     tokio::fs::write(&path, &bytes).await?;
-    Ok(ShardEmit {
+    Ok(ChunkEmit {
         shard,
+        part,
         object_key,
         bytes_written: bytes.len() as u64,
         sha256_hex: format!("{:x}", Sha256::digest(&bytes)),
@@ -541,7 +569,7 @@ async fn flush_code(cli: &Cli, shard: u32, rows: Vec<(B256, Vec<u8>)>) -> eyre::
     })
 }
 
-// ============== manifest emission (v2 / hash-keyed) ==============
+// ============== manifest emission (v3 / hash-keyed / multi-ref) ==============
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StateArtifactRef {
@@ -554,6 +582,9 @@ struct StateArtifactRef {
     content_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     shard: Option<u32>,
+    /// Sub-chunk index within (shard, family). 0 for single-chunk shards.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    part: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     key_min: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -563,9 +594,13 @@ struct StateArtifactRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ShardManifest {
     shard: u32,
-    accounts: StateArtifactRef,
-    storage: StateArtifactRef,
-    code: StateArtifactRef,
+    /// v3 schema: every (shard, family) is a vector. Empty when the
+    /// shard has no rows for that family. Multi-entry when a fat
+    /// contract overflowed the in-memory flush threshold (sub-chunked).
+    /// Ordered by `part` ascending.
+    accounts: Vec<StateArtifactRef>,
+    storage: Vec<StateArtifactRef>,
+    code: Vec<StateArtifactRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -575,11 +610,11 @@ struct FinalizedStateArtifactManifest {
     block_number: u64,
     block_hash: String,
     state_root: Option<String>,
-    /// Always present in v2; only the per-shard refs are populated.
+    /// One entry per shard ID that has at least one chunk in any family.
     shards: Vec<ShardManifest>,
     /// Number of high-order bits of `keccak(addr)` that route to a shard.
     shard_bits: Option<u8>,
-    /// Always `"hashed"` in v2 — kept as a string so v3 can extend.
+    /// Always `"hashed"` in v3.
     key_layout: Option<String>,
 }
 
@@ -618,67 +653,40 @@ fn build_manifest(
     state_root: &Option<String>,
     dump: &StateDump,
 ) -> FinalizedStateArtifactManifest {
-    // Join the three shard families on shard_id. Each family may have
-    // gaps (e.g. a shard with no storage rows), but for every shard
-    // that contains accounts we emit a ShardManifest. The bucket
-    // client tolerates empty storage/code refs (returns 0 rows).
+    // Group sub-chunks by shard id. Each (shard, family) may have
+    // zero, one, or many chunks. The v3 client iterates the Vec and
+    // decodes each chunk in turn.
     let mut by_shard: std::collections::BTreeMap<
         u32,
-        (Option<&ShardEmit>, Option<&ShardEmit>, Option<&ShardEmit>),
+        (Vec<&ChunkEmit>, Vec<&ChunkEmit>, Vec<&ChunkEmit>),
     > = std::collections::BTreeMap::new();
-    for e in &dump.account_shards {
-        by_shard.entry(e.shard).or_insert((None, None, None)).0 = Some(e);
+    for c in &dump.account_chunks {
+        by_shard.entry(c.shard).or_default().0.push(c);
     }
-    for e in &dump.storage_shards {
-        by_shard.entry(e.shard).or_insert((None, None, None)).1 = Some(e);
+    for c in &dump.storage_chunks {
+        by_shard.entry(c.shard).or_default().1.push(c);
     }
-    for e in &dump.code_shards {
-        by_shard.entry(e.shard).or_insert((None, None, None)).2 = Some(e);
+    for c in &dump.code_chunks {
+        by_shard.entry(c.shard).or_default().2.push(c);
     }
+
     let shards = by_shard
         .into_iter()
-        .map(|(shard_id, (a, s, c))| {
-            let (rmin, rmax) = shard_range(shard_id, cli.shard_bits);
-            let range_min = format!("0x{}", hex::encode(rmin.as_slice()));
-            let range_max = format!("0x{}", hex::encode(rmax.as_slice()));
+        .map(|(shard_id, (mut a, mut s, mut c))| {
+            a.sort_by_key(|c| c.part);
+            s.sort_by_key(|c| c.part);
+            c.sort_by_key(|c| c.part);
             ShardManifest {
                 shard: shard_id,
-                accounts: emit_to_ref(
-                    1,
-                    "accounts",
-                    block_number,
-                    state_root,
-                    shard_id,
-                    a,
-                    &range_min,
-                    &range_max,
-                ),
-                storage: emit_to_ref(
-                    1,
-                    "storage",
-                    block_number,
-                    state_root,
-                    shard_id,
-                    s,
-                    &range_min,
-                    &range_max,
-                ),
-                code: emit_to_ref(
-                    1,
-                    "code",
-                    block_number,
-                    state_root,
-                    shard_id,
-                    c,
-                    &range_min,
-                    &range_max,
-                ),
+                accounts: chunks_to_refs("accounts", block_number, state_root, &a),
+                storage: chunks_to_refs("storage", block_number, state_root, &s),
+                code: chunks_to_refs("code", block_number, state_root, &c),
             }
         })
         .collect();
 
     FinalizedStateArtifactManifest {
-        version: 2,
+        version: 3,
         chain_id: 1,
         block_number,
         block_hash: block_hash.to_string(),
@@ -689,42 +697,28 @@ fn build_manifest(
     }
 }
 
-fn emit_to_ref(
-    chain_id: u64,
+fn chunks_to_refs(
     kind: &str,
     block: u64,
     state_root: &Option<String>,
-    shard_id: u32,
-    emit: Option<&ShardEmit>,
-    range_min: &str,
-    range_max: &str,
-) -> StateArtifactRef {
-    match emit {
-        Some(e) => StateArtifactRef {
-            chain_id,
+    chunks: &[&ChunkEmit],
+) -> Vec<StateArtifactRef> {
+    chunks
+        .iter()
+        .map(|c| StateArtifactRef {
+            chain_id: 1,
             kind: kind.to_string(),
             from_block: block,
             to_block: block,
             state_root: state_root.clone(),
-            object_key: e.object_key.clone(),
-            content_sha256: e.sha256_hex.clone(),
-            shard: Some(shard_id),
-            key_min: e.key_min.map(|h| format!("0x{}", hex::encode(h.as_slice()))),
-            key_max: e.key_max.map(|h| format!("0x{}", hex::encode(h.as_slice()))),
-        },
-        None => StateArtifactRef {
-            chain_id,
-            kind: kind.to_string(),
-            from_block: block,
-            to_block: block,
-            state_root: state_root.clone(),
-            object_key: format!("shard-{shard_id:04}/{kind}.vortex"),
-            content_sha256: format!("{:x}", Sha256::digest([])),
-            shard: Some(shard_id),
-            key_min: Some(range_min.to_string()),
-            key_max: Some(range_max.to_string()),
-        },
-    }
+            object_key: c.object_key.clone(),
+            content_sha256: c.sha256_hex.clone(),
+            shard: Some(c.shard),
+            part: Some(c.part),
+            key_min: c.key_min.map(|h| format!("0x{}", hex::encode(h.as_slice()))),
+            key_max: c.key_max.map(|h| format!("0x{}", hex::encode(h.as_slice()))),
+        })
+        .collect()
 }
 
 // ======================== upload ========================
@@ -813,15 +807,9 @@ async fn upload(
     let upload_one = |local: PathBuf, key: String, expected: String| {
         let store = Arc::clone(&store);
         async move {
-            // Tolerate "shard exists in manifest but no file on disk"
-            // for the empty-shard placeholder case. The expected sha
-            // is the sha of empty bytes; if we can't read the file,
-            // upload empty.
-            let bytes = match tokio::fs::read(&local).await {
-                Ok(b) => b,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Err(err) => return Err(eyre!("read {}: {err}", local.display())),
-            };
+            let bytes = tokio::fs::read(&local)
+                .await
+                .with_context(|| format!("read {}", local.display()))?;
             let actual = format!("{:x}", Sha256::digest(&bytes));
             if actual != expected {
                 return Err(eyre!(
@@ -836,25 +824,14 @@ async fn upload(
     };
 
     for shard in &manifest.shards {
-        let dir = shard_dir(&cli.out_dir, shard.shard);
-        upload_one(
-            dir.join("accounts.vortex"),
-            format!("{dir_prefix}/{}", shard.accounts.object_key),
-            shard.accounts.content_sha256.clone(),
-        )
-        .await?;
-        upload_one(
-            dir.join("storage.vortex"),
-            format!("{dir_prefix}/{}", shard.storage.object_key),
-            shard.storage.content_sha256.clone(),
-        )
-        .await?;
-        upload_one(
-            dir.join("code.vortex"),
-            format!("{dir_prefix}/{}", shard.code.object_key),
-            shard.code.content_sha256.clone(),
-        )
-        .await?;
+        for r in shard.accounts.iter().chain(&shard.storage).chain(&shard.code) {
+            upload_one(
+                cli.out_dir.join(&r.object_key),
+                format!("{dir_prefix}/{}", r.object_key),
+                r.content_sha256.clone(),
+            )
+            .await?;
+        }
     }
 
     let signed = SignedCheckpointManifest {
