@@ -41,6 +41,7 @@ reth-payload-builder.workspace = true
 reth-primitives-traits.workspace = true
 reth-provider.workspace = true
 reth-bucket-header-client = { path = "../../bucket-header-client" }
+reth-bucket-state-client = { path = "../../bucket-state-client" }
 reth-prune.workspace = true
 reth-rpc.workspace = true
 reth-rpc-api.workspace = true

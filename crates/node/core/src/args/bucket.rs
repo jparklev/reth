@@ -60,6 +60,25 @@ pub struct BucketArgs {
         help_heading = "Bucket"
     )]
     pub bucket_warm_epochs: u32,
+
+    /// Phase 26.x - enable bucket-mode plain-state reads.
+    /// When set (along with --bucket-url), the node fetches the
+    /// latest Phase 26.2 checkpoint from `<bucket>/<state-prefix>/index.json`,
+    /// hydrates it into an in-memory plain-state map, applies Phase 26.1
+    /// epoch deltas forward, and serves account/storage/bytecode reads
+    /// from the in-memory state before falling back to MDBX.
+    #[arg(long, help_heading = "Bucket")]
+    pub bucket_state_enabled: bool,
+
+    /// Bucket prefix where Phase 26.2 checkpoints live. Default
+    /// `checkpoints` (the Phase 26.2 writer default).
+    #[arg(
+        long,
+        value_name = "PREFIX",
+        default_value = "checkpoints",
+        help_heading = "Bucket"
+    )]
+    pub bucket_state_prefix: String,
 }
 
 impl BucketArgs {

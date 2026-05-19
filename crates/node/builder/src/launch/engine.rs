@@ -159,7 +159,54 @@ impl EngineNodeLauncher {
                             bucket_url = %client.bucket_url(),
                             "bucket-mode header reads enabled"
                         );
-                        Ok(provider.with_bucket(client.into_arc()))
+                        let mut provider = provider.with_bucket(client.into_arc());
+                        // Phase 26.x - optional bucket-mode plain-state reads.
+                        if bucket_args.bucket_state_enabled {
+                            let state_cfg = reth_bucket_state_client::BucketStateClientConfig {
+                                conn: reth_bucket_state_client::BucketStateConnConfig {
+                                    bucket_url: bucket_args
+                                        .bucket_url
+                                        .clone()
+                                        .expect("bucket_url is_enabled implies Some"),
+                                    endpoint: bucket_args
+                                        .bucket_endpoint
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    region: bucket_args.bucket_region.clone(),
+                                    anonymous: bucket_args.bucket_anonymous,
+                                    access_key_env: "BUCKET_ACCESS_KEY".into(),
+                                    secret_key_env: "BUCKET_SECRET_KEY".into(),
+                                    trusted_writers: bucket_args
+                                        .bucket_trusted_writers
+                                        .split(',')
+                                        .filter(|s| !s.is_empty())
+                                        .map(|s| s.to_string())
+                                        .collect(),
+                                },
+                                checkpoint_prefix: bucket_args.bucket_state_prefix.clone(),
+                                target_block: None,
+                                apply_deltas: true,
+                            };
+                            let state_client =
+                                reth_bucket_state_client::HttpBucketStateClient::new_blocking(
+                                    state_cfg,
+                                )
+                                .map_err(|err| eyre::eyre!("bucket-state init failed: {err}"))?;
+                            info!(
+                                target: "reth::cli",
+                                pinned_block = reth_provider::BucketStateClient::pinned_block_number(&*state_client),
+                                head_block = state_client.head_block(),
+                                accounts = state_client.account_count(),
+                                storage = state_client.storage_count(),
+                                code = state_client.code_count(),
+                                elapsed_ms = state_client.stats().total_elapsed_ms,
+                                "bucket-mode state reads enabled"
+                            );
+                            provider = provider.with_state_bucket(
+                                reth_bucket_state_client::into_state_arc(state_client),
+                            );
+                        }
+                        Ok(provider)
                     } else {
                         Ok(provider)
                     }

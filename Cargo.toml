@@ -110,6 +110,7 @@ members = [
     "crates/storage/provider/",
     "crates/relay-state-checkpointer/",
     "crates/bucket-header-client/",
+    "crates/bucket-state-client/",
     "crates/storage/storage-api/",
     "crates/tasks/",
     "crates/tokio-util/",

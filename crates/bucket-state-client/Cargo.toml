@@ -1,0 +1,41 @@
+[package]
+name = "reth-bucket-state-client"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Phase 26.x: HTTP/Vortex implementer of reth_provider::BucketStateClient. Fetches a signed Phase 26.2 plain-state checkpoint from an S3-compatible bucket, replays Phase 26.1 epoch deltas forward, and serves account/storage/bytecode reads from an in-memory HashMap."
+
+[dependencies]
+# Trait we implement (extends BucketHeaderClient).
+reth-provider = { path = "../storage/provider" }
+reth-storage-errors = { path = "../storage/errors" }
+reth-primitives-traits = { path = "../primitives-traits" }
+reth-ethereum-primitives = { path = "../ethereum/primitives" }
+
+# Vortex for chunk decode (same fork the rest of the project uses).
+vortex = { git = "https://github.com/jparklev/vortex.git", branch = "develop", features = ["object_store", "tokio", "files"] }
+vortex-file = { git = "https://github.com/jparklev/vortex.git", branch = "develop" }
+vortex-buffer = { git = "https://github.com/jparklev/vortex.git", branch = "develop" }
+vortex-io = { git = "https://github.com/jparklev/vortex.git", branch = "develop", features = ["object_store"] }
+
+# alloy + std
+alloy-consensus = { version = "1.0", features = ["serde"] }
+alloy-primitives = "1.5.7"
+
+# IO + crypto
+object_store = { version = "0.13", features = ["aws"] }
+ed25519-dalek = "2"
+sha2 = "0.10"
+hex = "0.4"
+
+# Async + parsing
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+arc-swap = "1"
+
+# Errors + logs
+thiserror = "2"
+tracing = "0.1"
+eyre = "0.6"

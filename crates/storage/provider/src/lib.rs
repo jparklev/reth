@@ -24,7 +24,7 @@ pub mod providers;
 pub use providers::{
     DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, HistoricalStateProvider,
     HistoricalStateProviderRef, LatestStateProvider, LatestStateProviderRef, ProviderFactory,
-    BlockchainProvider, BucketHeaderClient, BucketHeaderClientArc, ConsistentProvider, PruneShardOutcome, PrunedIndices, SaveBlocksMode, StaticFileAccess, StaticFileProviderBuilder,
+    BlockchainProvider, BucketHeaderClient, BucketHeaderClientArc, BucketStateClient, BucketStateClientArc, ConsistentProvider, PruneShardOutcome, PrunedIndices, SaveBlocksMode, StaticFileAccess, StaticFileProviderBuilder,
     StaticFileWriteCtx, StaticFileWriter,
 };
 
