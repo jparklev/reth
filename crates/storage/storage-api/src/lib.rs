@@ -51,6 +51,10 @@ pub use storage::*;
 mod transactions;
 pub use transactions::*;
 
+mod bucket_logs;
+pub use bucket_logs::*;
+
+
 mod trie;
 pub use trie::*;
 

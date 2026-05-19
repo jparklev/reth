@@ -16,6 +16,7 @@ pub trait FullRpcProvider:
     + HeaderProvider
     + TransactionsProvider
     + StageCheckpointReader
+    + crate::BucketLogsLookup
     + Clone
     + Unpin
     + 'static
@@ -29,6 +30,7 @@ impl<T> FullRpcProvider for T where
         + HeaderProvider
         + TransactionsProvider
         + StageCheckpointReader
+        + crate::BucketLogsLookup
         + Clone
         + Unpin
         + 'static

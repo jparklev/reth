@@ -352,3 +352,220 @@ fn bytes_to_bloom(b: &[u8]) -> Result<Bloom> {
 fn parse_u256_dec(s: &str) -> Result<U256> {
     U256::from_str_radix(s, 10).map_err(|err| eyre!("parse U256 from '{s}': {err}"))
 }
+// ===== Vortex log chunk decoder (epoch- or block-level) =====
+//
+// Port of `relay-rpc/src/backends/vortex_logs.rs`'s scan path, with
+// filter pushdown via `with_filter(eq(col("address"), …))`. The
+// current live bucket emits Parquet for `logs` chunks (so this code
+// path is exercised only by Vortex unit tests + future Phase 24
+// deploys that promote `logs` to Vortex).
+//
+// Schema, port of `relay_indexer::types::LogRow`:
+//   block_num: i64
+//   block_hash: binary
+//   log_idx: i32
+//   tx_idx: i32
+//   tx_hash: binary
+//   address: binary
+//   topic0..3: binary (topic0 is NonNull and contains 32 zero bytes
+//              for anonymous events; topic1..3 are nullable)
+//   data: binary
+//
+// Filter pushdown:
+//   block_num predicate is always pushed (range or eq)
+//   address allowlist becomes an OR-of-eq pushdown
+//   topic0 (selective only) becomes an OR-of-eq pushdown
+//   topic1..3 are filtered in-process for now (the relay reader
+//   does push them down, but the lit() shape requires the
+//   anonymous-event normalization which only applies to topic0)
+
+use std::collections::HashMap;
+
+use alloy_primitives::{Bytes as PrimBytes, LogData, Log as PrimitiveLog};
+use alloy_rpc_types_eth::Log;
+use vortex::array::dtype::Nullability;
+use vortex::array::expr::{and, gt_eq, lt_eq, or_collect};
+
+use super::logs_decode::LogScanFilter;
+
+const LOG_COLUMNS: &[&str] = &[
+    "block_num",
+    "block_hash",
+    "log_idx",
+    "tx_idx",
+    "tx_hash",
+    "address",
+    "topic0",
+    "topic1",
+    "topic2",
+    "topic3",
+    "data",
+];
+
+pub(crate) async fn decode_log_chunk(
+    store: Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    file_size: Option<u64>,
+    footer_metadata_b64: Option<&str>,
+    preload_ranges: &[VortexPreloadRange],
+    from_block: u64,
+    to_block: u64,
+    filter: &LogScanFilter,
+    block_hashes: &HashMap<u64, B256>,
+) -> Result<Vec<Log>> {
+    let session = VortexSession::default();
+    let handle = vortex_io::runtime::Handle::find()
+        .ok_or_else(|| eyre!("no vortex runtime handle available"))?;
+    let read_at = ObjectStoreReadAt::new(Arc::clone(&store), path.clone(), handle);
+
+    let mut options = session.open_options();
+    options = options.with_some_file_size(file_size);
+    if let Some(b64) = footer_metadata_b64 {
+        let bytes = BASE64
+            .decode(b64)
+            .map_err(|err| eyre!("decode footer b64: {err}"))?;
+        let footer = Footer::from_metadata_bytes(ByteBuffer::copy_from(&bytes), session.clone())
+            .map_err(|err| eyre!("footer parse: {err}"))?;
+        options = options.with_footer(footer);
+    }
+    for range in preload_ranges {
+        if range.length == 0 {
+            continue;
+        }
+        let end = range
+            .offset
+            .checked_add(range.length)
+            .ok_or_else(|| eyre!("preload range overflow"))?;
+        let bytes = store
+            .get_range(&path, range.offset..end)
+            .await
+            .map_err(|err| eyre!("preload {}..{}: {err}", range.offset, end))?;
+        options =
+            options.with_preloaded_file_range(range.offset, ByteBuffer::copy_from(bytes.as_ref()));
+    }
+
+    let file = options
+        .open(Arc::new(read_at))
+        .await
+        .map_err(|err| eyre!("open vortex file: {err}"))?;
+
+    // Build the filter expression. Block-num range is always pushed.
+    let block_filter = if from_block == to_block {
+        eq(col("block_num"), lit(Scalar::from(from_block as i64)))
+    } else {
+        and(
+            gt_eq(col("block_num"), lit(Scalar::from(from_block as i64))),
+            lt_eq(col("block_num"), lit(Scalar::from(to_block as i64))),
+        )
+    };
+    let mut filter_expr = block_filter;
+    if !filter.addresses.is_empty() {
+        if let Some(address_pred) = or_collect(filter.addresses.iter().map(|addr| {
+            eq(
+                col("address"),
+                lit(Scalar::binary(ByteBuffer::copy_from(addr.as_slice()), Nullability::NonNullable)),
+            )
+        })) {
+            filter_expr = and(filter_expr, address_pred);
+        }
+    }
+    if !filter.topics[0].is_empty() {
+        if let Some(topic0_pred) = or_collect(filter.topics[0].iter().map(|topic_b| {
+            let key = {
+                let bytes = topic_b.as_slice();
+                let mut out = vec![0u8; 32];
+                let copy_len = bytes.len().min(32);
+                out[32 - copy_len..].copy_from_slice(&bytes[..copy_len]);
+                out
+            };
+            eq(
+                col("topic0"),
+                lit(Scalar::binary(ByteBuffer::copy_from(&key), Nullability::NonNullable)),
+            )
+        })) {
+            filter_expr = and(filter_expr, topic0_pred);
+        }
+    }
+
+    let array = file
+        .scan()
+        .map_err(|err| eyre!("scan vortex logs: {err}"))?
+        .with_filter(filter_expr)
+        .with_projection(select(LOG_COLUMNS, root()))
+        .into_array_stream()
+        .map_err(|err| eyre!("stream vortex logs: {err}"))?
+        .read_all()
+        .await
+        .map_err(|err| eyre!("read vortex logs: {err}"))?;
+
+    let mut ctx = session.create_execution_ctx();
+    let struct_arr: VortexStructArray = array
+        .execute(&mut ctx)
+        .map_err(|err| eyre!("decode vortex logs: {err}"))?;
+
+    let block_num = primitive_required::<i64>(&mut ctx, &struct_arr, "block_num")?;
+    let log_idx = primitive_required::<i32>(&mut ctx, &struct_arr, "log_idx")?;
+    let tx_idx = primitive_required::<i32>(&mut ctx, &struct_arr, "tx_idx")?;
+    let tx_hash = varbin_required(&mut ctx, &struct_arr, "tx_hash")?;
+    let address = varbin_required(&mut ctx, &struct_arr, "address")?;
+    let topic0 = varbin_required(&mut ctx, &struct_arr, "topic0")?;
+    let topic1 = varbin_optional(&mut ctx, &struct_arr, "topic1")?;
+    let topic2 = varbin_optional(&mut ctx, &struct_arr, "topic2")?;
+    let topic3 = varbin_optional(&mut ctx, &struct_arr, "topic3")?;
+    let data = varbin_required(&mut ctx, &struct_arr, "data")?;
+    let block_hash = varbin_required(&mut ctx, &struct_arr, "block_hash")?;
+
+    let len = block_num.len();
+    let mut out: Vec<Log> = Vec::with_capacity(len);
+    for row in 0..len {
+        let bn = block_num[row] as u64;
+        if bn < from_block || bn > to_block {
+            continue;
+        }
+        if address[row].len() != 20 {
+            return Err(eyre!("address row {row} not 20 bytes"));
+        }
+        let addr = Address::from_slice(&address[row]);
+
+        let mut topics: Vec<B256> = Vec::with_capacity(4);
+        let t0_is_zero = topic0[row].iter().all(|b| *b == 0);
+        if !t0_is_zero && topic0[row].len() == 32 {
+            topics.push(B256::from_slice(&topic0[row]));
+        }
+        if let Some(t1) = topic1[row].as_ref().filter(|t| t.len() == 32) {
+            topics.push(B256::from_slice(t1));
+        }
+        if let Some(t2) = topic2[row].as_ref().filter(|t| t.len() == 32) {
+            topics.push(B256::from_slice(t2));
+        }
+        if let Some(t3) = topic3[row].as_ref().filter(|t| t.len() == 32) {
+            topics.push(B256::from_slice(t3));
+        }
+
+        if !filter.matches(&addr, &topics) {
+            continue;
+        }
+
+        let primitive = PrimitiveLog {
+            address: addr,
+            data: LogData::new(topics, PrimBytes::from(data[row].clone()))
+                .ok_or_else(|| eyre!("log topics > 4 at row {row}"))?,
+        };
+        let canonical_bh = block_hashes
+            .get(&bn)
+            .copied()
+            .or_else(|| (block_hash[row].len() == 32).then(|| B256::from_slice(&block_hash[row])));
+
+        out.push(Log {
+            inner: primitive,
+            block_hash: canonical_bh,
+            block_number: Some(bn),
+            block_timestamp: None,
+            transaction_hash: (tx_hash[row].len() == 32).then(|| B256::from_slice(&tx_hash[row])),
+            transaction_index: Some(tx_idx[row] as u64),
+            log_index: Some(log_idx[row] as u64),
+            removed: false,
+        });
+    }
+    Ok(out)
+}

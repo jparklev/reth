@@ -28,8 +28,8 @@ use reth_rpc_eth_types::{
 };
 use reth_rpc_server_types::{result::rpc_error_with_code, ToRpcResult};
 use reth_storage_api::{
-    BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, HeaderProvider, ProviderBlock,
-    ProviderReceipt, ReceiptProvider,
+    BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BucketLogsLookup, HeaderProvider,
+    ProviderBlock, ProviderReceipt, ReceiptProvider,
 };
 use reth_tasks::TaskSpawner;
 use reth_transaction_pool::{NewSubpoolTransactionStream, PoolTransaction, TransactionPool};
@@ -51,7 +51,7 @@ use tracing::{debug, error, trace};
 impl<Eth> EngineEthFilter for EthFilter<Eth>
 where
     Eth: FullEthApiTypes
-        + RpcNodeCoreExt<Provider: BlockIdReader>
+        + RpcNodeCoreExt<Provider: BlockIdReader + BucketLogsLookup>
         + LoadReceipt
         + EthBlocks
         + 'static,
@@ -201,7 +201,7 @@ where
 
 impl<Eth> EthFilter<Eth>
 where
-    Eth: FullEthApiTypes<Provider: BlockReader + BlockIdReader>
+    Eth: FullEthApiTypes<Provider: BlockReader + BlockIdReader + BucketLogsLookup>
         + RpcNodeCoreExt
         + LoadReceipt
         + EthBlocks
@@ -328,7 +328,11 @@ where
 #[async_trait]
 impl<Eth> EthFilterApiServer<RpcTransaction<Eth::NetworkTypes>> for EthFilter<Eth>
 where
-    Eth: FullEthApiTypes + RpcNodeCoreExt + LoadReceipt + EthBlocks + 'static,
+    Eth: FullEthApiTypes
+        + RpcNodeCoreExt<Provider: BucketLogsLookup>
+        + LoadReceipt
+        + EthBlocks
+        + 'static,
 {
     /// Handler for `eth_newFilter`
     async fn new_filter(&self, filter: Filter) -> RpcResult<FilterId> {
@@ -443,7 +447,7 @@ struct EthFilterInner<Eth: EthApiTypes> {
 
 impl<Eth> EthFilterInner<Eth>
 where
-    Eth: RpcNodeCoreExt<Provider: BlockIdReader, Pool: TransactionPool>
+    Eth: RpcNodeCoreExt<Provider: BlockIdReader + BucketLogsLookup, Pool: TransactionPool>
         + EthApiTypes<NetworkTypes: reth_rpc_eth_api::types::RpcTypes>
         + LoadReceipt
         + EthBlocks
@@ -554,15 +558,33 @@ where
                     .transpose()?
                     .flatten();
 
+                // Phase 26.x - if the request range is fully covered by
+                // a bucket-backed finalized snapshot, skip the local-head
+                // check. Otherwise, enforce the regular gate.
+                let effective_best = {
+                    let mut b = info.best_number;
+                    if let Some(logs) = self
+                        .provider()
+                        .bucket_logs_in_range(&filter, from.unwrap_or(0), to.unwrap_or(b))
+                        .ok()
+                        .flatten()
+                    {
+                        // The bucket fully served the range; return now.
+                        return Ok(logs);
+                    }
+                    let _ = &mut b;
+                    b
+                };
+
                 // Return error if toBlock exceeds current head
                 if let Some(t) = to &&
-                    t > info.best_number
+                    t > effective_best
                 {
                     return Err(EthFilterError::BlockRangeExceedsHead);
                 }
 
                 if let Some(f) = from &&
-                    f > info.best_number
+                    f > effective_best
                 {
                     // start block higher than local head, can return empty
                     return Ok(Vec::new());
@@ -658,6 +680,28 @@ where
         to_block: u64,
         limits: QueryLimits,
     ) -> Result<Vec<Log>, EthFilterError> {
+        // Phase 26.x item 4 — short-circuit to the bucket reader when
+        // the provider has one attached and the range is fully covered
+        // by the signed manifest. The bucket fetches signed `logs`
+        // chunks (parquet/Vortex), probes per-chunk Bloom side-tables
+        // for the address/topic predicate, and returns the filtered +
+        // sorted result without ever touching MDBX/static-files.
+        if let Some(logs) = self.provider().bucket_logs_in_range(filter, from_block, to_block)? {
+            // The bucket served the whole range. Apply the same
+            // max_logs_per_response cap as the regular path so callers
+            // can't smuggle a huge response through.
+            if let Some(max_logs_per_response) = limits.max_logs_per_response
+                && from_block != to_block
+                && logs.len() > max_logs_per_response
+            {
+                return Err(EthFilterError::QueryExceedsMaxResults {
+                    max_logs: max_logs_per_response,
+                    from_block,
+                    to_block,
+                });
+            }
+            return Ok(logs);
+        }
         let mut all_logs = Vec::new();
         let mut matching_headers = Vec::new();
 
@@ -991,7 +1035,7 @@ where
 
 /// Represents different modes for processing block ranges when filtering logs
 enum RangeMode<
-    Eth: RpcNodeCoreExt<Provider: BlockIdReader, Pool: TransactionPool>
+    Eth: RpcNodeCoreExt<Provider: BlockIdReader + BucketLogsLookup, Pool: TransactionPool>
         + EthApiTypes
         + LoadReceipt
         + EthBlocks
@@ -1004,7 +1048,7 @@ enum RangeMode<
 }
 
 impl<
-        Eth: RpcNodeCoreExt<Provider: BlockIdReader, Pool: TransactionPool>
+        Eth: RpcNodeCoreExt<Provider: BlockIdReader + BucketLogsLookup, Pool: TransactionPool>
             + EthApiTypes
             + LoadReceipt
             + EthBlocks
@@ -1080,7 +1124,7 @@ impl<
 
 /// Mode for processing blocks using cache optimization for recent blocks
 struct CachedMode<
-    Eth: RpcNodeCoreExt<Provider: BlockIdReader, Pool: TransactionPool>
+    Eth: RpcNodeCoreExt<Provider: BlockIdReader + BucketLogsLookup, Pool: TransactionPool>
         + EthApiTypes
         + LoadReceipt
         + EthBlocks
@@ -1091,7 +1135,7 @@ struct CachedMode<
 }
 
 impl<
-        Eth: RpcNodeCoreExt<Provider: BlockIdReader, Pool: TransactionPool>
+        Eth: RpcNodeCoreExt<Provider: BlockIdReader + BucketLogsLookup, Pool: TransactionPool>
             + EthApiTypes
             + LoadReceipt
             + EthBlocks
@@ -1122,7 +1166,7 @@ type ReceiptFetchFuture<P> =
 
 /// Mode for processing blocks using range queries for older blocks
 struct RangeBlockMode<
-    Eth: RpcNodeCoreExt<Provider: BlockIdReader, Pool: TransactionPool>
+    Eth: RpcNodeCoreExt<Provider: BlockIdReader + BucketLogsLookup, Pool: TransactionPool>
         + EthApiTypes
         + LoadReceipt
         + EthBlocks
@@ -1137,7 +1181,7 @@ struct RangeBlockMode<
 }
 
 impl<
-        Eth: RpcNodeCoreExt<Provider: BlockIdReader, Pool: TransactionPool>
+        Eth: RpcNodeCoreExt<Provider: BlockIdReader + BucketLogsLookup, Pool: TransactionPool>
             + EthApiTypes
             + LoadReceipt
             + EthBlocks

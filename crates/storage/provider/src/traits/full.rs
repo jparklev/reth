@@ -42,6 +42,7 @@ pub trait FullProvider<N: NodeTypesWithDB>:
     + ForkChoiceSubscriptions<Header = HeaderTy<N>>
     + PersistedBlockSubscriptions
     + StageCheckpointReader
+    + reth_storage_api::BucketLogsLookup
     + Clone
     + Debug
     + Unpin
@@ -77,6 +78,7 @@ impl<T, N: NodeTypesWithDB> FullProvider<N> for T where
         + ForkChoiceSubscriptions<Header = HeaderTy<N>>
         + PersistedBlockSubscriptions
         + StageCheckpointReader
+        + reth_storage_api::BucketLogsLookup
         + Clone
         + Debug
         + Unpin
