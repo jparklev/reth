@@ -191,7 +191,14 @@ impl HttpBucketHeaderClient {
                 "HttpBucketHeaderClient::new_blocking requires a tokio runtime context".into(),
             )
         })?;
-        handle.block_on(async { Self::new(config).await }).map(Arc::new)
+        // Inside a multi-threaded runtime the constructor is
+        // called from within an executor task; using block_on
+        // directly would panic. block_in_place yields the worker
+        // to other tasks while we run the bootstrap synchronously.
+        tokio::task::block_in_place(|| {
+            handle.block_on(async { Self::new(config).await })
+        })
+        .map(Arc::new)
     }
 
     pub fn bucket_url(&self) -> &str { &self.config.bucket_url }
