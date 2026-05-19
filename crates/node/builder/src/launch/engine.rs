@@ -88,6 +88,11 @@ impl EngineNodeLauncher {
         } = target;
         let NodeHooks { on_component_initialized, on_node_started, .. } = hooks;
 
+        // Phase 26.x — clone bucket args out of NodeConfig before
+        // `config` is moved into the launch context, so the closure
+        // below can capture them.
+        let ctx_node_config_bucket = config.bucket.clone();
+
         // Create changeset cache that will be shared across the engine
         let changeset_cache = ChangesetCache::new();
 
@@ -120,8 +125,45 @@ impl EngineNodeLauncher {
             .with_metrics_task()
             // passing FullNodeTypes as type parameter here so that we can build
             // later the components.
-            .with_blockchain_db::<T, _>(move |provider_factory| {
-                Ok(BlockchainProvider::new(provider_factory)?)
+            .with_blockchain_db::<T, _>({
+                // Phase 26.x — attach bucket-mode header client when
+                // the node was started with `--bucket-url`.
+                let bucket_args = ctx_node_config_bucket.clone();
+                move |provider_factory| {
+                    let provider = BlockchainProvider::new(provider_factory)?;
+                    if bucket_args.is_enabled() {
+                        let cfg = reth_bucket_header_client::BucketHeaderClientConfig {
+                            bucket_url: bucket_args
+                                .bucket_url
+                                .clone()
+                                .expect("bucket_url is_enabled implies Some"),
+                            endpoint: bucket_args.bucket_endpoint.clone().unwrap_or_default(),
+                            region: bucket_args.bucket_region.clone(),
+                            anonymous: bucket_args.bucket_anonymous,
+                            access_key_env: "BUCKET_ACCESS_KEY".into(),
+                            secret_key_env: "BUCKET_SECRET_KEY".into(),
+                            trusted_writers: bucket_args
+                                .bucket_trusted_writers
+                                .split(',')
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string())
+                                .collect(),
+                            warm_epochs: bucket_args.bucket_warm_epochs,
+                        };
+                        let client = reth_bucket_header_client::HttpBucketHeaderClient::new_blocking(cfg)
+                            .map_err(|err| {
+                                eyre::eyre!("bucket-mode init failed: {err}")
+                            })?;
+                        info!(
+                            target: "reth::cli",
+                            bucket_url = %client.bucket_url(),
+                            "bucket-mode header reads enabled"
+                        );
+                        Ok(provider.with_bucket(client.into_arc()))
+                    } else {
+                        Ok(provider)
+                    }
+                }
             })?
             .with_components(components_builder, on_component_initialized).await?;
 

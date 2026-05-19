@@ -1,0 +1,42 @@
+[package]
+name = "reth-bucket-header-client"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Phase 26.x: HTTP/Vortex implementer of reth_provider::BucketHeaderClient. Fetches signed manifests + header chunks from an S3-compatible bucket."
+
+[dependencies]
+# Trait we implement
+reth-provider = { path = "../storage/provider" }
+reth-storage-errors = { path = "../storage/errors" }
+
+# Vortex for chunk decode (same git fork the rest of the project uses).
+vortex = { git = "https://github.com/jparklev/vortex.git", branch = "develop", features = ["object_store", "tokio", "files"] }
+vortex-file = { git = "https://github.com/jparklev/vortex.git", branch = "develop" }
+vortex-buffer = { git = "https://github.com/jparklev/vortex.git", branch = "develop" }
+vortex-io = { git = "https://github.com/jparklev/vortex.git", branch = "develop", features = ["object_store"] }
+
+# alloy + std
+alloy-consensus = { version = "1.0", features = ["serde"] }
+alloy-primitives = "1.5.7"
+
+# IO + crypto
+object_store = { version = "0.13", features = ["aws"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ed25519-dalek = "2"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+
+# Async + parsing
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+arc-swap = "1"
+
+# Errors + logs
+thiserror = "2"
+tracing = "0.1"
+eyre = "0.6"
