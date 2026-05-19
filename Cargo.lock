@@ -8633,6 +8633,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-bucket-header-client"
+version = "0.0.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "arc-swap",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "eyre",
+ "hex",
+ "object_store",
+ "reqwest",
+ "reth-provider",
+ "reth-storage-errors",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "vortex",
+ "vortex-buffer",
+ "vortex-file",
+ "vortex-io",
+]
+
+[[package]]
 name = "reth-chain-state"
 version = "1.11.3"
 dependencies = [
@@ -10216,6 +10245,7 @@ dependencies = [
  "parking_lot",
  "rayon",
  "reth-basic-payload-builder",
+ "reth-bucket-header-client",
  "reth-chain-state",
  "reth-chainspec",
  "reth-config",
@@ -14230,6 +14260,7 @@ dependencies = [
  "arrow-schema",
  "flatbuffers",
  "jiff",
+ "object_store",
  "prost",
  "tokio",
 ]
@@ -14263,6 +14294,7 @@ dependencies = [
  "itertools 0.14.0",
  "kanal",
  "moka",
+ "object_store",
  "oneshot",
  "parking_lot",
  "pin-project-lite",
@@ -14331,6 +14363,7 @@ dependencies = [
  "futures",
  "glob",
  "kanal",
+ "object_store",
  "oneshot",
  "parking_lot",
  "pin-project-lite",

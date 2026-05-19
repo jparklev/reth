@@ -113,6 +113,7 @@ members = [
     "crates/storage/nippy-jar/",
     "crates/storage/provider/",
     "crates/relay-state-checkpointer/",
+    "crates/bucket-header-client/",
     "crates/storage/storage-api/",
     "crates/storage/zstd-compressors/",
     "crates/tasks/",
