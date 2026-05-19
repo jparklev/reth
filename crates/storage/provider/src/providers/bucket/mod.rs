@@ -25,13 +25,12 @@
 //! and live in the same module when they ship.
 
 use alloy_consensus::Header;
-use alloy_primitives::{Address, B256, BlockHash, BlockNumber, Bytes, TxHash, U256};
+use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, TxHash, B256, U256};
 use alloy_rpc_types_eth::Log;
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_primitives_traits::Account;
 use reth_storage_errors::provider::ProviderResult;
-use std::fmt::Debug;
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
 /// Sync, trait-object-friendly bucket client.
 ///
@@ -79,10 +78,7 @@ pub trait BucketHeaderClient: Send + Sync + Debug {
     /// Stage: spike (transaction_by_hash is the next item on the
     /// FULL-VORTEX-RETH-READ-NODE roadmap in
     /// `jparklev/relay@docs/FULL-VORTEX-RETH-READ-NODE.md`).
-    fn transaction_by_hash(
-        &self,
-        _hash: TxHash,
-    ) -> ProviderResult<Option<TransactionSigned>> {
+    fn transaction_by_hash(&self, _hash: TxHash) -> ProviderResult<Option<TransactionSigned>> {
         Ok(None)
     }
 
@@ -114,10 +110,7 @@ pub trait BucketHeaderClient: Send + Sync + Debug {
     /// covered — falls through to the database path. Returns
     /// receipts sorted by `tx_idx`, each populated with its logs
     /// from the same block's `vortex_logs` chunk.
-    fn receipts_by_block(
-        &self,
-        _num: BlockNumber,
-    ) -> ProviderResult<Option<Vec<Receipt>>> {
+    fn receipts_by_block(&self, _num: BlockNumber) -> ProviderResult<Option<Vec<Receipt>>> {
         Ok(None)
     }
 
@@ -126,10 +119,10 @@ pub trait BucketHeaderClient: Send + Sync + Debug {
     /// `topics` slot constraints (`topics[i]` empty = any). The
     /// bucket implementation is responsible for:
     /// - identifying the epochs the range spans;
-    /// - probing per-chunk Bloom side-tables (Phase 22 sprint 3) to
-    ///   skip chunks that can't possibly match;
-    /// - pushing the filter down into the chunk decoder where the
-    ///   format supports it (Vortex `with_filter`/`select`);
+    /// - probing per-chunk Bloom side-tables (Phase 22 sprint 3) to skip chunks that can't possibly
+    ///   match;
+    /// - pushing the filter down into the chunk decoder where the format supports it (Vortex
+    ///   `with_filter`/`select`);
     /// - filtering remaining rows by block_num + filter predicate;
     /// - sorting by `(block_num, log_idx)` for deterministic output.
     ///
@@ -225,7 +218,11 @@ mod tests {
 
     impl BucketHeaderClient for MockClient {
         fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Header>> {
-            if num == self.header.number { Ok(Some(self.header.clone())) } else { Ok(None) }
+            if num == self.header.number {
+                Ok(Some(self.header.clone()))
+            } else {
+                Ok(None)
+            }
         }
         fn latest_finalized_block_number(&self) -> BlockNumber {
             self.latest
@@ -273,7 +270,9 @@ mod tests {
             fn header_by_number(&self, _: BlockNumber) -> ProviderResult<Option<Header>> {
                 Ok(None)
             }
-            fn latest_finalized_block_number(&self) -> BlockNumber { 0 }
+            fn latest_finalized_block_number(&self) -> BlockNumber {
+                0
+            }
         }
         impl BucketStateClient for S {}
         fn assert_dyn(_x: &dyn BucketStateClient) {}
@@ -292,7 +291,9 @@ mod tests {
             fn header_by_number(&self, _: BlockNumber) -> ProviderResult<Option<Header>> {
                 Ok(None)
             }
-            fn latest_finalized_block_number(&self) -> BlockNumber { 0 }
+            fn latest_finalized_block_number(&self) -> BlockNumber {
+                0
+            }
         }
         let s = S;
         assert!(s.transaction_by_hash(B256::ZERO).unwrap().is_none());
@@ -300,9 +301,8 @@ mod tests {
         assert!(s.transactions_by_block(0).unwrap().is_none());
         assert!(s.receipts_by_block(0).unwrap().is_none());
         // Default logs_in_range returns empty (back compat).
-        let logs = s
-            .logs_in_range(0, 1, &[], &[Vec::new(), Vec::new(), Vec::new(), Vec::new()])
-            .unwrap();
+        let logs =
+            s.logs_in_range(0, 1, &[], &[Vec::new(), Vec::new(), Vec::new(), Vec::new()]).unwrap();
         assert!(logs.is_empty());
     }
 
@@ -316,7 +316,9 @@ mod tests {
             fn header_by_number(&self, _: BlockNumber) -> ProviderResult<Option<Header>> {
                 Ok(None)
             }
-            fn latest_finalized_block_number(&self) -> BlockNumber { 0 }
+            fn latest_finalized_block_number(&self) -> BlockNumber {
+                0
+            }
         }
         impl BucketStateClient for S {}
         let s = S;

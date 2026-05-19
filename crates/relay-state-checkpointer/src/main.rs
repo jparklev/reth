@@ -1,62 +1,51 @@
-//! Phase 26.3 — full-mainnet plain-state checkpointer.
+//! Phase 26.x — full-mainnet hash-keyed state checkpointer (v2).
 //!
-//! Reads PlainAccountState, PlainStorageState, and Bytecodes from a
-//! local reth datadir (opened read-only via the existing reth-cli
-//! Environment bootstrap), streams the rows into three Vortex
-//! chunks whose schema is byte-equivalent to the relay-rpc reader,
-//! signs the resulting checkpoint manifest with the same ed25519
-//! writer key the indexer uses for head.json, and uploads the
-//! bundle to an S3-compatible bucket. Optionally refreshes
-//! `<prefix>index.json` so thin-reth followers can hydrate from
-//! the latest checkpoint ≤ a target block.
+//! Walks reth's `HashedAccounts` / `HashedStorages` / `Bytecodes`
+//! tables in shard-aligned chunks and emits Vortex bundles keyed by
+//! `keccak(addr)` / `(keccak(addr), keccak(slot))`. A reth-fork
+//! follower hydrates those bundles lazily via
+//! `reth-bucket-state-client`, hashing query inputs on the fly.
 //!
-//! ## Why this is a reth-fork binary, not a relay-side CLI
+//! ## Why hash-keyed
 //!
-//! Reading PlainAccountState at mainnet scale (~300M accounts) is
-//! infeasible over JSON-RPC and impractical via the `reth db` TUI.
-//! Direct MDBX access via reth's provider crates is the only
-//! workable shape. Doing it inside the reth fork lets us use path
-//! deps to reth-cli-commands, reth-db-api, reth-provider — no git
-//! wrangling.
+//! Production reth runs storage_v2: `PlainAccountState` and
+//! `PlainStorageState` are empty; all state lives in the hashed
+//! tables. Plain-keyed enumeration would require a reverse hash
+//! dictionary that gets pruned along with `AccountChangeSets`. The
+//! follower receives plain `(Address, slot)` at query time and can
+//! hash on the fly, so the bucket can stay hash-keyed end-to-end.
 //!
-//! ## Operational stance (codex review pivot, 2026-05-18)
+//! ## Operational stance
 //!
-//! - The checkpoint binds to the local node's **current** plain
-//!   state (not an arbitrary historical block). Caller is expected
-//!   to pause reth or run on a paused replica.
-//! - No trie recomputation; we trust the state_root from the local
-//!   node's canonical header.
-//! - Sharding by address prefix is supported via `--shard-bits`
-//!   (0 = single shard, 8 = 256 shards, 12 = 4096 shards). At
-//!   mainnet today 8 shards keeps each `accounts.vortex` ~40MB.
-//! - Streaming: rows are accumulated per shard, written once per
-//!   shard. A future iteration can fully stream the Vortex writer
-//!   (today's vortex-file writer wants the full ArrayRef).
+//! - Checkpoint binds to the local node's current state — callers pause reth or run on a paused
+//!   replica.
+//! - No trie recomputation; we trust the local node's canonical header for `state_root`.
+//! - Streaming per-shard: HashedAccounts/HashedStorages are sorted by hashed key, so we accumulate
+//!   one shard's worth of rows in memory, flush, and move on. Peak memory ≈ one shard.
+//! - Code is sharded by top-bits of `code_hash` (independent of the account shard) because the
+//!   client looks up code by hash only.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Instant};
 
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_consensus::constants::KECCAK_EMPTY;
+use alloy_primitives::{keccak256, Address, B256, U256};
 use chrono::SecondsFormat;
 use clap::Parser;
 use ed25519_dalek::Signer;
-use eyre::{Context, eyre};
-use object_store::aws::AmazonS3Builder;
-use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
-use alloy_consensus::constants::KECCAK_EMPTY;
-use object_store::ObjectStoreExt;
+use eyre::{eyre, Context};
+use object_store::{
+    aws::AmazonS3Builder, path::Path as ObjectPath, ObjectStore, ObjectStoreExt, PutPayload,
+};
 use reth_cli_commands::common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs};
-use reth_db_api::cursor::{DbCursorRO, DbDupCursorRO};
-use reth_db_api::tables::{Bytecodes, HashedAccounts, HashedStorages, PlainAccountState, PlainStorageState};
-use reth_db_api::transaction::DbTx;
+use reth_db_api::{
+    cursor::{DbCursorRO, DbDupCursorRO},
+    tables::{Bytecodes, HashedAccounts, HashedStorages},
+    transaction::DbTx,
+};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_provider::providers::ProviderNodeTypes;
 use reth_provider::{
-    BlockNumReader, DatabaseProviderFactory, HeaderProvider, ProviderFactory,
-    StaticFileProviderFactory,
+    providers::ProviderNodeTypes, BlockNumReader, DatabaseProviderFactory, HeaderProvider,
+    ProviderFactory, StaticFileProviderFactory,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -77,41 +66,19 @@ struct Cli {
     #[arg(long)]
     out_dir: PathBuf,
 
-    /// Number of high-order address bits to shard on. 0 = single
-    /// chunk per artifact family (good for spike runs). 8 = 256
-    /// shards (good for mainnet — ~1.2M accounts/shard, ~40MB
-    /// post-vortex). 12 = 4096 shards (~75k each).
-    #[arg(long, default_value_t = 0u8)]
+    /// Number of high-order bits of `keccak(addr)` used to assign a
+    /// shard. 0 = single shard (testing only — won't scale). 8 = 256
+    /// shards (default; ~1.5M accounts / shard at full mainnet).
+    /// 12 = 4096 shards (~95k each). Must be ≤ 16.
+    #[arg(long, default_value_t = 8u8)]
     shard_bits: u8,
 
-    /// Cap on total accounts emitted across the run. `0` disables
-    /// (full table dump). Useful for spike runs against mainnet
-    /// before paying the full ~30 min walk cost.
+    /// Cap on total accounts emitted. `0` disables. Aborts the
+    /// HashedAccounts walk early once the cap is hit. Useful for
+    /// smoke runs against full mainnet without the ~30-min walk.
+    /// Note: storage rows for accounts beyond the cap are skipped.
     #[arg(long, default_value_t = 0usize)]
     max_accounts: usize,
-
-    /// Cap on storage rows per account. `0` disables. Some heavy
-    /// contracts (Uniswap pools, USDC) have millions of slots;
-    /// per-account capping keeps the artifact bounded at the cost
-    /// of incompleteness.
-    #[arg(long, default_value_t = 0usize)]
-    max_storage_per_account: usize,
-
-    /// Additional account address to force-include in the
-    /// checkpoint (repeatable). Useful for targeted spike runs
-    /// where you want a known contract / EOA (e.g. USDC, vitalik)
-    /// in the bucket even when `--max-accounts` would skip past
-    /// them. The account row plus its bytecode are emitted; storage
-    /// for these addresses follows `--max-storage-per-account`.
-    #[arg(long = "account", value_name = "ADDR")]
-    extra_accounts: Vec<String>,
-
-    /// Additional storage slot to force-include, of the form
-    /// `0xADDR:0xSLOT` (repeatable). Useful for seeding known
-    /// state mappings like `balances[user]` without dumping the
-    /// whole contract's storage table.
-    #[arg(long = "slot", value_name = "ADDR:SLOT")]
-    extra_slots: Vec<String>,
 
     // ---- Upload (optional) ----
     /// When set, after writing local artifacts the binary uploads
@@ -151,28 +118,24 @@ struct Cli {
 }
 
 fn main() -> eyre::Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async_main())
 }
 
 async fn async_main() -> eyre::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(
-                    "info,relay_state_checkpointer=debug,reth=warn",
-                )
-            }),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
+            |_| tracing_subscriber::EnvFilter::new("info,relay_state_checkpointer=debug,reth=warn"),
+        ))
         .init();
     let cli = Cli::parse();
+    if cli.shard_bits > 16 {
+        return Err(eyre!("--shard-bits must be ≤ 16; got {}", cli.shard_bits));
+    }
     tokio::fs::create_dir_all(&cli.out_dir).await?;
 
-    let env: Environment<_> = cli
-        .env
-        .init::<reth_node_ethereum::node::EthereumNode>(AccessRights::RO)?;
+    let env: Environment<_> =
+        cli.env.init::<reth_node_ethereum::node::EthereumNode>(AccessRights::RO)?;
     let factory = env.provider_factory.clone();
 
     let provider = factory.database_provider_ro()?;
@@ -190,19 +153,23 @@ async fn async_main() -> eyre::Result<()> {
         shard_bits = cli.shard_bits,
         "anchored to local reth canonical head"
     );
+    drop(provider);
 
     let start = Instant::now();
-    let dump = read_state(&factory, &cli)?;
+    let dump = dump_state(&factory, &cli).await?;
     info!(
         accounts = dump.total_accounts,
         storage_rows = dump.total_storage,
         code_blobs = dump.total_code,
-        shards = dump.shards.len(),
+        shards = dump.account_shards.len(),
+        code_shards = dump.code_shards.len(),
         elapsed_secs = start.elapsed().as_secs(),
-        "plain-state dump complete"
+        "hash-keyed state dump complete"
     );
 
-    let manifest = write_artifacts(&cli, block_number, &block_hash, &state_root, &dump).await?;
+    let manifest = build_manifest(&cli, block_number, &block_hash, &state_root, &dump);
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    tokio::fs::write(cli.out_dir.join("manifest.json"), &manifest_bytes).await?;
 
     if let Some(bucket) = &cli.upload_bucket {
         let writer_key = cli
@@ -235,21 +202,7 @@ async fn async_main() -> eyre::Result<()> {
     Ok(())
 }
 
-#[derive(Default)]
-struct StateDump {
-    /// Indexed by shard ID (0..=2^shard_bits-1).
-    shards: Vec<ShardData>,
-    total_accounts: usize,
-    total_storage: usize,
-    total_code: usize,
-}
-
-#[derive(Default)]
-struct ShardData {
-    accounts: Vec<(Address, u64, U256, B256)>,
-    storage: Vec<(Address, U256, U256)>,
-    code: Vec<(B256, Vec<u8>)>,
-}
+// ============== shard math ==============
 
 fn shard_count(bits: u8) -> usize {
     if bits == 0 {
@@ -259,231 +212,294 @@ fn shard_count(bits: u8) -> usize {
     }
 }
 
-fn shard_for(address: Address, bits: u8) -> usize {
+/// Top `bits` of a 32-byte hash, big-endian.
+fn shard_for_hash(hash: B256, bits: u8) -> usize {
     if bits == 0 {
         return 0;
     }
-    let bytes = address.as_slice();
-    let v = ((bytes[0] as u16) << 8) | bytes[1] as u16;
+    let bytes = hash.as_slice();
+    // We support up to 16 bits, so reading the first 2 bytes is enough.
+    let v = ((bytes[0] as u32) << 8) | (bytes[1] as u32);
     (v as usize) >> (16 - bits as usize)
 }
 
-fn read_state<N>(factory: &ProviderFactory<N>, cli: &Cli) -> eyre::Result<StateDump>
+/// Inclusive [min, max] hash range covered by `shard_id` under `bits`.
+fn shard_range(shard_id: u32, bits: u8) -> (B256, B256) {
+    let mut min = [0u8; 32];
+    let mut max = [0xffu8; 32];
+    if bits == 0 {
+        return (B256::from(min), B256::from(max));
+    }
+    // Distribute the shard_id across the first 2 bytes of the hash;
+    // the remaining bits of byte 1 (and all lower bytes) are wildcards.
+    let shifted = (shard_id as u32) << (16 - bits as u32);
+    min[0] = (shifted >> 8) as u8;
+    min[1] = (shifted & 0xff) as u8;
+    let upper = shifted | ((1u32 << (16 - bits as u32)) - 1);
+    max[0] = (upper >> 8) as u8;
+    max[1] = (upper & 0xff) as u8;
+    (B256::from(min), B256::from(max))
+}
+
+// ============== dump (streaming, shard-by-shard) ==============
+
+#[derive(Default)]
+struct ShardEmit {
+    shard: u32,
+    object_key: String,
+    bytes_written: u64,
+    sha256_hex: String,
+    key_min: Option<B256>,
+    key_max: Option<B256>,
+    rows: u64,
+}
+
+#[derive(Default)]
+struct StateDump {
+    account_shards: Vec<ShardEmit>,
+    storage_shards: Vec<ShardEmit>,
+    code_shards: Vec<ShardEmit>,
+    total_accounts: u64,
+    total_storage: u64,
+    total_code: u64,
+}
+
+async fn dump_state<N>(factory: &ProviderFactory<N>, cli: &Cli) -> eyre::Result<StateDump>
 where
     N: ProviderNodeTypes,
 {
-    let shards = shard_count(cli.shard_bits);
-    let mut out = StateDump {
-        shards: (0..shards).map(|_| ShardData::default()).collect(),
-        ..Default::default()
-    };
+    let mut dump = StateDump::default();
+
     let provider = factory.database_provider_ro()?;
     let tx = provider.tx_ref();
 
-    let mut account_cursor = tx.cursor_read::<PlainAccountState>()?;
-    let mut storage_cursor = tx.cursor_dup_read::<PlainStorageState>()?;
-    let mut bytecode_cursor = tx.cursor_read::<Bytecodes>()?;
-    // Phase 26.x — reth's "optimized" / storage_v2 mode wipes
-    // PlainAccountState / PlainStorageState in favor of HashedAccounts
-    // / HashedStorages keyed by `keccak256(addr)` / `keccak256(slot)`.
-    // For targeted (`--account` / `--slot`) lookups we transparently
-    // fall back to the hashed tables.
-    let mut hashed_account_cursor = tx.cursor_read::<HashedAccounts>()?;
-    let mut hashed_storage_cursor = tx.cursor_dup_read::<HashedStorages>()?;
+    // ---- accounts (and code-hash collection) ----
+    let acct_start = Instant::now();
+    let mut accounts_cursor = tx.cursor_read::<HashedAccounts>()?;
+    let mut current_shard: Option<u32> = None;
+    let mut buf: Vec<(B256, u64, U256, B256)> = Vec::new();
+    let mut code_hashes_seen: HashSet<B256> = HashSet::new();
+    let max_accounts = if cli.max_accounts == 0 { u64::MAX } else { cli.max_accounts as u64 };
 
-    let row_cap = if cli.max_accounts == 0 {
-        usize::MAX
-    } else {
-        cli.max_accounts
-    };
-    let per_acct_cap = if cli.max_storage_per_account == 0 {
-        usize::MAX
-    } else {
-        cli.max_storage_per_account
-    };
-
-    let mut seen_code: HashSet<B256> = HashSet::new();
-    let mut acct_iter = account_cursor.walk(None)?;
-    while let Some(row) = acct_iter.next() {
-        if out.total_accounts >= row_cap {
+    let mut walk = accounts_cursor.walk(None)?;
+    while let Some(row) = walk.next() {
+        if dump.total_accounts >= max_accounts {
             break;
         }
-        let (address, account) = row?;
-        let code_hash = account
-            .bytecode_hash
-            .unwrap_or(KECCAK_EMPTY);
-        let shard = shard_for(address, cli.shard_bits);
-        out.shards[shard]
-            .accounts
-            .push((address, account.nonce, account.balance, code_hash));
-        out.total_accounts += 1;
+        let (h_addr, account) = row?;
+        let shard = shard_for_hash(h_addr, cli.shard_bits) as u32;
 
-        if account.bytecode_hash.is_some()
-            && code_hash != KECCAK_EMPTY
-            && seen_code.insert(code_hash)
-        {
-            if let Some((_, bytecode)) = bytecode_cursor.seek_exact(code_hash)? {
-                out.shards[shard]
-                    .code
-                    .push((code_hash, bytecode.original_byte_slice().to_vec()));
-                out.total_code += 1;
+        if Some(shard) != current_shard {
+            if let Some(prev) = current_shard.take() {
+                let emit = flush_accounts(cli, prev, std::mem::take(&mut buf)).await?;
+                dump.account_shards.push(emit);
             }
+            current_shard = Some(shard);
         }
 
-        let mut entry = storage_cursor.seek_exact(address)?;
-        let mut per_acct = 0usize;
-        while let Some((addr, sub)) = entry {
-            if addr != address || per_acct >= per_acct_cap {
-                break;
-            }
-            let slot = U256::from_be_slice(sub.key.as_slice());
-            out.shards[shard].storage.push((address, slot, sub.value));
-            out.total_storage += 1;
-            per_acct += 1;
-            entry = storage_cursor.next_dup()?;
+        let code_hash = account.bytecode_hash.unwrap_or(KECCAK_EMPTY);
+        if code_hash != KECCAK_EMPTY {
+            code_hashes_seen.insert(code_hash);
         }
+        buf.push((h_addr, account.nonce, account.balance, code_hash));
+        dump.total_accounts += 1;
 
-        if out.total_accounts % 100_000 == 0 {
+        if dump.total_accounts.is_multiple_of(500_000) {
             info!(
-                accounts = out.total_accounts,
-                storage = out.total_storage,
-                code = out.total_code,
-                "checkpoint walk progress"
+                accounts = dump.total_accounts,
+                shard,
+                elapsed_secs = acct_start.elapsed().as_secs(),
+                "accounts walk progress"
             );
         }
     }
+    if let Some(prev) = current_shard.take() {
+        let emit = flush_accounts(cli, prev, std::mem::take(&mut buf)).await?;
+        dump.account_shards.push(emit);
+    }
+    info!(
+        accounts = dump.total_accounts,
+        shards = dump.account_shards.len(),
+        code_hashes_referenced = code_hashes_seen.len(),
+        elapsed_secs = acct_start.elapsed().as_secs(),
+        "accounts dump complete"
+    );
 
-    // ---- Pass 2: force-include extra accounts/slots ----
-    // Phase 26.x — lets a spike-run target specific contracts/EOAs
-    // (e.g. USDC + vitalik) without dumping the surrounding 300M
-    // accounts.
-    let already_seeded: HashSet<Address> = out
-        .shards
-        .iter()
-        .flat_map(|s| s.accounts.iter().map(|(a, ..)| *a))
-        .collect();
+    // ---- storage ----
+    let storage_start = Instant::now();
+    let mut storage_cursor = tx.cursor_dup_read::<HashedStorages>()?;
+    let mut current_shard: Option<u32> = None;
+    let mut buf: Vec<(B256, B256, U256)> = Vec::new();
 
-    for raw in &cli.extra_accounts {
-        let addr: Address = raw.parse().with_context(|| {
-            format!("--account: invalid address {raw:?}")
-        })?;
-        if already_seeded.contains(&addr) {
-            continue;
+    // walk over a dup table yields (key, value) per duplicate row; for
+    // HashedStorages: key = keccak(addr), value = StorageEntry { key:
+    // keccak(slot), value: U256 }.
+    let mut walk = storage_cursor.walk(None)?;
+    while let Some(row) = walk.next() {
+        let (h_addr, entry) = row?;
+        let shard = shard_for_hash(h_addr, cli.shard_bits) as u32;
+
+        // Skip storage for accounts past the --max-accounts cap. We
+        // identify those by shard ID > last account shard (since
+        // sorted), OR by comparing within the current shard against
+        // the highest account hash emitted. For simplicity: if
+        // max_accounts capped us mid-walk, the last account shard
+        // emit captures the cutoff; storage shards beyond it are
+        // skipped entirely.
+        if cli.max_accounts > 0 {
+            let last_acct_shard = dump.account_shards.last().map(|s| s.shard).unwrap_or(0);
+            if shard > last_acct_shard {
+                break;
+            }
         }
-        // Plain first, then hashed (storage_v2 path).
-        let account = match account_cursor.seek_exact(addr)? {
-            Some((_, a)) => Some(a),
+
+        if Some(shard) != current_shard {
+            if let Some(prev) = current_shard.take() {
+                let emit = flush_storage(cli, prev, std::mem::take(&mut buf)).await?;
+                dump.storage_shards.push(emit);
+            }
+            current_shard = Some(shard);
+        }
+
+        buf.push((h_addr, entry.key, entry.value));
+        dump.total_storage += 1;
+
+        if dump.total_storage.is_multiple_of(2_000_000) {
+            info!(
+                storage = dump.total_storage,
+                shard,
+                elapsed_secs = storage_start.elapsed().as_secs(),
+                "storage walk progress"
+            );
+        }
+    }
+    if let Some(prev) = current_shard.take() {
+        let emit = flush_storage(cli, prev, std::mem::take(&mut buf)).await?;
+        dump.storage_shards.push(emit);
+    }
+    info!(
+        storage = dump.total_storage,
+        shards = dump.storage_shards.len(),
+        elapsed_secs = storage_start.elapsed().as_secs(),
+        "storage dump complete"
+    );
+
+    // ---- code (independent shard layout: top-bits of code_hash) ----
+    let code_start = Instant::now();
+    let mut bytecode_cursor = tx.cursor_read::<Bytecodes>()?;
+    let mut sorted: Vec<B256> = code_hashes_seen.into_iter().collect();
+    sorted.sort();
+
+    let mut current_shard: Option<u32> = None;
+    let mut buf: Vec<(B256, Vec<u8>)> = Vec::new();
+    for code_hash in sorted {
+        let shard = shard_for_hash(code_hash, cli.shard_bits) as u32;
+
+        if Some(shard) != current_shard {
+            if let Some(prev) = current_shard.take() {
+                let emit = flush_code(cli, prev, std::mem::take(&mut buf)).await?;
+                dump.code_shards.push(emit);
+            }
+            current_shard = Some(shard);
+        }
+
+        match bytecode_cursor.seek_exact(code_hash)? {
+            Some((_, bytecode)) => {
+                buf.push((code_hash, bytecode.original_byte_slice().to_vec()));
+                dump.total_code += 1;
+            }
             None => {
-                let h = keccak256(addr);
-                hashed_account_cursor.seek_exact(h)?.map(|(_, a)| a)
+                warn!(?code_hash, "referenced code_hash missing from Bytecodes");
             }
-        };
-        let Some(account) = account else {
-            warn!(address = %addr, "extra account not found in PlainAccountState or HashedAccounts");
-            continue;
-        };
-        let code_hash = account.bytecode_hash.unwrap_or(KECCAK_EMPTY);
-        let shard = shard_for(addr, cli.shard_bits);
-        out.shards[shard]
-            .accounts
-            .push((addr, account.nonce, account.balance, code_hash));
-        out.total_accounts += 1;
-        if account.bytecode_hash.is_some()
-            && code_hash != KECCAK_EMPTY
-            && seen_code.insert(code_hash)
-        {
-            if let Some((_, bytecode)) = bytecode_cursor.seek_exact(code_hash)? {
-                out.shards[shard]
-                    .code
-                    .push((code_hash, bytecode.original_byte_slice().to_vec()));
-                out.total_code += 1;
-            }
-        }
-        // Walk storage rows for the targeted account up to the cap.
-        // PlainStorageState first, fall back to HashedStorages.
-        let mut entry = storage_cursor.seek_exact(addr)?;
-        let mut per_acct = 0usize;
-        let mut found_plain = false;
-        while let Some((haddr, sub)) = entry {
-            if haddr != addr || per_acct >= per_acct_cap {
-                break;
-            }
-            let slot = U256::from_be_slice(sub.key.as_slice());
-            out.shards[shard].storage.push((addr, slot, sub.value));
-            out.total_storage += 1;
-            per_acct += 1;
-            found_plain = true;
-            entry = storage_cursor.next_dup()?;
-        }
-        if !found_plain {
-            // HashedStorages is keyed by keccak256(addr); the slot
-            // inner key is keccak256(slot). We don't have a reverse
-            // map from hashed slot back to plain slot, so we can
-            // only emit storage rows that were explicitly named via
-            // `--slot ADDR:SLOT`. That's handled in the next loop.
-        }
-        info!(address = %addr, "extra account seeded");
-    }
-
-    for raw in &cli.extra_slots {
-        let Some((a_raw, s_raw)) = raw.split_once(':') else {
-            return Err(eyre!("--slot expects ADDR:SLOT, got {raw:?}"));
-        };
-        let addr: Address = a_raw
-            .parse()
-            .with_context(|| format!("--slot: invalid address {a_raw:?}"))?;
-        let slot: U256 = U256::from_str_radix(
-            s_raw.trim_start_matches("0x"),
-            16,
-        )
-        .with_context(|| format!("--slot: invalid slot {s_raw:?}"))?;
-        let target_key_be: [u8; 32] = slot.to_be_bytes();
-        let target_key = B256::from(target_key_be);
-        let shard = shard_for(addr, cli.shard_bits);
-        let mut found = false;
-        // PlainStorageState first.
-        let mut entry = storage_cursor.seek_exact(addr)?;
-        while let Some((haddr, sub)) = entry {
-            if haddr != addr {
-                break;
-            }
-            if sub.key == target_key {
-                out.shards[shard].storage.push((addr, slot, sub.value));
-                out.total_storage += 1;
-                found = true;
-                info!(address = %addr, slot = %slot, value = %sub.value, "extra slot seeded (plain)");
-                break;
-            }
-            entry = storage_cursor.next_dup()?;
-        }
-        if !found {
-            // HashedStorages fallback: dup table keyed by
-            // keccak256(addr), inner key keccak256(slot).
-            let h_addr = keccak256(addr);
-            let h_slot = keccak256(target_key);
-            let mut h_entry = hashed_storage_cursor.seek_by_key_subkey(h_addr, h_slot)?;
-            // seek_by_key_subkey may land on a higher subkey if the
-            // exact slot isn't present.
-            while let Some(sub) = h_entry {
-                if sub.key != h_slot {
-                    break;
-                }
-                out.shards[shard].storage.push((addr, slot, sub.value));
-                out.total_storage += 1;
-                found = true;
-                info!(address = %addr, slot = %slot, value = %sub.value, "extra slot seeded (hashed)");
-                break;
-            }
-        }
-        if !found {
-            warn!(address = %addr, slot = %slot, "extra slot not found in PlainStorageState or HashedStorages");
         }
     }
+    if let Some(prev) = current_shard.take() {
+        let emit = flush_code(cli, prev, std::mem::take(&mut buf)).await?;
+        dump.code_shards.push(emit);
+    }
+    info!(
+        code_blobs = dump.total_code,
+        shards = dump.code_shards.len(),
+        elapsed_secs = code_start.elapsed().as_secs(),
+        "code dump complete"
+    );
 
-    Ok(out)
+    Ok(dump)
 }
 
-// ======================== artifact emit ========================
+fn shard_dir(out_dir: &std::path::Path, shard: u32) -> PathBuf {
+    out_dir.join(format!("shard-{shard:04}"))
+}
+
+async fn flush_accounts(
+    cli: &Cli,
+    shard: u32,
+    rows: Vec<(B256, u64, U256, B256)>,
+) -> eyre::Result<ShardEmit> {
+    let dir = shard_dir(&cli.out_dir, shard);
+    tokio::fs::create_dir_all(&dir).await?;
+    let bytes = vortex_writer::accounts_chunk(&rows).await?;
+    let key_min = rows.first().map(|r| r.0);
+    let key_max = rows.last().map(|r| r.0);
+    let path = dir.join("accounts.vortex");
+    let object_key = format!("shard-{shard:04}/accounts.vortex");
+    tokio::fs::write(&path, &bytes).await?;
+    Ok(ShardEmit {
+        shard,
+        object_key,
+        bytes_written: bytes.len() as u64,
+        sha256_hex: format!("{:x}", Sha256::digest(&bytes)),
+        key_min,
+        key_max,
+        rows: rows.len() as u64,
+    })
+}
+
+async fn flush_storage(
+    cli: &Cli,
+    shard: u32,
+    rows: Vec<(B256, B256, U256)>,
+) -> eyre::Result<ShardEmit> {
+    let dir = shard_dir(&cli.out_dir, shard);
+    tokio::fs::create_dir_all(&dir).await?;
+    let bytes = vortex_writer::storage_chunk(&rows).await?;
+    let key_min = rows.first().map(|r| r.0);
+    let key_max = rows.last().map(|r| r.0);
+    let path = dir.join("storage.vortex");
+    let object_key = format!("shard-{shard:04}/storage.vortex");
+    tokio::fs::write(&path, &bytes).await?;
+    Ok(ShardEmit {
+        shard,
+        object_key,
+        bytes_written: bytes.len() as u64,
+        sha256_hex: format!("{:x}", Sha256::digest(&bytes)),
+        key_min,
+        key_max,
+        rows: rows.len() as u64,
+    })
+}
+
+async fn flush_code(cli: &Cli, shard: u32, rows: Vec<(B256, Vec<u8>)>) -> eyre::Result<ShardEmit> {
+    let dir = shard_dir(&cli.out_dir, shard);
+    tokio::fs::create_dir_all(&dir).await?;
+    let bytes = vortex_writer::code_chunk(&rows).await?;
+    let key_min = rows.first().map(|r| r.0);
+    let key_max = rows.last().map(|r| r.0);
+    let path = dir.join("code.vortex");
+    let object_key = format!("shard-{shard:04}/code.vortex");
+    tokio::fs::write(&path, &bytes).await?;
+    Ok(ShardEmit {
+        shard,
+        object_key,
+        bytes_written: bytes.len() as u64,
+        sha256_hex: format!("{:x}", Sha256::digest(&bytes)),
+        key_min,
+        key_max,
+        rows: rows.len() as u64,
+    })
+}
+
+// ============== manifest emission (v2 / hash-keyed) ==============
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StateArtifactRef {
@@ -493,12 +509,21 @@ struct StateArtifactRef {
     to_block: u64,
     state_root: Option<String>,
     object_key: String,
-    index_key: Option<String>,
     content_sha256: String,
-    /// Phase 26.3 — shard-aware: which shard this ref points at.
-    /// `None` for single-shard (`shard_bits=0`) checkpoints.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     shard: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    key_min: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    key_max: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShardManifest {
+    shard: u32,
+    accounts: StateArtifactRef,
+    storage: StateArtifactRef,
+    code: StateArtifactRef,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -508,32 +533,12 @@ struct FinalizedStateArtifactManifest {
     block_number: u64,
     block_hash: String,
     state_root: Option<String>,
-    /// Single-shard mode: identical to Phase 26.2's schema.
-    /// Multi-shard mode: top-level `accounts/storage/code` are
-    /// `None`; consult `shards[*]` instead.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    accounts: Option<StateArtifactRef>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    storage: Option<StateArtifactRef>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    code: Option<StateArtifactRef>,
-    /// Phase 26.3 — one entry per shard, ordered by shard id
-    /// ascending. Each entry has its own (accounts, storage, code)
-    /// refs. Empty when `shard_bits == 0`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always present in v2; only the per-shard refs are populated.
     shards: Vec<ShardManifest>,
-    /// `shard_bits` used to lay out the shards. Readers shard the
-    /// same way when looking up by address.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Number of high-order bits of `keccak(addr)` that route to a shard.
     shard_bits: Option<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ShardManifest {
-    shard: u32,
-    accounts: StateArtifactRef,
-    storage: StateArtifactRef,
-    code: StateArtifactRef,
+    /// Always `"hashed"` in v2 — kept as a string so v3 can extend.
+    key_layout: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -564,119 +569,119 @@ struct CheckpointIndex {
 
 const MAX_INDEX_ENTRIES: usize = 64;
 
-async fn write_artifacts(
+fn build_manifest(
     cli: &Cli,
     block_number: u64,
     block_hash: &str,
     state_root: &Option<String>,
     dump: &StateDump,
-) -> eyre::Result<FinalizedStateArtifactManifest> {
-    let mut manifest = FinalizedStateArtifactManifest {
-        version: 1,
-        chain_id: 1, // Mainnet — relay-side bucket is mainnet-only today
-        block_number,
-        block_hash: block_hash.to_string(),
-        state_root: state_root.clone(),
-        accounts: None,
-        storage: None,
-        code: None,
-        shards: Vec::new(),
-        shard_bits: if cli.shard_bits == 0 {
-            None
-        } else {
-            Some(cli.shard_bits)
-        },
-    };
-
-    if cli.shard_bits == 0 {
-        // Single-shard: matches Phase 26.2 schema exactly.
-        let shard = &dump.shards[0];
-        let (a_bytes, s_bytes, c_bytes) = write_shard(cli, "0", shard).await?;
-        manifest.accounts = Some(make_ref(1, "accounts", block_number, state_root, "accounts.vortex", &a_bytes, None));
-        manifest.storage = Some(make_ref(1, "storage", block_number, state_root, "storage.vortex", &s_bytes, None));
-        manifest.code = Some(make_ref(1, "code", block_number, state_root, "code.vortex", &c_bytes, None));
-    } else {
-        for (idx, shard) in dump.shards.iter().enumerate() {
-            let dirname = format!("shard-{idx:04}");
-            let (a_bytes, s_bytes, c_bytes) = write_shard(cli, &dirname, shard).await?;
-            let s = ShardManifest {
-                shard: idx as u32,
-                accounts: make_ref(
+) -> FinalizedStateArtifactManifest {
+    // Join the three shard families on shard_id. Each family may have
+    // gaps (e.g. a shard with no storage rows), but for every shard
+    // that contains accounts we emit a ShardManifest. The bucket
+    // client tolerates empty storage/code refs (returns 0 rows).
+    let mut by_shard: std::collections::BTreeMap<
+        u32,
+        (Option<&ShardEmit>, Option<&ShardEmit>, Option<&ShardEmit>),
+    > = std::collections::BTreeMap::new();
+    for e in &dump.account_shards {
+        by_shard.entry(e.shard).or_insert((None, None, None)).0 = Some(e);
+    }
+    for e in &dump.storage_shards {
+        by_shard.entry(e.shard).or_insert((None, None, None)).1 = Some(e);
+    }
+    for e in &dump.code_shards {
+        by_shard.entry(e.shard).or_insert((None, None, None)).2 = Some(e);
+    }
+    let shards = by_shard
+        .into_iter()
+        .map(|(shard_id, (a, s, c))| {
+            let (rmin, rmax) = shard_range(shard_id, cli.shard_bits);
+            let range_min = format!("0x{}", hex::encode(rmin.as_slice()));
+            let range_max = format!("0x{}", hex::encode(rmax.as_slice()));
+            ShardManifest {
+                shard: shard_id,
+                accounts: emit_to_ref(
                     1,
                     "accounts",
                     block_number,
                     state_root,
-                    &format!("{dirname}/accounts.vortex"),
-                    &a_bytes,
-                    Some(idx as u32),
+                    shard_id,
+                    a,
+                    &range_min,
+                    &range_max,
                 ),
-                storage: make_ref(
+                storage: emit_to_ref(
                     1,
                     "storage",
                     block_number,
                     state_root,
-                    &format!("{dirname}/storage.vortex"),
-                    &s_bytes,
-                    Some(idx as u32),
+                    shard_id,
+                    s,
+                    &range_min,
+                    &range_max,
                 ),
-                code: make_ref(
+                code: emit_to_ref(
                     1,
                     "code",
                     block_number,
                     state_root,
-                    &format!("{dirname}/code.vortex"),
-                    &c_bytes,
-                    Some(idx as u32),
+                    shard_id,
+                    c,
+                    &range_min,
+                    &range_max,
                 ),
-            };
-            manifest.shards.push(s);
-        }
+            }
+        })
+        .collect();
+
+    FinalizedStateArtifactManifest {
+        version: 2,
+        chain_id: 1,
+        block_number,
+        block_hash: block_hash.to_string(),
+        state_root: state_root.clone(),
+        shards,
+        shard_bits: Some(cli.shard_bits),
+        key_layout: Some("hashed".to_string()),
     }
-    let bytes = serde_json::to_vec_pretty(&manifest)?;
-    tokio::fs::write(cli.out_dir.join("manifest.json"), bytes).await?;
-    Ok(manifest)
 }
 
-async fn write_shard(
-    cli: &Cli,
-    dirname: &str,
-    shard: &ShardData,
-) -> eyre::Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let dir = if dirname == "0" {
-        cli.out_dir.clone()
-    } else {
-        let d = cli.out_dir.join(dirname);
-        tokio::fs::create_dir_all(&d).await?;
-        d
-    };
-    let a = vortex_writer::accounts_chunk(&shard.accounts).await?;
-    let s = vortex_writer::storage_chunk(&shard.storage).await?;
-    let c = vortex_writer::code_chunk(&shard.code).await?;
-    tokio::fs::write(dir.join("accounts.vortex"), &a).await?;
-    tokio::fs::write(dir.join("storage.vortex"), &s).await?;
-    tokio::fs::write(dir.join("code.vortex"), &c).await?;
-    Ok((a, s, c))
-}
-
-fn make_ref(
+fn emit_to_ref(
     chain_id: u64,
     kind: &str,
     block: u64,
     state_root: &Option<String>,
-    object_key: &str,
-    bytes: &[u8],
-    shard: Option<u32>,
+    shard_id: u32,
+    emit: Option<&ShardEmit>,
+    range_min: &str,
+    range_max: &str,
 ) -> StateArtifactRef {
-    StateArtifactRef {
-        chain_id,
-        kind: kind.to_string(),
-        from_block: block,
-        to_block: block,
-        state_root: state_root.clone(),
-        object_key: object_key.to_string(),
-        index_key: None,
-        content_sha256: format!("{:x}", Sha256::digest(bytes)),
-        shard,
+    match emit {
+        Some(e) => StateArtifactRef {
+            chain_id,
+            kind: kind.to_string(),
+            from_block: block,
+            to_block: block,
+            state_root: state_root.clone(),
+            object_key: e.object_key.clone(),
+            content_sha256: e.sha256_hex.clone(),
+            shard: Some(shard_id),
+            key_min: e.key_min.map(|h| format!("0x{}", hex::encode(h.as_slice()))),
+            key_max: e.key_max.map(|h| format!("0x{}", hex::encode(h.as_slice()))),
+        },
+        None => StateArtifactRef {
+            chain_id,
+            kind: kind.to_string(),
+            from_block: block,
+            to_block: block,
+            state_root: state_root.clone(),
+            object_key: format!("shard-{shard_id:04}/{kind}.vortex"),
+            content_sha256: format!("{:x}", Sha256::digest([])),
+            shard: Some(shard_id),
+            key_min: Some(range_min.to_string()),
+            key_max: Some(range_max.to_string()),
+        },
     }
 }
 
@@ -732,11 +737,18 @@ async fn upload(
         format!("{base}/{}", manifest.block_number)
     };
 
-    let upload_one = |local: PathBuf, key: String, ar: &StateArtifactRef| {
+    let upload_one = |local: PathBuf, key: String, expected: String| {
         let store = Arc::clone(&store);
-        let expected = ar.content_sha256.clone();
         async move {
-            let bytes = tokio::fs::read(&local).await?;
+            // Tolerate "shard exists in manifest but no file on disk"
+            // for the empty-shard placeholder case. The expected sha
+            // is the sha of empty bytes; if we can't read the file,
+            // upload empty.
+            let bytes = match tokio::fs::read(&local).await {
+                Ok(b) => b,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(err) => return Err(eyre!("read {}: {err}", local.display())),
+            };
             let actual = format!("{:x}", Sha256::digest(&bytes));
             if actual != expected {
                 return Err(eyre!(
@@ -744,55 +756,32 @@ async fn upload(
                     local.display()
                 ));
             }
-            store
-                .put(&ObjectPath::from(key.as_str()), PutPayload::from(bytes))
-                .await?;
+            store.put(&ObjectPath::from(key.as_str()), PutPayload::from(bytes)).await?;
             info!(key, "uploaded");
             eyre::Ok(())
         }
     };
 
-    if let (Some(a), Some(s), Some(c)) = (&manifest.accounts, &manifest.storage, &manifest.code) {
+    for shard in &manifest.shards {
+        let dir = shard_dir(&cli.out_dir, shard.shard);
         upload_one(
-            cli.out_dir.join("accounts.vortex"),
-            format!("{dir_prefix}/accounts.vortex"),
-            a,
+            dir.join("accounts.vortex"),
+            format!("{dir_prefix}/{}", shard.accounts.object_key),
+            shard.accounts.content_sha256.clone(),
         )
         .await?;
         upload_one(
-            cli.out_dir.join("storage.vortex"),
-            format!("{dir_prefix}/storage.vortex"),
-            s,
+            dir.join("storage.vortex"),
+            format!("{dir_prefix}/{}", shard.storage.object_key),
+            shard.storage.content_sha256.clone(),
         )
         .await?;
         upload_one(
-            cli.out_dir.join("code.vortex"),
-            format!("{dir_prefix}/code.vortex"),
-            c,
+            dir.join("code.vortex"),
+            format!("{dir_prefix}/{}", shard.code.object_key),
+            shard.code.content_sha256.clone(),
         )
         .await?;
-    } else {
-        for shard in &manifest.shards {
-            let local = cli.out_dir.join(format!("shard-{:04}", shard.shard));
-            upload_one(
-                local.join("accounts.vortex"),
-                format!("{dir_prefix}/{}", shard.accounts.object_key),
-                &shard.accounts,
-            )
-            .await?;
-            upload_one(
-                local.join("storage.vortex"),
-                format!("{dir_prefix}/{}", shard.storage.object_key),
-                &shard.storage,
-            )
-            .await?;
-            upload_one(
-                local.join("code.vortex"),
-                format!("{dir_prefix}/{}", shard.code.object_key),
-                &shard.code,
-            )
-            .await?;
-        }
     }
 
     let signed = SignedCheckpointManifest {
@@ -806,44 +795,35 @@ async fn upload(
     let signature = signing_key.sign(&signed_bytes).to_bytes().to_vec();
     let manifest_key = format!("{dir_prefix}/manifest.json");
     let sig_key = format!("{manifest_key}.sig");
-    store
-        .put(&ObjectPath::from(manifest_key.as_str()), PutPayload::from(signed_bytes))
-        .await?;
-    store
-        .put(&ObjectPath::from(sig_key.as_str()), PutPayload::from(signature))
-        .await?;
+    store.put(&ObjectPath::from(manifest_key.as_str()), PutPayload::from(signed_bytes)).await?;
+    store.put(&ObjectPath::from(sig_key.as_str()), PutPayload::from(signature)).await?;
     info!(manifest_key, "uploaded signed checkpoint manifest");
 
     if params.update_index {
-        let index_key = if base.is_empty() {
-            "index.json".to_string()
-        } else {
-            format!("{base}/index.json")
-        };
-        let mut entries: Vec<CheckpointIndexEntry> = match store
-            .get(&ObjectPath::from(index_key.as_str()))
-            .await
-        {
-            Ok(g) => {
-                let bytes = g.bytes().await?.to_vec();
-                serde_json::from_slice::<CheckpointIndex>(&bytes)
-                    .map(|i| i.entries)
-                    .unwrap_or_default()
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("NoSuchKey")
-                    || msg.contains("NotFound")
-                    || msg.contains("status code: 404")
-                    || msg.contains("status code: 403")
-                    || msg.contains("AccessDenied")
-                {
-                    Vec::new()
-                } else {
-                    return Err(eyre!("read index {index_key}: {e}"));
+        let index_key =
+            if base.is_empty() { "index.json".to_string() } else { format!("{base}/index.json") };
+        let mut entries: Vec<CheckpointIndexEntry> =
+            match store.get(&ObjectPath::from(index_key.as_str())).await {
+                Ok(g) => {
+                    let bytes = g.bytes().await?.to_vec();
+                    serde_json::from_slice::<CheckpointIndex>(&bytes)
+                        .map(|i| i.entries)
+                        .unwrap_or_default()
                 }
-            }
-        };
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("NoSuchKey") ||
+                        msg.contains("NotFound") ||
+                        msg.contains("status code: 404") ||
+                        msg.contains("status code: 403") ||
+                        msg.contains("AccessDenied")
+                    {
+                        Vec::new()
+                    } else {
+                        return Err(eyre!("read index {index_key}: {e}"));
+                    }
+                }
+            };
         entries.retain(|e| e.block_number != manifest.block_number);
         entries.push(CheckpointIndexEntry {
             block_number: manifest.block_number,
@@ -863,17 +843,9 @@ async fn upload(
         };
         let new_bytes = serde_json::to_vec_pretty(&new_index)?;
         let new_sig = signing_key.sign(&new_bytes).to_bytes().to_vec();
+        store.put(&ObjectPath::from(index_key.as_str()), PutPayload::from(new_bytes)).await?;
         store
-            .put(
-                &ObjectPath::from(index_key.as_str()),
-                PutPayload::from(new_bytes),
-            )
-            .await?;
-        store
-            .put(
-                &ObjectPath::from(format!("{index_key}.sig").as_str()),
-                PutPayload::from(new_sig),
-            )
+            .put(&ObjectPath::from(format!("{index_key}.sig").as_str()), PutPayload::from(new_sig))
             .await?;
         info!(index_key, "uploaded checkpoint index");
     }
@@ -884,45 +856,25 @@ async fn upload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::Address;
 
     #[test]
-    fn shard_for_distributes_addresses() {
-        let mut counts = [0usize; 256];
-        for i in 0u32..=10_000 {
-            let mut bytes = [0u8; 20];
-            bytes[0..4].copy_from_slice(&i.to_be_bytes());
-            let addr = Address::from(bytes);
-            let s = shard_for(addr, 8);
-            counts[s] += 1;
-        }
-        // Bits 0..8 are i.to_be_bytes()[0] which is i >> 24 — all
-        // 0 for our small range. The whole 10,000 addresses land
-        // in shard 0. This isn't a uniformity test (sequential
-        // inputs aren't randomized), but it does prove the
-        // function maps every address to a valid shard id.
-        assert_eq!(counts[0], 10_001);
-        for c in &counts[1..] {
-            assert_eq!(*c, 0);
-        }
+    fn shard_for_hash_uses_top_bits() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xab;
+        bytes[1] = 0xcd;
+        let h = B256::from(bytes);
+        // 8-bit shard: 0xab
+        assert_eq!(shard_for_hash(h, 8), 0xab);
+        // 12-bit shard: 0xabc
+        assert_eq!(shard_for_hash(h, 12), 0xabc);
+        // 16-bit shard: 0xabcd
+        assert_eq!(shard_for_hash(h, 16), 0xabcd);
     }
 
     #[test]
-    fn shard_for_high_bits_route_to_high_shards() {
-        let mut bytes = [0u8; 20];
-        bytes[0] = 0xff;
-        let addr = Address::from(bytes);
-        assert_eq!(shard_for(addr, 8), 255);
-
-        bytes[0] = 0x80;
-        let addr = Address::from(bytes);
-        assert_eq!(shard_for(addr, 8), 128);
-
-        bytes[0] = 0xab;
-        bytes[1] = 0xcd;
-        let addr = Address::from(bytes);
-        // 12-bit shard: top 12 bits = 0xabc
-        assert_eq!(shard_for(addr, 12), 0xabc);
+    fn shard_for_hash_zero_bits_single_shard() {
+        let h = B256::from([0xffu8; 32]);
+        assert_eq!(shard_for_hash(h, 0), 0);
     }
 
     #[test]
@@ -931,5 +883,41 @@ mod tests {
         assert_eq!(shard_count(1), 2);
         assert_eq!(shard_count(8), 256);
         assert_eq!(shard_count(12), 4096);
+        assert_eq!(shard_count(16), 65_536);
+    }
+
+    #[test]
+    fn shard_range_covers_full_space() {
+        // 8 bits, shard 0: 0x0000... to 0x00ff...
+        let (lo, hi) = shard_range(0, 8);
+        assert_eq!(lo.as_slice()[0..2], [0x00, 0x00]);
+        assert_eq!(hi.as_slice()[0..2], [0x00, 0xff]);
+        // 8 bits, shard 0xff: 0xff00... to 0xffff...
+        let (lo, hi) = shard_range(0xff, 8);
+        assert_eq!(lo.as_slice()[0..2], [0xff, 0x00]);
+        assert_eq!(hi.as_slice()[0..2], [0xff, 0xff]);
+        // 12 bits, shard 0xabc: 0xabc0 to 0xabcf in top 16 bits
+        let (lo, hi) = shard_range(0xabc, 12);
+        assert_eq!(lo.as_slice()[0..2], [0xab, 0xc0]);
+        assert_eq!(hi.as_slice()[0..2], [0xab, 0xcf]);
+    }
+
+    #[test]
+    fn shard_assignment_round_trips_with_range() {
+        for bits in [0u8, 1, 4, 8, 12, 16] {
+            for shard in 0..shard_count(bits) as u32 {
+                let (lo, hi) = shard_range(shard, bits);
+                assert_eq!(shard_for_hash(lo, bits), shard as usize);
+                assert_eq!(shard_for_hash(hi, bits), shard as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn keccak_addr_is_deterministic() {
+        let a = Address::from([1u8; 20]);
+        let h1 = keccak256(a);
+        let h2 = keccak256(a);
+        assert_eq!(h1, h2);
     }
 }

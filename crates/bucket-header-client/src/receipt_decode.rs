@@ -6,35 +6,34 @@
 //! joining the per-block `vortex_logs` chunk by `tx_idx` for the
 //! `logs` field.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use alloy_consensus::TxType;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
-use eyre::{Result, eyre};
-use object_store::{ObjectStore, ObjectStoreExt};
-use object_store::path::Path as ObjectPath;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use eyre::{eyre, Result};
+use object_store::{path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
 use reth_ethereum_primitives::Receipt;
-use vortex::array::accessor::ArrayAccessor;
-use vortex::array::arrays::decimal::DecimalArrayExt;
-use vortex::array::arrays::struct_::StructArrayExt;
-use vortex::array::arrays::{
-    DecimalArray, PrimitiveArray, StructArray as VortexStructArray,
-    VarBinViewArray as VortexVarBinViewArray,
+use vortex::{
+    array::{
+        accessor::ArrayAccessor,
+        arrays::{
+            decimal::DecimalArrayExt, struct_::StructArrayExt, DecimalArray, PrimitiveArray,
+            StructArray as VortexStructArray, VarBinViewArray as VortexVarBinViewArray,
+        },
+        dtype::DecimalType,
+        expr::{col, eq, lit, root, select},
+        scalar::Scalar,
+        stream::ArrayStreamExt,
+        ExecutionCtx, VortexSessionExecute,
+    },
+    session::VortexSession,
+    VortexSessionDefault,
 };
-use vortex::array::dtype::DecimalType;
-use vortex::array::expr::{col, eq, lit, root, select};
-use vortex::array::stream::ArrayStreamExt;
-use vortex::array::{ExecutionCtx, VortexSessionExecute, scalar::Scalar};
-use vortex::session::VortexSession;
-use vortex::VortexSessionDefault;
 use vortex_buffer::ByteBuffer;
 use vortex_file::{Footer, OpenOptionsSessionExt};
 use vortex_io::object_store::ObjectStoreReadAt;
 
-use super::VortexPreloadRange;
-use super::log_decode::DecodedLog;
+use super::{log_decode::DecodedLog, VortexPreloadRange};
 
 const RECEIPT_COLUMNS: &[&str] = &[
     "block_num",
@@ -146,8 +145,8 @@ pub(crate) fn rows_to_receipts(
     let mut out = Vec::with_capacity(len);
     for row in 0..len {
         let row_block = block_num[row] as u64;
-        if let Some(filter) = block_filter
-            && row_block != filter
+        if let Some(filter) = block_filter &&
+            row_block != filter
         {
             continue;
         }
@@ -156,8 +155,8 @@ pub(crate) fn rows_to_receipts(
         let tx_type_byte = tx_types_by_tx_idx.get(&idx).copied().unwrap_or(0);
         let tx_type = TxType::try_from(tx_type_byte)
             .map_err(|err| eyre!("row {row} tx_type {tx_type_byte}: {err}"))?;
-        let tx_hash_b = bytes_to_b256(&tx_hash[row])
-            .map_err(|err| eyre!("row {row} tx_hash: {err}"))?;
+        let tx_hash_b =
+            bytes_to_b256(&tx_hash[row]).map_err(|err| eyre!("row {row} tx_hash: {err}"))?;
         let receipt = Receipt {
             tx_type,
             success: status[row] != 0,
@@ -201,9 +200,8 @@ where
         .map_err(|err| eyre!("vortex receipts missing {name}: {err}"))?;
     let values: PrimitiveArray =
         field.clone().execute(ctx).map_err(|err| eyre!("decode {name}: {err}"))?;
-    Ok(values.with_iterator(|iter| {
-        iter.map(|v| v.copied().unwrap_or_default()).collect::<Vec<_>>()
-    }))
+    Ok(values
+        .with_iterator(|iter| iter.map(|v| v.copied().unwrap_or_default()).collect::<Vec<_>>()))
 }
 
 fn varbin_required(
@@ -241,14 +239,17 @@ fn _decimal_unused(_a: DecimalArray, _t: DecimalType) {}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use object_store::ObjectStoreExt;
-    use object_store::memory::InMemory;
-    use vortex::array::IntoArray;
-    use vortex::array::arrays::StructArray;
-    use vortex::array::builders::{ArrayBuilder, VarBinViewBuilder};
-    use vortex::array::dtype::{DType, DecimalDType, FieldNames, Nullability};
-    use vortex::array::validity::Validity;
-    use vortex::buffer::{Buffer, ByteBufferMut};
+    use object_store::{memory::InMemory, ObjectStoreExt};
+    use vortex::{
+        array::{
+            arrays::StructArray,
+            builders::{ArrayBuilder, VarBinViewBuilder},
+            dtype::{DType, DecimalDType, FieldNames, Nullability},
+            validity::Validity,
+            IntoArray,
+        },
+        buffer::{Buffer, ByteBufferMut},
+    };
     use vortex_file::WriteOptionsSessionExt;
 
     #[tokio::test]
@@ -258,10 +259,7 @@ pub(crate) mod tests {
         let object_path = ObjectPath::from(format!("chunks/{chunk_path}"));
         let bytes = build_synthetic_receipt_chunk().await;
         let file_size = bytes.len() as u64;
-        store
-            .put(&object_path, bytes.freeze().to_vec().into())
-            .await
-            .expect("put receipt object");
+        store.put(&object_path, bytes.freeze().to_vec().into()).await.expect("put receipt object");
 
         // Synthetic logs/tx-types: tx 0 has one log; tx 1 none.
         let mut logs = BTreeMap::new();
@@ -311,22 +309,10 @@ pub(crate) mod tests {
             FieldNames::from(RECEIPT_COLUMNS),
             vec![
                 primitive_array([100_i64, 101, 101]),
-                binary_array([
-                    Some(vec![0x10; 32]),
-                    Some(vec![0x11; 32]),
-                    Some(vec![0x12; 32]),
-                ]),
+                binary_array([Some(vec![0x10; 32]), Some(vec![0x11; 32]), Some(vec![0x12; 32])]),
                 primitive_array([0_i32, 0, 1]),
-                binary_array([
-                    Some(vec![0x20; 32]),
-                    Some(vec![0x21; 32]),
-                    Some(vec![0x22; 32]),
-                ]),
-                binary_array([
-                    Some(vec![0x30; 20]),
-                    Some(vec![0x31; 20]),
-                    Some(vec![0x32; 20]),
-                ]),
+                binary_array([Some(vec![0x20; 32]), Some(vec![0x21; 32]), Some(vec![0x22; 32])]),
+                binary_array([Some(vec![0x30; 20]), Some(vec![0x31; 20]), Some(vec![0x32; 20])]),
                 binary_array([None, Some(vec![0x41; 20]), None]),
                 binary_array([None, None, Some(vec![0x52; 20])]),
                 primitive_array([1_i8, 1, 0]),
@@ -335,11 +321,7 @@ pub(crate) mod tests {
                 decimal_array([6_i128, 7, 8]),
                 primitive_nullable_array([None, Some(3_i64), None]),
                 decimal_nullable_array([None, Some(9_i128), None]),
-                binary_array([
-                    Some(vec![0x70; 256]),
-                    Some(vec![0x71; 256]),
-                    Some(vec![0x72; 256]),
-                ]),
+                binary_array([Some(vec![0x70; 256]), Some(vec![0x71; 256]), Some(vec![0x72; 256])]),
             ],
             3,
             Validity::NonNullable,
@@ -366,17 +348,14 @@ pub(crate) mod tests {
         .into_array()
     }
 
-    fn primitive_nullable_array<T, const N: usize>(values: [Option<T>; N]) -> vortex::array::ArrayRef
+    fn primitive_nullable_array<T, const N: usize>(
+        values: [Option<T>; N],
+    ) -> vortex::array::ArrayRef
     where
         T: vortex::array::dtype::NativePType,
     {
         PrimitiveArray::new(
-            Buffer::<T>::from(
-                values
-                    .iter()
-                    .map(|v| v.unwrap_or_default())
-                    .collect::<Vec<_>>(),
-            ),
+            Buffer::<T>::from(values.iter().map(|v| v.unwrap_or_default()).collect::<Vec<_>>()),
             Validity::from_iter(values.iter().map(Option::is_some)),
         )
         .into_array()
@@ -386,7 +365,9 @@ pub(crate) mod tests {
         DecimalArray::from_iter(values, DecimalDType::new(38, 0)).into_array()
     }
 
-    fn decimal_nullable_array<const N: usize>(values: [Option<i128>; N]) -> vortex::array::ArrayRef {
+    fn decimal_nullable_array<const N: usize>(
+        values: [Option<i128>; N],
+    ) -> vortex::array::ArrayRef {
         DecimalArray::from_option_iter(values, DecimalDType::new(38, 0)).into_array()
     }
 

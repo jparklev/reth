@@ -8,33 +8,30 @@
 //! ## Trust chain
 //!
 //! - `manifest/head.json` ed25519-signed by writer
-//! - `manifest/finalized/<epoch>.json` ed25519-signed by writer,
-//!   sha256-pinned by `head.epoch_manifest_sha256`
-//! - chunks pinned by sha256 inside the epoch manifest's
-//!   `block_index` + `chunks` map
+//! - `manifest/finalized/<epoch>.json` ed25519-signed by writer, sha256-pinned by
+//!   `head.epoch_manifest_sha256`
+//! - chunks pinned by sha256 inside the epoch manifest's `block_index` + `chunks` map
 //!
 //! Same trust shape relay-rpc already runs at 100% L1 mainnet
 //! traffic. See `crates/relay-rpc/src/backends/bucket.rs` in the
 //! relay project for the canonical reader-side implementation; this
 //! crate is the in-reth port (sync `HeaderProvider`-shaped surface).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use alloy_consensus::Header;
-use alloy_primitives::{Address, B256, BlockHash, BlockNumber, Bloom, Bytes, U256};
+use alloy_primitives::{Address, BlockHash, BlockNumber, Bloom, Bytes, B256, U256};
 use alloy_rpc_types_eth::Log;
 use arc_swap::ArcSwap;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::Verifier;
-use object_store::{ObjectStore, ObjectStoreExt};
-use object_store::aws::AmazonS3Builder;
-use object_store::path::Path as ObjectPath;
+use object_store::{aws::AmazonS3Builder, path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_provider::{BucketHeaderClient, BucketHeaderClientArc};
-use reth_storage_errors::db::DatabaseError;
-use reth_storage_errors::provider::{ProviderError, ProviderResult};
+use reth_storage_errors::{
+    db::DatabaseError,
+    provider::{ProviderError, ProviderResult},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
@@ -236,20 +233,23 @@ impl HttpBucketHeaderClient {
         // called from within an executor task; using block_on
         // directly would panic. block_in_place yields the worker
         // to other tasks while we run the bootstrap synchronously.
-        tokio::task::block_in_place(|| {
-            handle.block_on(async { Self::new(config).await })
-        })
-        .map(Arc::new)
+        tokio::task::block_in_place(|| handle.block_on(async { Self::new(config).await }))
+            .map(Arc::new)
     }
 
-    pub fn bucket_url(&self) -> &str { &self.config.bucket_url }
+    pub fn bucket_url(&self) -> &str {
+        &self.config.bucket_url
+    }
 
     pub async fn new(config: BucketHeaderClientConfig) -> Result<Self, BucketClientError> {
         let bucket = config
             .bucket_url
             .strip_prefix("s3://")
             .ok_or_else(|| {
-                BucketClientError::Backend(format!("expected s3:// bucket URL, got {}", config.bucket_url))
+                BucketClientError::Backend(format!(
+                    "expected s3:// bucket URL, got {}",
+                    config.bucket_url
+                ))
             })?
             .to_string();
         if bucket.is_empty() {
@@ -277,9 +277,7 @@ impl HttpBucketHeaderClient {
                     config.secret_key_env
                 ))
             })?;
-            builder = builder
-                .with_access_key_id(ak)
-                .with_secret_access_key(sk);
+            builder = builder.with_access_key_id(ak).with_secret_access_key(sk);
         }
         let store = Arc::new(builder.build().map_err(|err| {
             BucketClientError::Backend(format!("object_store init failed: {err}"))
@@ -287,12 +285,9 @@ impl HttpBucketHeaderClient {
         // Load head + writer pubkey
         let head_bytes = fetch_object(&store, "manifest/head.json").await?;
         let head_sig = fetch_object(&store, "manifest/head.json.sig").await?;
-        let head: HeadManifest = serde_json::from_slice(&head_bytes).map_err(|err| {
-            BucketClientError::Backend(format!("decode head.json: {err}"))
-        })?;
-        if !config.trusted_writers.is_empty()
-            && !config.trusted_writers.contains(&head.writer_id)
-        {
+        let head: HeadManifest = serde_json::from_slice(&head_bytes)
+            .map_err(|err| BucketClientError::Backend(format!("decode head.json: {err}")))?;
+        if !config.trusted_writers.is_empty() && !config.trusted_writers.contains(&head.writer_id) {
             return Err(BucketClientError::Trust(format!(
                 "writer_id '{}' not in --bucket-trusted-writers",
                 head.writer_id
@@ -328,10 +323,8 @@ impl HttpBucketHeaderClient {
                     )));
                 }
             }
-            let manifest: EpochManifest =
-                serde_json::from_slice(&bytes).map_err(|err| {
-                    BucketClientError::Backend(format!("decode epoch {url}: {err}"))
-                })?;
+            let manifest: EpochManifest = serde_json::from_slice(&bytes)
+                .map_err(|err| BucketClientError::Backend(format!("decode epoch {url}: {err}")))?;
             expected_sha = manifest.previous_epoch_manifest_sha256.clone();
             next_url = manifest.previous_epoch_manifest_url.clone();
             epochs.push(manifest);
@@ -367,10 +360,7 @@ impl HttpBucketHeaderClient {
             }
             let parsed: HashMap<String, TxIndexEntry> =
                 serde_json::from_slice(&bytes).map_err(|err| {
-                    BucketClientError::Backend(format!(
-                        "decode tx_index {}: {err}",
-                        index_ref.url
-                    ))
+                    BucketClientError::Backend(format!("decode tx_index {}: {err}", index_ref.url))
                 })?;
             tx_hash_to_location.extend(parsed);
             tx_index_loaded_epochs += 1;
@@ -463,11 +453,7 @@ impl HttpBucketHeaderClient {
             reason: format!("hash: {err}"),
         })?;
         let _ = hash;
-        Ok(Some(Header {
-            parent_hash,
-            number: num,
-            ..Default::default()
-        }))
+        Ok(Some(Header { parent_hash, number: num, ..Default::default() }))
     }
 
     /// Helper: locate the `(epoch_idx, block_meta, chunk_ref)`
@@ -540,7 +526,8 @@ impl HttpBucketHeaderClient {
             return Ok(None);
         };
         let logs_chunk = Self::locate_chunk(&snap, block_num, "logs").map(|(_, _, c)| c.clone());
-        let txs_chunk = Self::locate_chunk(&snap, block_num, "transactions").map(|(_, _, c)| c.clone());
+        let txs_chunk =
+            Self::locate_chunk(&snap, block_num, "transactions").map(|(_, _, c)| c.clone());
         let receipts_chunk = receipts_chunk.clone();
         drop(snap);
 
@@ -727,9 +714,12 @@ impl HttpBucketHeaderClient {
                         filter,
                         &block_hashes,
                     )
-                    .map_err(|err| BucketClientError::Backend(format!(
-                        "decode epoch logs (epoch {}): {err}", epoch.epoch
-                    )))?;
+                    .map_err(|err| {
+                        BucketClientError::Backend(format!(
+                            "decode epoch logs (epoch {}): {err}",
+                            epoch.epoch
+                        ))
+                    })?;
                     out.extend(rows);
                 } else if chunk_ref.is_vortex() {
                     // Vortex epoch-logs format. Today the live
@@ -748,9 +738,12 @@ impl HttpBucketHeaderClient {
                         &block_hashes,
                     )
                     .await
-                    .map_err(|err| BucketClientError::Backend(format!(
-                        "decode vortex epoch logs (epoch {}): {err}", epoch.epoch
-                    )))?;
+                    .map_err(|err| {
+                        BucketClientError::Backend(format!(
+                            "decode vortex epoch logs (epoch {}): {err}",
+                            epoch.epoch
+                        ))
+                    })?;
                     out.extend(rows);
                 }
                 continue;
@@ -779,9 +772,12 @@ impl HttpBucketHeaderClient {
                         filter,
                         &block_hashes,
                     )
-                    .map_err(|err| BucketClientError::Backend(format!(
-                        "decode block-logs (block {}): {err}", blk.num
-                    )))?;
+                    .map_err(|err| {
+                        BucketClientError::Backend(format!(
+                            "decode block-logs (block {}): {err}",
+                            blk.num
+                        ))
+                    })?;
                     out.extend(rows);
                 } else if chunk_ref.is_vortex() {
                     let rows = vortex_decode::decode_log_chunk(
@@ -796,9 +792,12 @@ impl HttpBucketHeaderClient {
                         &block_hashes,
                     )
                     .await
-                    .map_err(|err| BucketClientError::Backend(format!(
-                        "decode vortex block-logs (block {}): {err}", blk.num
-                    )))?;
+                    .map_err(|err| {
+                        BucketClientError::Backend(format!(
+                            "decode vortex block-logs (block {}): {err}",
+                            blk.num
+                        ))
+                    })?;
                     out.extend(rows);
                 }
             }
@@ -899,12 +898,7 @@ impl BucketHeaderClient for HttpBucketHeaderClient {
     ) -> ProviderResult<Vec<Log>> {
         let filter = LogScanFilter {
             addresses: addresses.to_vec(),
-            topics: [
-                topics[0].clone(),
-                topics[1].clone(),
-                topics[2].clone(),
-                topics[3].clone(),
-            ],
+            topics: [topics[0].clone(), topics[1].clone(), topics[2].clone(), topics[3].clone()],
         };
         match Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {
@@ -923,12 +917,14 @@ async fn fetch_object(
     key: &str,
 ) -> Result<Vec<u8>, BucketClientError> {
     let path = ObjectPath::from(key);
-    let result = store.get(&path).await.map_err(|err| {
-        BucketClientError::Backend(format!("GET {key}: {err}"))
-    })?;
-    let bytes = result.bytes().await.map_err(|err| {
-        BucketClientError::Backend(format!("body {key}: {err}"))
-    })?;
+    let result = store
+        .get(&path)
+        .await
+        .map_err(|err| BucketClientError::Backend(format!("GET {key}: {err}")))?;
+    let bytes = result
+        .bytes()
+        .await
+        .map_err(|err| BucketClientError::Backend(format!("body {key}: {err}")))?;
     Ok(bytes.to_vec())
 }
 
@@ -945,9 +941,8 @@ fn verify_signature(
     }
     let mut sig_arr = [0u8; 64];
     sig_arr.copy_from_slice(sig);
-    let key = ed25519_dalek::VerifyingKey::from_bytes(pubkey).map_err(|err| {
-        BucketClientError::Trust(format!("invalid ed25519 pubkey: {err}"))
-    })?;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(pubkey)
+        .map_err(|err| BucketClientError::Trust(format!("invalid ed25519 pubkey: {err}")))?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
     key.verify(payload, &signature)
         .map_err(|err| BucketClientError::Trust(format!("signature verify failed: {err}")))
@@ -1003,8 +998,9 @@ mod tests {
 
     #[test]
     fn parse_b256_strict_length() {
-        let h = parse_b256_hex("0x0000000000000000000000000000000000000000000000000000000000000001")
-            .unwrap();
+        let h =
+            parse_b256_hex("0x0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
         assert_eq!(h.as_slice()[31], 1);
         assert!(parse_b256_hex("0x01").is_err());
     }

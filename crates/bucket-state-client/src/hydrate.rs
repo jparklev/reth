@@ -1,27 +1,23 @@
-//! Hydrate-side helpers: load checkpoint shards + replay epoch
-//! deltas into in-memory HashMaps.
+//! Hydrate-side helpers: materialize checkpoint shards + replay epoch
+//! deltas into hash-keyed caches.
 //!
 //! Schema mirrors the writer side:
-//! - **checkpoint** (Phase 26.2 / 26.3) chunks are written by
-//!   `relay-state-checkpointer` and `relay-rpc state-artifacts write`.
-//!   Account schema `address, nonce, balance, code_hash`; storage
-//!   `address, slot, value`; code `code_hash, code`.
-//! - **delta** (Phase 26.1) chunks are written by `relay-indexer`'s
-//!   `state_epoch` emitter. Schemas as above but with a leading
-//!   `block_num` column (sorted by `block_num` asc within the epoch).
+//! - **checkpoint** (Phase 26.2 / 26.3) chunks are written by `relay-state-checkpointer` and
+//!   `relay-rpc state-artifacts write`. Account schema `hashed_address, nonce, balance, code_hash`;
+//!   storage `hashed_address, hashed_slot, value`; code `code_hash, code`.
+//! - **delta** (Phase 26.1) chunks are written by `relay-indexer`'s `state_epoch` emitter. Schemas
+//!   as above but with a leading `block_num` column (sorted by `block_num` asc within the epoch).
 //!
 //! Tombstones (writer-side convention):
 //! - Account `nonce=0, balance=0, code_hash=KECCAK_EMPTY` → "no account"
-//! - Storage `value=0` → "slot cleared in this epoch" (we still
-//!   *insert* the (addr, slot) → 0 mapping so subsequent reads see 0
-//!   rather than fall through to MDBX).
+//! - Storage `value=0` → "slot cleared in this epoch" (we still *insert* the (addr, slot) → 0
+//!   mapping so subsequent reads see 0 rather than fall through to MDBX).
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::{Address, B256, BlockNumber, Bytes, U256};
+use alloy_primitives::{keccak256, BlockNumber, Bytes, B256, U256};
+use moka::sync::Cache;
 use object_store::ObjectStore;
 use reth_primitives_traits::Account;
 
@@ -29,8 +25,7 @@ use crate::EpochManifest;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
-use crate::vortex_state;
-use crate::{fetch_object, BucketStateClientError};
+use crate::{fetch_object, vortex_state, BucketStateClientError};
 
 /// Stats for the index.json + manifest.json fetch step.
 #[derive(Debug, Clone, Default)]
@@ -73,57 +68,60 @@ pub struct HydrateStats {
     pub total_elapsed_ms: u64,
 }
 
-/// Fetch the three checkpoint chunks for one shard and merge them
-/// into the in-memory maps. Returns the total bytes fetched.
-pub(crate) async fn load_shard(
-    store: Arc<dyn ObjectStore>,
-    accounts_key: &str,
-    accounts_sha: &str,
-    storage_key: &str,
-    storage_sha: &str,
-    code_key: &str,
-    code_sha: &str,
-    accounts: &mut HashMap<Address, Account>,
-    storage: &mut HashMap<(Address, U256), U256>,
-    code: &mut HashMap<B256, Bytes>,
-) -> Result<u64, BucketStateClientError> {
-    let mut bytes_total: u64 = 0;
-
-    let a_bytes = fetch_object(&store, accounts_key).await?;
-    verify_chunk_sha(&a_bytes, accounts_sha, accounts_key)?;
-    bytes_total += a_bytes.len() as u64;
-    let rows_a = vortex_state::decode_accounts_chunk(a_bytes).await?;
-    for row in rows_a {
-        accounts.insert(
-            row.address,
-            Account {
-                nonce: row.nonce,
-                balance: row.balance,
-                bytecode_hash: Some(row.code_hash),
-            },
-        );
-    }
-
-    let s_bytes = fetch_object(&store, storage_key).await?;
-    verify_chunk_sha(&s_bytes, storage_sha, storage_key)?;
-    bytes_total += s_bytes.len() as u64;
-    let rows_s = vortex_state::decode_storage_chunk(s_bytes).await?;
-    for row in rows_s {
-        storage.insert((row.address, row.slot), row.value);
-    }
-
-    let c_bytes = fetch_object(&store, code_key).await?;
-    verify_chunk_sha(&c_bytes, code_sha, code_key)?;
-    bytes_total += c_bytes.len() as u64;
-    let rows_c = vortex_state::decode_code_chunk(c_bytes).await?;
-    for row in rows_c {
-        code.insert(row.code_hash, row.code);
-    }
-
-    Ok(bytes_total)
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MaterializedShardCounts {
+    pub accounts: u64,
+    pub storage: u64,
+    pub code: u64,
 }
 
-/// Apply a single epoch's delta artifacts to the in-memory maps.
+/// Decode the three checkpoint chunks for one shard and merge them into
+/// the hash-keyed caches.
+pub(crate) async fn materialize_shard(
+    accounts_bytes: Vec<u8>,
+    storage_bytes: Vec<u8>,
+    code_bytes: Vec<u8>,
+    account_cache: &Cache<B256, Option<Account>>,
+    storage_cache: &Cache<(B256, B256), Option<U256>>,
+    code_cache: &Cache<B256, Option<Bytes>>,
+) -> Result<MaterializedShardCounts, BucketStateClientError> {
+    let mut counts = MaterializedShardCounts::default();
+
+    let rows_a = vortex_state::decode_accounts_chunk(accounts_bytes).await?;
+    for row in rows_a {
+        let account =
+            Account { nonce: row.nonce, balance: row.balance, bytecode_hash: Some(row.code_hash) };
+        if account_cache.get(&row.hashed_address).is_none() {
+            if is_account_tombstone(&account) {
+                account_cache.insert(row.hashed_address, None);
+            } else {
+                account_cache.insert(row.hashed_address, Some(account));
+            }
+        }
+        counts.accounts += 1;
+    }
+
+    let rows_s = vortex_state::decode_storage_chunk(storage_bytes).await?;
+    for row in rows_s {
+        let key = (row.hashed_address, row.hashed_slot);
+        if storage_cache.get(&key).is_none() {
+            storage_cache.insert(key, Some(row.value));
+        }
+        counts.storage += 1;
+    }
+
+    let rows_c = vortex_state::decode_code_chunk(code_bytes).await?;
+    for row in rows_c {
+        if code_cache.get(&row.code_hash).is_none() {
+            code_cache.insert(row.code_hash, Some(row.code));
+        }
+        counts.code += 1;
+    }
+
+    Ok(counts)
+}
+
+/// Apply a single epoch's delta artifacts to the in-memory caches.
 ///
 /// "Latest-wins" semantics: within the epoch, rows are sorted by
 /// `block_num asc, address asc, slot asc` (the writer's invariant);
@@ -138,9 +136,9 @@ pub(crate) async fn apply_epoch_deltas(
     epoch: &EpochManifest,
     pinned_block: BlockNumber,
     head_block: BlockNumber,
-    accounts: &mut HashMap<Address, Account>,
-    storage: &mut HashMap<(Address, U256), U256>,
-    code: &mut HashMap<B256, Bytes>,
+    account_cache: &Cache<B256, Option<Account>>,
+    storage_cache: &Cache<(B256, B256), Option<U256>>,
+    code_cache: &Cache<B256, Option<Bytes>>,
     stats: &mut DeltaHydrateStats,
 ) -> Result<BlockNumber, BucketStateClientError> {
     // Phase 26.1 advertises the three artifact families as entries in
@@ -161,18 +159,17 @@ pub(crate) async fn apply_epoch_deltas(
             if row.block_num > head_block {
                 break; // sorted asc by block_num
             }
-            // Tombstone: all-zero ⇒ revm None ⇒ we remove the entry
-            // so subsequent fallback to MDBX surfaces correctly.
+            let hashed_address = keccak256(row.address);
             if row.nonce == 0 && row.balance.is_zero() && row.code_hash == KECCAK_EMPTY {
-                accounts.remove(&row.address);
+                account_cache.insert(hashed_address, None);
             } else {
-                accounts.insert(
-                    row.address,
-                    Account {
+                account_cache.insert(
+                    hashed_address,
+                    Some(Account {
                         nonce: row.nonce,
                         balance: row.balance,
                         bytecode_hash: Some(row.code_hash),
-                    },
+                    }),
                 );
             }
             stats.account_rows += 1;
@@ -198,7 +195,7 @@ pub(crate) async fn apply_epoch_deltas(
             // — we still insert so callers see Some(0) rather than fall
             // through (avoids returning the MDBX/static-file's older
             // pre-clear value).
-            storage.insert((row.address, row.slot), row.value);
+            storage_cache.insert((keccak256(row.address), keccak256(row.slot)), Some(row.value));
             stats.storage_rows += 1;
             if row.block_num > applied {
                 applied = row.block_num;
@@ -218,8 +215,9 @@ pub(crate) async fn apply_epoch_deltas(
             if row.block_num > head_block {
                 break;
             }
-            // First occurrence wins — bytecode is content-addressed.
-            code.entry(row.code_hash).or_insert(row.code);
+            if code_cache.get(&row.code_hash).is_none() {
+                code_cache.insert(row.code_hash, Some(row.code));
+            }
             stats.code_rows += 1;
             if row.block_num > applied {
                 applied = row.block_num;
@@ -294,7 +292,7 @@ fn chunks_key(path: &str) -> String {
     }
 }
 
-fn verify_chunk_sha(
+pub(crate) fn verify_chunk_sha(
     bytes: &[u8],
     expected: &str,
     label: &str,
@@ -311,13 +309,18 @@ fn verify_chunk_sha(
     Ok(())
 }
 
+pub(crate) fn is_account_tombstone(account: &Account) -> bool {
+    account.nonce == 0 && account.balance.is_zero() && account.bytecode_hash == Some(KECCAK_EMPTY)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parse_epoch_artifacts_extracts_state_refs() {
-        let v: serde_json::Value = serde_json::from_str(r#"{
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{
             "logs": {"path": "chunks/aa/aa..."},
             "state_account_deltas": {
               "path": "chunks/01/0123",
@@ -332,7 +335,9 @@ mod tests {
               "path": "chunks/03/0345",
               "content_sha256": "0345"
             }
-          }"#).unwrap();
+          }"#,
+        )
+        .unwrap();
         let out = parse_epoch_artifacts_value(&v);
         assert_eq!(out.state_account_deltas.as_ref().unwrap().path, "chunks/01/0123");
         assert_eq!(out.state_storage_deltas.as_ref().unwrap().path, "chunks/02/0234");

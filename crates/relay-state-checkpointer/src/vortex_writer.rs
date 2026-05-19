@@ -1,33 +1,39 @@
-//! Vortex chunk writers for the checkpointer.
+//! Vortex chunk writers for the v2 hash-keyed checkpointer.
 //!
-//! Schemas are byte-equivalent to relay-rpc's on-demand state-
-//! artifacts CLI (`crates/relay-rpc/src/backends/state_artifacts.rs::
-//! write_{accounts,storage,code}_artifact`). A schema change in
-//! either place must be mirrored in the other.
+//! Schemas must stay byte-aligned with the decoders in
+//! `reth-bucket-state-client::vortex_state` (`hashed_address`,
+//! `hashed_slot`, etc.). A schema change in either place must be
+//! mirrored.
+//!
+//! Rows are pre-sorted by the caller — accounts by `hashed_address`,
+//! storage by `(hashed_address, hashed_slot)` — so future Vortex
+//! range-fetch work has sorted row groups to bind to.
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{B256, U256};
 use eyre::{Context, Result};
-use vortex::VortexSessionDefault;
-use vortex::array::IntoArray;
-use vortex::array::arrays::{PrimitiveArray, StructArray as VortexStructArray};
-use vortex::array::builders::{ArrayBuilder, VarBinViewBuilder};
-use vortex::array::dtype::{DType, FieldNames, NativePType, Nullability};
-use vortex::array::validity::Validity;
-use vortex::buffer::{Buffer, ByteBufferMut};
-use vortex::session::VortexSession;
+use vortex::{
+    array::{
+        arrays::{PrimitiveArray, StructArray as VortexStructArray},
+        builders::{ArrayBuilder, VarBinViewBuilder},
+        dtype::{DType, FieldNames, NativePType, Nullability},
+        validity::Validity,
+        IntoArray,
+    },
+    buffer::{Buffer, ByteBufferMut},
+    session::VortexSession,
+    VortexSessionDefault,
+};
 use vortex_file::WriteOptionsSessionExt;
 
-pub(crate) async fn accounts_chunk(rows: &[(Address, u64, U256, B256)]) -> Result<Vec<u8>> {
+pub(crate) async fn accounts_chunk(rows: &[(B256, u64, U256, B256)]) -> Result<Vec<u8>> {
     let len = rows.len();
     let data = VortexStructArray::new(
-        FieldNames::from(["address", "nonce", "balance", "code_hash"]),
+        FieldNames::from(["hashed_address", "nonce", "balance", "code_hash"]),
         vec![
-            binary_required(rows.iter().map(|(a, _, _, _)| a.as_slice().to_vec()).collect()),
+            binary_required(rows.iter().map(|(h, _, _, _)| h.as_slice().to_vec()).collect()),
             primitive_required(rows.iter().map(|(_, n, _, _)| *n as i64)),
             binary_required(
-                rows.iter()
-                    .map(|(_, _, b, _)| b.to_be_bytes::<32>().to_vec())
-                    .collect(),
+                rows.iter().map(|(_, _, b, _)| b.to_be_bytes::<32>().to_vec()).collect(),
             ),
             binary_required(rows.iter().map(|(_, _, _, h)| h.as_slice().to_vec()).collect()),
         ],
@@ -38,22 +44,14 @@ pub(crate) async fn accounts_chunk(rows: &[(Address, u64, U256, B256)]) -> Resul
     write_vortex(data).await
 }
 
-pub(crate) async fn storage_chunk(rows: &[(Address, U256, U256)]) -> Result<Vec<u8>> {
+pub(crate) async fn storage_chunk(rows: &[(B256, B256, U256)]) -> Result<Vec<u8>> {
     let len = rows.len();
     let data = VortexStructArray::new(
-        FieldNames::from(["address", "slot", "value"]),
+        FieldNames::from(["hashed_address", "hashed_slot", "value"]),
         vec![
             binary_required(rows.iter().map(|(a, _, _)| a.as_slice().to_vec()).collect()),
-            binary_required(
-                rows.iter()
-                    .map(|(_, s, _)| s.to_be_bytes::<32>().to_vec())
-                    .collect(),
-            ),
-            binary_required(
-                rows.iter()
-                    .map(|(_, _, v)| v.to_be_bytes::<32>().to_vec())
-                    .collect(),
-            ),
+            binary_required(rows.iter().map(|(_, s, _)| s.as_slice().to_vec()).collect()),
+            binary_required(rows.iter().map(|(_, _, v)| v.to_be_bytes::<32>().to_vec()).collect()),
         ],
         len,
         Validity::NonNullable,

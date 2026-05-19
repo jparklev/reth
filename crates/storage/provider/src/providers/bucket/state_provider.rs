@@ -12,9 +12,7 @@
 //! implementer lives in `crates/bucket-state-client/`.
 
 use crate::providers::BucketStateClientArc;
-use alloy_primitives::{
-    Address, BlockNumber, Bytes, StorageKey, StorageValue, B256, U256,
-};
+use alloy_primitives::{Address, BlockNumber, Bytes, StorageKey, StorageValue, B256, U256};
 use reth_primitives_traits::{Account, Bytecode};
 use reth_storage_api::{
     AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider, StateProofProvider,
@@ -368,7 +366,9 @@ mod tests {
     /// call-site.
     struct StateProviderFactoryTestHelper;
     impl StateProviderFactoryTestHelper {
-        fn latest<P: crate::StateProviderFactory>(p: &P) -> ProviderResult<Box<dyn StateProvider + Send + 'static>> {
+        fn latest<P: crate::StateProviderFactory>(
+            p: &P,
+        ) -> ProviderResult<Box<dyn StateProvider + Send + 'static>> {
             p.latest()
         }
     }
@@ -432,10 +432,7 @@ mod tests {
 
         let bucket = CountingBucket {
             accounts: [
-                (
-                    usdc,
-                    Account { nonce: 1, balance: U256::ZERO, bytecode_hash: Some(code_hash) },
-                ),
+                (usdc, Account { nonce: 1, balance: U256::ZERO, bytecode_hash: Some(code_hash) }),
                 (
                     vitalik,
                     Account {
@@ -447,9 +444,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            storage: [((usdc, balance_slot), U256::from(0x1c804u64))]
-                .into_iter()
-                .collect(),
+            storage: [((usdc, balance_slot), U256::from(0x1c804u64))].into_iter().collect(),
             code: [(code_hash, code.clone())].into_iter().collect(),
             ..Default::default()
         };
@@ -458,13 +453,10 @@ mod tests {
         // struct fields.
         let bucket = Arc::new(bucket);
         let inspect = bucket.clone();
-        let provider = BucketStateProvider::new(
-            bucket as BucketStateClientArc,
-            inner_state,
-        );
+        let provider = BucketStateProvider::new(bucket as BucketStateClientArc, inner_state);
 
-        // 1. basic_account hit + bytecode hit + storage hit, simulating
-        //    revm's "load contract, run balanceOf" sequence.
+        // 1. basic_account hit + bytecode hit + storage hit, simulating revm's "load contract, run
+        //    balanceOf" sequence.
         let acc = provider.basic_account(&usdc).unwrap().expect("usdc present");
         assert_eq!(acc.nonce, 1);
         assert_eq!(acc.bytecode_hash, Some(code_hash));
@@ -475,9 +467,8 @@ mod tests {
             .unwrap()
             .expect("slot");
         assert_eq!(stored, U256::from(0x1c804u64));
-        // 2. miss → fall-through. An unknown address must still hit the
-        //    bucket FIRST (so the bucket can answer if it ever gains
-        //    coverage) but resolve to None via the inner provider.
+        // 2. miss → fall-through. An unknown address must still hit the bucket FIRST (so the bucket
+        //    can answer if it ever gains coverage) but resolve to None via the inner provider.
         let stranger = Address::from([0xcc; 20]);
         assert!(provider.basic_account(&stranger).unwrap().is_none());
 

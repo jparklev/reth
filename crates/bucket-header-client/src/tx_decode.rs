@@ -24,28 +24,28 @@ use std::sync::Arc;
 use alloy_consensus::{
     EthereumTypedTransaction, TxEip1559, TxEip2930, TxEip4844, TxEip7702, TxLegacy,
 };
-use alloy_eips::eip2930::AccessList;
-use alloy_eips::eip7702::SignedAuthorization;
-use alloy_primitives::{Address, B256, Bytes, Signature, TxKind, U256};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
-use eyre::{Result, eyre};
-use object_store::{ObjectStore, ObjectStoreExt};
-use object_store::path::Path as ObjectPath;
+use alloy_eips::{eip2930::AccessList, eip7702::SignedAuthorization};
+use alloy_primitives::{Address, Bytes, Signature, TxKind, B256, U256};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use eyre::{eyre, Result};
+use object_store::{path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
 use reth_ethereum_primitives::TransactionSigned;
-use vortex::array::accessor::ArrayAccessor;
-use vortex::array::arrays::decimal::DecimalArrayExt;
-use vortex::array::arrays::struct_::StructArrayExt;
-use vortex::array::arrays::{
-    DecimalArray, PrimitiveArray, StructArray as VortexStructArray,
-    VarBinViewArray as VortexVarBinViewArray,
+use vortex::{
+    array::{
+        accessor::ArrayAccessor,
+        arrays::{
+            decimal::DecimalArrayExt, struct_::StructArrayExt, DecimalArray, PrimitiveArray,
+            StructArray as VortexStructArray, VarBinViewArray as VortexVarBinViewArray,
+        },
+        dtype::DecimalType,
+        expr::{col, eq, lit, root, select},
+        scalar::Scalar,
+        stream::ArrayStreamExt,
+        ExecutionCtx, VortexSessionExecute,
+    },
+    session::VortexSession,
+    VortexSessionDefault,
 };
-use vortex::array::dtype::DecimalType;
-use vortex::array::expr::{col, eq, lit, root, select};
-use vortex::array::stream::ArrayStreamExt;
-use vortex::array::{ExecutionCtx, VortexSessionExecute, scalar::Scalar};
-use vortex::session::VortexSession;
-use vortex::VortexSessionDefault;
 use vortex_buffer::ByteBuffer;
 use vortex_file::{Footer, OpenOptionsSessionExt};
 use vortex_io::object_store::ObjectStoreReadAt;
@@ -160,9 +160,7 @@ async fn open_and_scan(
         .await
         .map_err(|err| eyre!("read vortex transactions: {err}"))?;
     let mut ctx = session.create_execution_ctx();
-    array
-        .execute(&mut ctx)
-        .map_err(|err| eyre!("decode vortex transactions: {err}"))
+    array.execute(&mut ctx).map_err(|err| eyre!("decode vortex transactions: {err}"))
 }
 
 /// Convert a decoded struct array into [`DecodedTx`] rows. If
@@ -200,8 +198,8 @@ pub(crate) fn rows_to_transactions(
     let mut out = Vec::with_capacity(len);
     for row in 0..len {
         let row_block = block_num[row] as u64;
-        if let Some(filter) = block_filter
-            && row_block != filter
+        if let Some(filter) = block_filter &&
+            row_block != filter
         {
             continue;
         }
@@ -209,9 +207,9 @@ pub(crate) fn rows_to_transactions(
         let tx_hash = bytes_to_b256(&hash[row])
             .map_err(|err| eyre!("row {row} (block {row_block} idx {row_idx}) hash: {err}"))?;
         let to_kind = match &to[row] {
-            Some(bytes) if !bytes.is_empty() => TxKind::Call(
-                bytes_to_address(bytes).map_err(|err| eyre!("row {row} to: {err}"))?,
-            ),
+            Some(bytes) if !bytes.is_empty() => {
+                TxKind::Call(bytes_to_address(bytes).map_err(|err| eyre!("row {row} to: {err}"))?)
+            }
             _ => TxKind::Create,
         };
         let to_addr_required = match &to[row] {
@@ -374,10 +372,7 @@ fn primitive_required<T>(
 where
     T: vortex::array::dtype::NativePType + Copy + Default,
 {
-    Ok(primitive_optional(ctx, array, name)?
-        .into_iter()
-        .map(|v| v.unwrap_or_default())
-        .collect())
+    Ok(primitive_optional(ctx, array, name)?.into_iter().map(|v| v.unwrap_or_default()).collect())
 }
 
 fn primitive_optional<T>(
@@ -420,9 +415,7 @@ fn decimal_optional(
     if values.scale() != 0 {
         return Err(eyre!("expected integer decimal scale for {name}"));
     }
-    let validity = values
-        .validity()
-        .map_err(|err| eyre!("validity {name}: {err}"))?;
+    let validity = values.validity().map_err(|err| eyre!("validity {name}: {err}"))?;
     let mut out = match values.values_type() {
         DecimalType::I8 => buf_to_strs(values.buffer::<i8>()),
         DecimalType::I16 => buf_to_strs(values.buffer::<i16>()),
@@ -432,10 +425,7 @@ fn decimal_optional(
         DecimalType::I256 => return Err(eyre!("i256 decimal not supported for {name}")),
     };
     for (idx, value) in out.iter_mut().enumerate() {
-        if !validity
-            .is_valid(idx)
-            .map_err(|err| eyre!("validity is_valid {name}: {err}"))?
-        {
+        if !validity.is_valid(idx).map_err(|err| eyre!("validity is_valid {name}: {err}"))? {
             *value = None;
         }
     }
@@ -451,10 +441,7 @@ fn varbin_required(
     array: &VortexStructArray,
     name: &str,
 ) -> Result<Vec<Vec<u8>>> {
-    Ok(varbin_optional(ctx, array, name)?
-        .into_iter()
-        .map(|v| v.unwrap_or_default())
-        .collect())
+    Ok(varbin_optional(ctx, array, name)?.into_iter().map(|v| v.unwrap_or_default()).collect())
 }
 
 fn varbin_optional(
@@ -497,8 +484,7 @@ fn blob_hashes(
             if bytes.is_empty() {
                 Ok(Vec::new())
             } else {
-                serde_json::from_slice(&bytes)
-                    .map_err(|err| eyre!("decode {name} JSON: {err}"))
+                serde_json::from_slice(&bytes).map_err(|err| eyre!("decode {name} JSON: {err}"))
             }
         })
         .collect()
@@ -528,7 +514,9 @@ fn parse_u256_dec(s: &str) -> Result<U256> {
 
 fn parse_u128_opt(s: &Option<String>) -> Result<Option<u128>> {
     Ok(match s {
-        Some(s) => Some(u128::from_str_radix(s, 10).map_err(|err| eyre!("parse u128 '{s}': {err}"))?),
+        Some(s) => {
+            Some(u128::from_str_radix(s, 10).map_err(|err| eyre!("parse u128 '{s}': {err}"))?)
+        }
         None => None,
     })
 }
@@ -536,14 +524,17 @@ fn parse_u128_opt(s: &Option<String>) -> Result<Option<u128>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use object_store::ObjectStoreExt;
-    use object_store::memory::InMemory;
-    use vortex::array::IntoArray;
-    use vortex::array::arrays::StructArray;
-    use vortex::array::builders::{ArrayBuilder, VarBinViewBuilder};
-    use vortex::array::dtype::{DType, DecimalDType, FieldNames, Nullability};
-    use vortex::array::validity::Validity;
-    use vortex::buffer::{Buffer, ByteBufferMut};
+    use object_store::{memory::InMemory, ObjectStoreExt};
+    use vortex::{
+        array::{
+            arrays::StructArray,
+            builders::{ArrayBuilder, VarBinViewBuilder},
+            dtype::{DType, DecimalDType, FieldNames, Nullability},
+            validity::Validity,
+            IntoArray,
+        },
+        buffer::{Buffer, ByteBufferMut},
+    };
     use vortex_file::WriteOptionsSessionExt;
 
     /// Round-trip: write a synthetic in-memory `transactions` chunk
@@ -563,9 +554,10 @@ pub(crate) mod tests {
             .await
             .expect("put vortex test object");
 
-        let decoded = decode_transactions_chunk(store, object_path, 101, Some(file_size), None, &[])
-            .await
-            .expect("decode tx chunk");
+        let decoded =
+            decode_transactions_chunk(store, object_path, 101, Some(file_size), None, &[])
+                .await
+                .expect("decode tx chunk");
         // Two rows in block 101 (the synthetic also includes a
         // block 100 row, which the block_num filter prunes).
         assert_eq!(decoded.len(), 2, "decoded {decoded:?}");
@@ -600,11 +592,7 @@ pub(crate) mod tests {
                 // block_num
                 primitive_array([100_i64, 101, 101]),
                 // block_hash
-                binary_array([
-                    Some(vec![0x10; 32]),
-                    Some(vec![0x11; 32]),
-                    Some(vec![0x12; 32]),
-                ]),
+                binary_array([Some(vec![0x10; 32]), Some(vec![0x11; 32]), Some(vec![0x12; 32])]),
                 // idx
                 primitive_array([0_i32, 0, 1]),
                 // hash (use deterministic distinct hashes; the
@@ -618,11 +606,7 @@ pub(crate) mod tests {
                 // type: 2 (1559), 2 (1559), 0 (legacy)
                 primitive_array([2_i8, 2, 0]),
                 // from
-                binary_array([
-                    Some(vec![0x30; 20]),
-                    Some(vec![0x31; 20]),
-                    Some(vec![0x32; 20]),
-                ]),
+                binary_array([Some(vec![0x30; 20]), Some(vec![0x31; 20]), Some(vec![0x32; 20])]),
                 // to: None for the legacy row (contract creation)
                 binary_array([Some(vec![0x40; 20]), Some(vec![0x41; 20]), None]),
                 // value
@@ -648,11 +632,7 @@ pub(crate) mod tests {
                 // chain_id
                 primitive_nullable_array([Some(1_i64), Some(1), Some(1)]),
                 // access_list
-                binary_array([
-                    Some(b"[]".to_vec()),
-                    Some(b"[]".to_vec()),
-                    Some(b"[]".to_vec()),
-                ]),
+                binary_array([Some(b"[]".to_vec()), Some(b"[]".to_vec()), Some(b"[]".to_vec())]),
                 // authorization_list
                 binary_array([None, None, None]),
                 // blob_versioned_hashes
@@ -663,17 +643,9 @@ pub(crate) mod tests {
                 // legacy → parity=false.
                 decimal_array([1_i128, 1, 27]),
                 // r
-                binary_array([
-                    Some(vec![0x50; 32]),
-                    Some(vec![0x51; 32]),
-                    Some(vec![0x52; 32]),
-                ]),
+                binary_array([Some(vec![0x50; 32]), Some(vec![0x51; 32]), Some(vec![0x52; 32])]),
                 // s
-                binary_array([
-                    Some(vec![0x60; 32]),
-                    Some(vec![0x61; 32]),
-                    Some(vec![0x62; 32]),
-                ]),
+                binary_array([Some(vec![0x60; 32]), Some(vec![0x61; 32]), Some(vec![0x62; 32])]),
                 // y_parity (typed only)
                 primitive_nullable_array([Some(0_i8), Some(1), None]),
             ],
@@ -713,17 +685,14 @@ pub(crate) mod tests {
         .into_array()
     }
 
-    fn primitive_nullable_array<T, const N: usize>(values: [Option<T>; N]) -> vortex::array::ArrayRef
+    fn primitive_nullable_array<T, const N: usize>(
+        values: [Option<T>; N],
+    ) -> vortex::array::ArrayRef
     where
         T: vortex::array::dtype::NativePType,
     {
         PrimitiveArray::new(
-            Buffer::<T>::from(
-                values
-                    .iter()
-                    .map(|v| v.unwrap_or_default())
-                    .collect::<Vec<_>>(),
-            ),
+            Buffer::<T>::from(values.iter().map(|v| v.unwrap_or_default()).collect::<Vec<_>>()),
             Validity::from_iter(values.iter().map(Option::is_some)),
         )
         .into_array()
@@ -733,7 +702,9 @@ pub(crate) mod tests {
         DecimalArray::from_iter(values, DecimalDType::new(38, 0)).into_array()
     }
 
-    fn decimal_nullable_array<const N: usize>(values: [Option<i128>; N]) -> vortex::array::ArrayRef {
+    fn decimal_nullable_array<const N: usize>(
+        values: [Option<i128>; N],
+    ) -> vortex::array::ArrayRef {
         DecimalArray::from_option_iter(values, DecimalDType::new(38, 0)).into_array()
     }
 

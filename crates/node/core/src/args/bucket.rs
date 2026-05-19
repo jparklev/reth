@@ -41,24 +41,14 @@ pub struct BucketArgs {
     /// `primary,secondary`, ...). Defaults to `primary`.
     /// Empty disables the trust check (insecure — accepts any
     /// signature-valid writer).
-    #[arg(
-        long,
-        value_name = "IDS",
-        default_value = "primary",
-        help_heading = "Bucket"
-    )]
+    #[arg(long, value_name = "IDS", default_value = "primary", help_heading = "Bucket")]
     pub bucket_trusted_writers: String,
 
     /// Number of epoch manifests to keep warm in the in-process
     /// snapshot. More = more recent history visible without a
     /// refresh, but slower startup. Default 8 (~50 minutes of
     /// mainnet at 32-block CL epoch cadence).
-    #[arg(
-        long,
-        value_name = "N",
-        default_value_t = 8u32,
-        help_heading = "Bucket"
-    )]
+    #[arg(long, value_name = "N", default_value_t = 8u32, help_heading = "Bucket")]
     pub bucket_warm_epochs: u32,
 
     /// Phase 26.x - enable bucket-mode plain-state reads.
@@ -72,12 +62,7 @@ pub struct BucketArgs {
 
     /// Bucket prefix where Phase 26.2 checkpoints live. Default
     /// `checkpoints` (the Phase 26.2 writer default).
-    #[arg(
-        long,
-        value_name = "PREFIX",
-        default_value = "checkpoints",
-        help_heading = "Bucket"
-    )]
+    #[arg(long, value_name = "PREFIX", default_value = "checkpoints", help_heading = "Bucket")]
     pub bucket_state_prefix: String,
 }
 

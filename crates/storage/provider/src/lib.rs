@@ -22,10 +22,11 @@ pub use traits::*;
 /// Provider trait implementations.
 pub mod providers;
 pub use providers::{
-    DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, HistoricalStateProvider,
-    HistoricalStateProviderRef, LatestStateProvider, LatestStateProviderRef, ProviderFactory,
-    BlockchainProvider, BucketHeaderClient, BucketHeaderClientArc, BucketStateClient, BucketStateClientArc, ConsistentProvider, PruneShardOutcome, PrunedIndices, SaveBlocksMode, StaticFileAccess, StaticFileProviderBuilder,
-    StaticFileWriteCtx, StaticFileWriter,
+    BlockchainProvider, BucketHeaderClient, BucketHeaderClientArc, BucketStateClient,
+    BucketStateClientArc, ConsistentProvider, DatabaseProvider, DatabaseProviderRO,
+    DatabaseProviderRW, HistoricalStateProvider, HistoricalStateProviderRef, LatestStateProvider,
+    LatestStateProviderRef, ProviderFactory, PruneShardOutcome, PrunedIndices, SaveBlocksMode,
+    StaticFileAccess, StaticFileProviderBuilder, StaticFileWriteCtx, StaticFileWriter,
 };
 
 pub mod changeset_walker;

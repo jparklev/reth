@@ -162,6 +162,10 @@ impl EngineNodeLauncher {
                         let mut provider = provider.with_bucket(client.into_arc());
                         // Phase 26.x - optional bucket-mode plain-state reads.
                         if bucket_args.bucket_state_enabled {
+                            let cache_dir = {
+                                use reth_bucket_state_client::BucketStateConnConfig;
+                                BucketStateConnConfig::default_cache_dir()
+                            };
                             let state_cfg = reth_bucket_state_client::BucketStateClientConfig {
                                 conn: reth_bucket_state_client::BucketStateConnConfig {
                                     bucket_url: bucket_args
@@ -182,6 +186,7 @@ impl EngineNodeLauncher {
                                         .filter(|s| !s.is_empty())
                                         .map(|s| s.to_string())
                                         .collect(),
+                                    cache_dir,
                                 },
                                 checkpoint_prefix: bucket_args.bucket_state_prefix.clone(),
                                 target_block: None,

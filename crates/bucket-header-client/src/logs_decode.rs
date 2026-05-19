@@ -16,18 +16,23 @@
 //! Parquet for the `logs` chunk type — Vortex is the future format.
 //! Both paths are supported here to match relay-rpc's reader.
 
-use alloy_primitives::{Address, B256, Bytes, LogData, Log as PrimitiveLog};
+use alloy_primitives::{Address, Bytes, Log as PrimitiveLog, LogData, B256};
 use alloy_rpc_types_eth::Log;
-use eyre::{Result, eyre};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ProjectionMask;
-use parquet::file::properties::ReaderProperties;
-use parquet::file::reader::FileReader;
-use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
+use eyre::{eyre, Result};
+use parquet::{
+    arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMask},
+    file::{
+        properties::ReaderProperties,
+        reader::FileReader,
+        serialized_reader::{ReadOptionsBuilder, SerializedFileReader},
+    },
+};
 use std::sync::Arc;
 
-use arrow::array::{Array, BinaryArray, FixedSizeBinaryArray, Int32Array, Int64Array};
-use arrow::record_batch::RecordBatch;
+use arrow::{
+    array::{Array, BinaryArray, FixedSizeBinaryArray, Int32Array, Int64Array},
+    record_batch::RecordBatch,
+};
 
 /// Flat representation of an `eth_getLogs` filter, in the shape the
 /// bucket reader needs. `addresses.is_empty()` ⇒ match any address;
@@ -92,34 +97,25 @@ pub fn chunk_bloom_skips_filter(chunk_bytes: &[u8], filter: &LogScanFilter) -> b
     }
 
     let options = ReadOptionsBuilder::new()
-        .with_reader_properties(
-            ReaderProperties::builder()
-                .set_read_bloom_filter(true)
-                .build(),
-        )
+        .with_reader_properties(ReaderProperties::builder().set_read_bloom_filter(true).build())
         .build();
-    let Ok(reader) = SerializedFileReader::new_with_options(
-        bytes::Bytes::copy_from_slice(chunk_bytes),
-        options,
-    ) else {
+    let Ok(reader) =
+        SerializedFileReader::new_with_options(bytes::Bytes::copy_from_slice(chunk_bytes), options)
+    else {
         return false;
     };
     let Ok(row_group) = reader.get_row_group(0) else {
         return false;
     };
     let columns = row_group.metadata().columns();
-    let column_idx = |name: &str| {
-        columns
-            .iter()
-            .position(|c| c.column_path().string() == name)
-    };
+    let column_idx = |name: &str| columns.iter().position(|c| c.column_path().string() == name);
 
     // Address allowlist — if every address misses the SBBF the
     // chunk is provably empty for the filter.
-    if !filter.addresses.is_empty()
-        && let Some(idx) = column_idx("address")
-        && let Some(bloom) = row_group.get_column_bloom_filter(idx)
-        && filter.addresses.iter().all(|address| {
+    if !filter.addresses.is_empty() &&
+        let Some(idx) = column_idx("address") &&
+        let Some(bloom) = row_group.get_column_bloom_filter(idx) &&
+        filter.addresses.iter().all(|address| {
             let v: &[u8] = address.as_slice();
             !bloom.check(&v.to_vec())
         })
@@ -129,10 +125,10 @@ pub fn chunk_bloom_skips_filter(chunk_bytes: &[u8], filter: &LogScanFilter) -> b
 
     // Topic0 — anonymous-event normalization on the writer side
     // means the probed key is always 32 bytes.
-    if !filter.topics[0].is_empty()
-        && let Some(idx) = column_idx("topic0")
-        && let Some(bloom) = row_group.get_column_bloom_filter(idx)
-        && filter.topics[0].iter().all(|topic| {
+    if !filter.topics[0].is_empty() &&
+        let Some(idx) = column_idx("topic0") &&
+        let Some(bloom) = row_group.get_column_bloom_filter(idx) &&
+        filter.topics[0].iter().all(|topic| {
             let key = normalize_topic0_key(topic.as_slice());
             !bloom.check(&key)
         })
@@ -160,22 +156,25 @@ pub fn decode_log_chunk_parquet(
     let schema = reader.schema().clone();
     let parquet_schema = reader.parquet_schema();
     let want: &[&str] = &[
-        "block_num", "block_hash", "log_idx", "tx_idx", "tx_hash", "address",
-        "topic0", "topic1", "topic2", "topic3", "data",
+        "block_num",
+        "block_hash",
+        "log_idx",
+        "tx_idx",
+        "tx_hash",
+        "address",
+        "topic0",
+        "topic1",
+        "topic2",
+        "topic3",
+        "data",
     ];
     let projection_indices: Vec<usize> = want
         .iter()
-        .map(|name| {
-            schema
-                .index_of(name)
-                .map_err(|err| eyre!("parquet missing {name}: {err}"))
-        })
+        .map(|name| schema.index_of(name).map_err(|err| eyre!("parquet missing {name}: {err}")))
         .collect::<Result<_>>()?;
     let mask = ProjectionMask::leaves(parquet_schema, projection_indices.clone());
-    let reader = reader
-        .with_projection(mask)
-        .build()
-        .map_err(|err| eyre!("build parquet reader: {err}"))?;
+    let reader =
+        reader.with_projection(mask).build().map_err(|err| eyre!("build parquet reader: {err}"))?;
     let _ = schema; // keep schema alive for life of reader
 
     let mut out = Vec::new();
@@ -246,9 +245,8 @@ fn decode_batch_into(
 
         let primitive = PrimitiveLog {
             address: addr,
-            data: LogData::new(topics, Bytes::from(data_bytes)).ok_or_else(|| {
-                eyre!("log topics > 4 at row {row}")
-            })?,
+            data: LogData::new(topics, Bytes::from(data_bytes))
+                .ok_or_else(|| eyre!("log topics > 4 at row {row}"))?,
         };
         out.push(Log {
             inner: primitive,
@@ -293,7 +291,11 @@ impl BytesColumn<'_> {
             Self::Fixed(arr, _) => arr.is_null(row),
             Self::Binary(arr, _) => arr.is_null(row),
         };
-        if is_null { None } else { Some(self.value(row).to_vec()) }
+        if is_null {
+            None
+        } else {
+            Some(self.value(row).to_vec())
+        }
     }
 }
 
@@ -338,28 +340,14 @@ mod tests {
     fn matches_address_allowlist_and_topic_slots() {
         let filter = LogScanFilter {
             addresses: vec![addr(0x31)],
-            topics: [
-                vec![topic(0x41)],
-                Vec::new(),
-                vec![topic(0x52)],
-                Vec::new(),
-            ],
+            topics: [vec![topic(0x41)], Vec::new(), vec![topic(0x52)], Vec::new()],
         };
         // Hit: address matches, topic0 matches, topic2 matches.
-        assert!(filter.matches(
-            &addr(0x31),
-            &[topic(0x41), topic(0x51), topic(0x52)],
-        ));
+        assert!(filter.matches(&addr(0x31), &[topic(0x41), topic(0x51), topic(0x52)],));
         // Miss: address mismatch.
-        assert!(!filter.matches(
-            &addr(0x32),
-            &[topic(0x41), topic(0x51), topic(0x52)],
-        ));
+        assert!(!filter.matches(&addr(0x32), &[topic(0x41), topic(0x51), topic(0x52)],));
         // Miss: topic0 mismatch.
-        assert!(!filter.matches(
-            &addr(0x31),
-            &[topic(0xff), topic(0x51), topic(0x52)],
-        ));
+        assert!(!filter.matches(&addr(0x31), &[topic(0xff), topic(0x51), topic(0x52)],));
         // Miss: topic2 absent (log has only 1 topic).
         assert!(!filter.matches(&addr(0x31), &[topic(0x41)]));
     }
@@ -388,10 +376,7 @@ mod tests {
     /// register row 1).
     #[test]
     fn bloom_probe_returns_false_on_unparseable_bytes() {
-        let filter = LogScanFilter {
-            addresses: vec![addr(0x31)],
-            topics: Default::default(),
-        };
+        let filter = LogScanFilter { addresses: vec![addr(0x31)], topics: Default::default() };
         assert!(filter.is_selective());
         // Garbage bytes — not a parquet file. Probe must NOT claim
         // the chunk is "definitely empty"; it must fall through to

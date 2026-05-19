@@ -24,13 +24,11 @@ use reth_storage_errors::provider::ProviderResult;
 /// address allowlist + topic constraints.
 ///
 /// Returns:
-/// - `Ok(Some(logs))` — the bucket fully served the range (sorted by
-///   `(block_num, log_idx)`). Caller should NOT also walk receipts.
-/// - `Ok(None)` — no bucket configured, or the range spans blocks
-///   not covered by the bucket. Caller should fall through to the
-///   regular log scan.
-/// - `Err(_)` — bucket fetch / decode / signature verification
-///   failed. Caller should bubble up.
+/// - `Ok(Some(logs))` — the bucket fully served the range (sorted by `(block_num, log_idx)`).
+///   Caller should NOT also walk receipts.
+/// - `Ok(None)` — no bucket configured, or the range spans blocks not covered by the bucket. Caller
+///   should fall through to the regular log scan.
+/// - `Err(_)` — bucket fetch / decode / signature verification failed. Caller should bubble up.
 ///
 /// Why `Option<Vec<Log>>` instead of `Vec<Log>` with a `covered()`
 /// probe: the bucket coverage check is per-range, not per-provider,

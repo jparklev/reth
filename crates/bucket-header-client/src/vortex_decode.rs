@@ -8,25 +8,26 @@
 use std::sync::Arc;
 
 use alloy_consensus::Header;
-use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
-use eyre::{Result, eyre};
-use object_store::{ObjectStore, ObjectStoreExt};
-use object_store::path::Path as ObjectPath;
-use vortex::array::accessor::ArrayAccessor;
-use vortex::array::arrays::decimal::DecimalArrayExt;
-use vortex::array::arrays::struct_::StructArrayExt;
-use vortex::array::arrays::{
-    DecimalArray, PrimitiveArray, StructArray as VortexStructArray,
-    VarBinViewArray as VortexVarBinViewArray,
+use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use eyre::{eyre, Result};
+use object_store::{path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
+use vortex::{
+    array::{
+        accessor::ArrayAccessor,
+        arrays::{
+            decimal::DecimalArrayExt, struct_::StructArrayExt, DecimalArray, PrimitiveArray,
+            StructArray as VortexStructArray, VarBinViewArray as VortexVarBinViewArray,
+        },
+        dtype::DecimalType,
+        expr::{col, eq, lit, root, select},
+        scalar::Scalar,
+        stream::ArrayStreamExt,
+        ExecutionCtx, VortexSessionExecute,
+    },
+    session::VortexSession,
+    VortexSessionDefault,
 };
-use vortex::array::dtype::DecimalType;
-use vortex::array::expr::{col, eq, lit, root, select};
-use vortex::array::stream::ArrayStreamExt;
-use vortex::array::{ExecutionCtx, VortexSessionExecute, scalar::Scalar};
-use vortex::session::VortexSession;
-use vortex::VortexSessionDefault;
 use vortex_buffer::ByteBuffer;
 use vortex_file::{Footer, OpenOptionsSessionExt};
 use vortex_io::object_store::ObjectStoreReadAt;
@@ -74,9 +75,7 @@ pub(crate) async fn decode_block_header_chunk(
     options = options.with_some_file_size(file_size);
 
     if let Some(b64) = footer_metadata_b64 {
-        let bytes = BASE64
-            .decode(b64)
-            .map_err(|err| eyre!("decode footer b64: {err}"))?;
+        let bytes = BASE64.decode(b64).map_err(|err| eyre!("decode footer b64: {err}"))?;
         let footer = Footer::from_metadata_bytes(ByteBuffer::copy_from(&bytes), session.clone())
             .map_err(|err| eyre!("footer parse: {err}"))?;
         options = options.with_footer(footer);
@@ -101,10 +100,8 @@ pub(crate) async fn decode_block_header_chunk(
             options.with_preloaded_file_range(range.offset, ByteBuffer::copy_from(bytes.as_ref()));
     }
 
-    let file = options
-        .open(Arc::new(read_at))
-        .await
-        .map_err(|err| eyre!("open vortex file: {err}"))?;
+    let file =
+        options.open(Arc::new(read_at)).await.map_err(|err| eyre!("open vortex file: {err}"))?;
 
     let array = file
         .scan()
@@ -117,9 +114,8 @@ pub(crate) async fn decode_block_header_chunk(
         .await
         .map_err(|err| eyre!("read vortex: {err}"))?;
     let mut ctx = session.create_execution_ctx();
-    let struct_arr: VortexStructArray = array
-        .execute(&mut ctx)
-        .map_err(|err| eyre!("decode vortex: {err}"))?;
+    let struct_arr: VortexStructArray =
+        array.execute(&mut ctx).map_err(|err| eyre!("decode vortex: {err}"))?;
     rows_to_header(&mut ctx, struct_arr, block_num)
 }
 
@@ -162,17 +158,10 @@ fn rows_to_header(
     let tx_root = bytes_to_b256(&transactions_root[row])?;
     let receipts_root_b = bytes_to_b256(&receipts_root[row])?;
     let bloom = bytes_to_bloom(&logs_bloom[row])?;
-    let difficulty = difficulty_str[row]
-        .as_deref()
-        .map(parse_u256_dec)
-        .transpose()?
-        .unwrap_or(U256::ZERO);
+    let difficulty =
+        difficulty_str[row].as_deref().map(parse_u256_dec).transpose()?.unwrap_or(U256::ZERO);
     let extra = Bytes::from(extra_data[row].clone());
-    let mix = mix_hash[row]
-        .as_ref()
-        .map(|b| bytes_to_b256(b))
-        .transpose()?
-        .unwrap_or(B256::ZERO);
+    let mix = mix_hash[row].as_ref().map(|b| bytes_to_b256(b)).transpose()?.unwrap_or(B256::ZERO);
     let nonce = nonce_bytes[row]
         .as_ref()
         .map(|b| {
@@ -186,23 +175,12 @@ fn rows_to_header(
         })
         .transpose()?
         .unwrap_or_default();
-    let base_fee_n = base_fee[row]
-        .as_deref()
-        .map(parse_u256_dec)
-        .transpose()?
-        .map(|u| u.to::<u64>());
-    let withdrawals_root_b = withdrawals_root[row]
-        .as_ref()
-        .map(|b| bytes_to_b256(b))
-        .transpose()?;
-    let parent_beacon_b = parent_beacon[row]
-        .as_ref()
-        .map(|b| bytes_to_b256(b))
-        .transpose()?;
-    let requests_hash_b = requests_hash[row]
-        .as_ref()
-        .map(|b| bytes_to_b256(b))
-        .transpose()?;
+    let base_fee_n =
+        base_fee[row].as_deref().map(parse_u256_dec).transpose()?.map(|u| u.to::<u64>());
+    let withdrawals_root_b =
+        withdrawals_root[row].as_ref().map(|b| bytes_to_b256(b)).transpose()?;
+    let parent_beacon_b = parent_beacon[row].as_ref().map(|b| bytes_to_b256(b)).transpose()?;
+    let requests_hash_b = requests_hash[row].as_ref().map(|b| bytes_to_b256(b)).transpose()?;
 
     Ok(Header {
         parent_hash: parent_hash_b,
@@ -239,10 +217,7 @@ fn primitive_required<T>(
 where
     T: vortex::array::dtype::NativePType + Copy + Default,
 {
-    Ok(primitive_optional(ctx, array, name)?
-        .into_iter()
-        .map(|v| v.unwrap_or_default())
-        .collect())
+    Ok(primitive_optional(ctx, array, name)?.into_iter().map(|v| v.unwrap_or_default()).collect())
 }
 
 fn primitive_optional<T>(
@@ -253,9 +228,8 @@ fn primitive_optional<T>(
 where
     T: vortex::array::dtype::NativePType + Copy,
 {
-    let field = array
-        .unmasked_field_by_name(name)
-        .map_err(|err| eyre!("vortex missing {name}: {err}"))?;
+    let field =
+        array.unmasked_field_by_name(name).map_err(|err| eyre!("vortex missing {name}: {err}"))?;
     let values: PrimitiveArray =
         field.clone().execute(ctx).map_err(|err| eyre!("decode {name}: {err}"))?;
     Ok(values.with_iterator(|iter| iter.map(|v| v.copied()).collect::<Vec<_>>()))
@@ -266,17 +240,14 @@ fn decimal_optional(
     array: &VortexStructArray,
     name: &str,
 ) -> Result<Vec<Option<String>>> {
-    let field = array
-        .unmasked_field_by_name(name)
-        .map_err(|err| eyre!("vortex missing {name}: {err}"))?;
+    let field =
+        array.unmasked_field_by_name(name).map_err(|err| eyre!("vortex missing {name}: {err}"))?;
     let values: DecimalArray =
         field.clone().execute(ctx).map_err(|err| eyre!("decode {name}: {err}"))?;
     if values.scale() != 0 {
         return Err(eyre!("expected integer decimal scale for {name}"));
     }
-    let validity = values
-        .validity()
-        .map_err(|err| eyre!("validity {name}: {err}"))?;
+    let validity = values.validity().map_err(|err| eyre!("validity {name}: {err}"))?;
     let mut out = match values.values_type() {
         DecimalType::I8 => buf_to_strs(values.buffer::<i8>()),
         DecimalType::I16 => buf_to_strs(values.buffer::<i16>()),
@@ -286,10 +257,7 @@ fn decimal_optional(
         DecimalType::I256 => return Err(eyre!("i256 decimal not supported for {name}")),
     };
     for (idx, value) in out.iter_mut().enumerate() {
-        if !validity
-            .is_valid(idx)
-            .map_err(|err| eyre!("validity is_valid {name}: {err}"))?
-        {
+        if !validity.is_valid(idx).map_err(|err| eyre!("validity is_valid {name}: {err}"))? {
             *value = None;
         }
     }
@@ -305,10 +273,7 @@ fn varbin_required(
     array: &VortexStructArray,
     name: &str,
 ) -> Result<Vec<Vec<u8>>> {
-    Ok(varbin_optional(ctx, array, name)?
-        .into_iter()
-        .map(|v| v.unwrap_or_default())
-        .collect())
+    Ok(varbin_optional(ctx, array, name)?.into_iter().map(|v| v.unwrap_or_default()).collect())
 }
 
 fn varbin_optional(
@@ -316,9 +281,8 @@ fn varbin_optional(
     array: &VortexStructArray,
     name: &str,
 ) -> Result<Vec<Option<Vec<u8>>>> {
-    let field = array
-        .unmasked_field_by_name(name)
-        .map_err(|err| eyre!("vortex missing {name}: {err}"))?;
+    let field =
+        array.unmasked_field_by_name(name).map_err(|err| eyre!("vortex missing {name}: {err}"))?;
     let values: VortexVarBinViewArray =
         field.clone().execute(ctx).map_err(|err| eyre!("decode {name}: {err}"))?;
     Ok(values.with_iterator(|iter| iter.map(|v| v.map(|b| b.to_vec())).collect::<Vec<_>>()))
@@ -383,10 +347,12 @@ fn parse_u256_dec(s: &str) -> Result<U256> {
 
 use std::collections::HashMap;
 
-use alloy_primitives::{Bytes as PrimBytes, LogData, Log as PrimitiveLog};
+use alloy_primitives::{Bytes as PrimBytes, Log as PrimitiveLog, LogData};
 use alloy_rpc_types_eth::Log;
-use vortex::array::dtype::Nullability;
-use vortex::array::expr::{and, gt_eq, lt_eq, or_collect};
+use vortex::array::{
+    dtype::Nullability,
+    expr::{and, gt_eq, lt_eq, or_collect},
+};
 
 use super::logs_decode::LogScanFilter;
 
@@ -423,9 +389,7 @@ pub(crate) async fn decode_log_chunk(
     let mut options = session.open_options();
     options = options.with_some_file_size(file_size);
     if let Some(b64) = footer_metadata_b64 {
-        let bytes = BASE64
-            .decode(b64)
-            .map_err(|err| eyre!("decode footer b64: {err}"))?;
+        let bytes = BASE64.decode(b64).map_err(|err| eyre!("decode footer b64: {err}"))?;
         let footer = Footer::from_metadata_bytes(ByteBuffer::copy_from(&bytes), session.clone())
             .map_err(|err| eyre!("footer parse: {err}"))?;
         options = options.with_footer(footer);
@@ -446,10 +410,8 @@ pub(crate) async fn decode_log_chunk(
             options.with_preloaded_file_range(range.offset, ByteBuffer::copy_from(bytes.as_ref()));
     }
 
-    let file = options
-        .open(Arc::new(read_at))
-        .await
-        .map_err(|err| eyre!("open vortex file: {err}"))?;
+    let file =
+        options.open(Arc::new(read_at)).await.map_err(|err| eyre!("open vortex file: {err}"))?;
 
     // Build the filter expression. Block-num range is always pushed.
     let block_filter = if from_block == to_block {
@@ -465,7 +427,10 @@ pub(crate) async fn decode_log_chunk(
         if let Some(address_pred) = or_collect(filter.addresses.iter().map(|addr| {
             eq(
                 col("address"),
-                lit(Scalar::binary(ByteBuffer::copy_from(addr.as_slice()), Nullability::NonNullable)),
+                lit(Scalar::binary(
+                    ByteBuffer::copy_from(addr.as_slice()),
+                    Nullability::NonNullable,
+                )),
             )
         })) {
             filter_expr = and(filter_expr, address_pred);
@@ -501,9 +466,8 @@ pub(crate) async fn decode_log_chunk(
         .map_err(|err| eyre!("read vortex logs: {err}"))?;
 
     let mut ctx = session.create_execution_ctx();
-    let struct_arr: VortexStructArray = array
-        .execute(&mut ctx)
-        .map_err(|err| eyre!("decode vortex logs: {err}"))?;
+    let struct_arr: VortexStructArray =
+        array.execute(&mut ctx).map_err(|err| eyre!("decode vortex logs: {err}"))?;
 
     let block_num = primitive_required::<i64>(&mut ctx, &struct_arr, "block_num")?;
     let log_idx = primitive_required::<i32>(&mut ctx, &struct_arr, "log_idx")?;

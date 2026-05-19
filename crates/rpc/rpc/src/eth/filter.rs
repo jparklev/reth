@@ -699,9 +699,9 @@ where
             // The bucket served the whole range. Apply the same
             // max_logs_per_response cap as the regular path so callers
             // can't smuggle a huge response through.
-            if let Some(max_logs_per_response) = limits.max_logs_per_response
-                && from_block != to_block
-                && logs.len() > max_logs_per_response
+            if let Some(max_logs_per_response) = limits.max_logs_per_response &&
+                from_block != to_block &&
+                logs.len() > max_logs_per_response
             {
                 return Err(EthFilterError::QueryExceedsMaxResults {
                     max_logs: max_logs_per_response,

@@ -867,9 +867,7 @@ where
     Pool: TransactionPool + Clone + 'static,
     Network: NetworkInfo + Peers + Clone + 'static,
     EthApi: FullEthApiServer
-        + reth_rpc_eth_api::RpcNodeCore<
-            Provider: reth_storage_api::BucketLogsLookup,
-        >,
+        + reth_rpc_eth_api::RpcNodeCore<Provider: reth_storage_api::BucketLogsLookup>,
     EvmConfig: ConfigureEvm<Primitives = N> + 'static,
     Consensus: FullConsensus<N> + Clone + 'static,
 {

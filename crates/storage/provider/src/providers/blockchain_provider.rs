@@ -173,10 +173,7 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
         _hint_block_hash: Option<BlockHash>,
     ) -> StateProviderBox {
         if let Some(state_bucket) = &self.state_bucket {
-            return Box::new(super::bucket::BucketStateProvider::new(
-                state_bucket.clone(),
-                inner,
-            ))
+            return Box::new(super::bucket::BucketStateProvider::new(state_bucket.clone(), inner))
         }
         inner
     }
@@ -185,8 +182,8 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
     /// `from_block..=to_block` range from the attached bucket, if any.
     /// Returns `Ok(None)` when:
     /// - no bucket is configured;
-    /// - the requested upper bound is beyond the bucket's finalized
-    ///   coverage (the bucket only serves finalized data).
+    /// - the requested upper bound is beyond the bucket's finalized coverage (the bucket only
+    ///   serves finalized data).
     ///
     /// The bucket dispatch decodes signed `logs` chunks (parquet
     /// or Vortex), probes per-chunk Bloom side-tables (Phase 22
@@ -313,8 +310,8 @@ impl<N: ProviderNodeTypes> HeaderProvider for BlockchainProvider<N> {
     type Header = HeaderTy<N>;
 
     fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
-        if let Some(bucket) = &self.bucket
-            && let Some(header) = bucket.header_by_hash(block_hash)?
+        if let Some(bucket) = &self.bucket &&
+            let Some(header) = bucket.header_by_hash(block_hash)?
         {
             // SAFETY: HeaderTy<N> == alloy_consensus::Header for
             // ethereum NodePrimitives (the only configuration this
@@ -329,9 +326,9 @@ impl<N: ProviderNodeTypes> HeaderProvider for BlockchainProvider<N> {
     }
 
     fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Self::Header>> {
-        if let Some(bucket) = &self.bucket
-            && num <= bucket.latest_finalized_block_number()
-            && let Some(header) = bucket.header_by_number(num)?
+        if let Some(bucket) = &self.bucket &&
+            num <= bucket.latest_finalized_block_number() &&
+            let Some(header) = bucket.header_by_number(num)?
         {
             // SAFETY: see header() above.
             return Ok(Some(unsafe { core::mem::transmute_copy(&header) }));
@@ -508,8 +505,8 @@ impl<N: ProviderNodeTypes> TransactionsProvider for BlockchainProvider<N> {
     }
 
     fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
-        if let Some(bucket) = &self.bucket
-            && let Some(tx) = bucket.transaction_by_hash(hash)?
+        if let Some(bucket) = &self.bucket &&
+            let Some(tx) = bucket.transaction_by_hash(hash)?
         {
             // SAFETY: TxTy<N> == reth_ethereum_primitives::TransactionSigned
             // for ethereum NodePrimitives — the only NodePrimitives
@@ -536,12 +533,10 @@ impl<N: ProviderNodeTypes> TransactionsProvider for BlockchainProvider<N> {
         if let Some(bucket) = &self.bucket {
             let num = match id {
                 BlockHashOrNumber::Number(n) => Some(n),
-                BlockHashOrNumber::Hash(h) => bucket
-                    .header_by_hash(h)?
-                    .map(|header| header.number),
+                BlockHashOrNumber::Hash(h) => bucket.header_by_hash(h)?.map(|header| header.number),
             };
-            if let Some(num) = num
-                && let Some(txs) = bucket.transactions_by_block(num)?
+            if let Some(num) = num &&
+                let Some(txs) = bucket.transactions_by_block(num)?
             {
                 // SAFETY: TxTy<N> == reth_ethereum_primitives::TransactionSigned
                 // for the Ethereum NodePrimitives this fork ships
@@ -588,8 +583,8 @@ impl<N: ProviderNodeTypes> ReceiptProvider for BlockchainProvider<N> {
     }
 
     fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Receipt>> {
-        if let Some(bucket) = &self.bucket
-            && let Some(receipt) = bucket.receipt_by_hash(hash)?
+        if let Some(bucket) = &self.bucket &&
+            let Some(receipt) = bucket.receipt_by_hash(hash)?
         {
             // SAFETY: ReceiptTy<N> == reth_ethereum_primitives::Receipt
             // for Ethereum NodePrimitives — the only configuration
@@ -607,12 +602,10 @@ impl<N: ProviderNodeTypes> ReceiptProvider for BlockchainProvider<N> {
         if let Some(bucket) = &self.bucket {
             let num = match block {
                 BlockHashOrNumber::Number(n) => Some(n),
-                BlockHashOrNumber::Hash(h) => bucket
-                    .header_by_hash(h)?
-                    .map(|header| header.number),
+                BlockHashOrNumber::Hash(h) => bucket.header_by_hash(h)?.map(|header| header.number),
             };
-            if let Some(num) = num
-                && let Some(receipts) = bucket.receipts_by_block(num)?
+            if let Some(num) = num &&
+                let Some(receipts) = bucket.receipts_by_block(num)?
             {
                 // SAFETY: see `receipt_by_hash` above.
                 return Ok(Some(unsafe { core::mem::transmute_copy(&receipts) }));
@@ -698,7 +691,9 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
     fn latest(&self) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", "Getting latest block state provider");
         // use latest state provider if the head state exists
-        let inner: StateProviderBox = if let Some(state) = self.canonical_in_memory_state.head_state() {
+        let inner: StateProviderBox = if let Some(state) =
+            self.canonical_in_memory_state.head_state()
+        {
             trace!(target: "providers::blockchain", "Using head state for latest state provider");
             self.block_state_provider(&state)?.boxed()
         } else {
@@ -2925,8 +2920,7 @@ mod tests {
             BlockRangeParams::default(),
         )?;
         let spy = make_spy_bucket();
-        let provider =
-            provider.with_state_bucket(spy.clone() as BucketStateClientArc);
+        let provider = provider.with_state_bucket(spy.clone() as BucketStateClientArc);
         let canonical = in_memory_blocks.last().unwrap().hash();
 
         // Drive `state_by_block_hash` (the eth_call→evm_env_at→
@@ -2937,9 +2931,7 @@ mod tests {
         assert_eq!(acc.balance, U256::from(123u64));
 
         // bytecode_by_hash hit
-        let bytecode = state
-            .bytecode_by_hash(&spy.sentinel_code_hash)?
-            .expect("code present");
+        let bytecode = state.bytecode_by_hash(&spy.sentinel_code_hash)?.expect("code present");
         assert_eq!(bytecode.original_byte_slice(), spy.sentinel_code.as_ref());
 
         // storage hit, then storage miss → fall-through
@@ -2990,8 +2982,7 @@ mod tests {
             BlockRangeParams::default(),
         )?;
         let spy = make_spy_bucket();
-        let provider =
-            provider.with_state_bucket(spy.clone() as BucketStateClientArc);
+        let provider = provider.with_state_bucket(spy.clone() as BucketStateClientArc);
 
         // latest()
         let latest = provider.latest()?;

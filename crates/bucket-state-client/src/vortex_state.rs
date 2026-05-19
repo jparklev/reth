@@ -4,8 +4,8 @@
 //! (`crates/relay-state-checkpointer/src/vortex_writer.rs` and
 //! `crates/relay-rpc/src/backends/state_artifacts.rs`):
 //!
-//! - `accounts.vortex`         : `address(20), nonce(i64), balance(32 BE), code_hash(32)`
-//! - `storage.vortex`          : `address(20), slot(32 BE), value(32 BE)`
+//! - `accounts.vortex`         : `hashed_address(32), nonce(i64), balance(32 BE), code_hash(32)`
+//! - `storage.vortex`          : `hashed_address(32), hashed_slot(32), value(32 BE)`
 //! - `code.vortex`             : `code_hash(32), code(binary)`
 //! - `state_account_deltas`    : `block_num(i64), address, nonce, balance, code_hash`
 //! - `state_storage_deltas`    : `block_num(i64), address, slot, value`
@@ -18,20 +18,21 @@
 
 use std::sync::Arc;
 
-use alloy_primitives::{Address, B256, Bytes, U256};
-use object_store::memory::InMemory;
-use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
-use vortex::array::accessor::ArrayAccessor;
-use vortex::array::arrays::struct_::StructArrayExt;
-use vortex::array::arrays::{
-    PrimitiveArray, StructArray as VortexStructArray,
-    VarBinViewArray as VortexVarBinViewArray,
+use alloy_primitives::{Address, Bytes, B256, U256};
+use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
+use vortex::{
+    array::{
+        accessor::ArrayAccessor,
+        arrays::{
+            struct_::StructArrayExt, PrimitiveArray, StructArray as VortexStructArray,
+            VarBinViewArray as VortexVarBinViewArray,
+        },
+        stream::ArrayStreamExt,
+        ExecutionCtx, VortexSessionExecute,
+    },
+    session::VortexSession,
+    VortexSessionDefault,
 };
-use vortex::array::stream::ArrayStreamExt;
-use vortex::array::{ExecutionCtx, VortexSessionExecute};
-use vortex::session::VortexSession;
-use vortex::VortexSessionDefault;
 use vortex_file::OpenOptionsSessionExt;
 use vortex_io::object_store::ObjectStoreReadAt;
 
@@ -41,7 +42,7 @@ use crate::BucketStateClientError;
 
 #[derive(Debug, Clone)]
 pub struct AccountRow {
-    pub address: Address,
+    pub hashed_address: B256,
     pub nonce: u64,
     pub balance: U256,
     pub code_hash: B256,
@@ -49,8 +50,8 @@ pub struct AccountRow {
 
 #[derive(Debug, Clone)]
 pub struct StorageRow {
-    pub address: Address,
-    pub slot: U256,
+    pub hashed_address: B256,
+    pub hashed_slot: B256,
     pub value: U256,
 }
 
@@ -91,14 +92,14 @@ pub(crate) async fn decode_accounts_chunk(
 ) -> Result<Vec<AccountRow>, BucketStateClientError> {
     let arr = read_struct(bytes).await?;
     let mut ctx = VortexSession::default().create_execution_ctx();
-    let addresses = varbin_required(&mut ctx, &arr, "address")?;
+    let addresses = varbin_required(&mut ctx, &arr, "hashed_address")?;
     let nonces = primitive_required::<i64>(&mut ctx, &arr, "nonce")?;
     let balances = varbin_required(&mut ctx, &arr, "balance")?;
     let code_hashes = varbin_required(&mut ctx, &arr, "code_hash")?;
     let mut out = Vec::with_capacity(addresses.len());
     for i in 0..addresses.len() {
         out.push(AccountRow {
-            address: bytes_to_address(&addresses[i])?,
+            hashed_address: bytes_to_b256(&addresses[i])?,
             nonce: nonces[i] as u64,
             balance: U256::from_be_slice(&balances[i]),
             code_hash: bytes_to_b256(&code_hashes[i])?,
@@ -112,14 +113,14 @@ pub(crate) async fn decode_storage_chunk(
 ) -> Result<Vec<StorageRow>, BucketStateClientError> {
     let arr = read_struct(bytes).await?;
     let mut ctx = VortexSession::default().create_execution_ctx();
-    let addresses = varbin_required(&mut ctx, &arr, "address")?;
-    let slots = varbin_required(&mut ctx, &arr, "slot")?;
+    let addresses = varbin_required(&mut ctx, &arr, "hashed_address")?;
+    let slots = varbin_required(&mut ctx, &arr, "hashed_slot")?;
     let values = varbin_required(&mut ctx, &arr, "value")?;
     let mut out = Vec::with_capacity(addresses.len());
     for i in 0..addresses.len() {
         out.push(StorageRow {
-            address: bytes_to_address(&addresses[i])?,
-            slot: U256::from_be_slice(&slots[i]),
+            hashed_address: bytes_to_b256(&addresses[i])?,
+            hashed_slot: bytes_to_b256(&slots[i])?,
             value: U256::from_be_slice(&values[i]),
         });
     }
@@ -255,7 +256,8 @@ where
         .clone()
         .execute(ctx)
         .map_err(|err| BucketStateClientError::Vortex(format!("decode {name}: {err}")))?;
-    Ok(values.with_iterator(|iter| iter.map(|v| v.copied().unwrap_or_default()).collect::<Vec<_>>()))
+    Ok(values
+        .with_iterator(|iter| iter.map(|v| v.copied().unwrap_or_default()).collect::<Vec<_>>()))
 }
 
 fn varbin_required(

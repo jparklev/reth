@@ -6,23 +6,25 @@
 
 use std::sync::Arc;
 
-use alloy_primitives::{Address, B256, Bytes, Log, LogData};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
-use eyre::{Result, eyre};
-use object_store::{ObjectStore, ObjectStoreExt};
-use object_store::path::Path as ObjectPath;
-use vortex::array::accessor::ArrayAccessor;
-use vortex::array::arrays::struct_::StructArrayExt;
-use vortex::array::arrays::{
-    PrimitiveArray, StructArray as VortexStructArray,
-    VarBinViewArray as VortexVarBinViewArray,
+use alloy_primitives::{Address, Bytes, Log, LogData, B256};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use eyre::{eyre, Result};
+use object_store::{path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
+use vortex::{
+    array::{
+        accessor::ArrayAccessor,
+        arrays::{
+            struct_::StructArrayExt, PrimitiveArray, StructArray as VortexStructArray,
+            VarBinViewArray as VortexVarBinViewArray,
+        },
+        expr::{col, eq, lit, root, select},
+        scalar::Scalar,
+        stream::ArrayStreamExt,
+        ExecutionCtx, VortexSessionExecute,
+    },
+    session::VortexSession,
+    VortexSessionDefault,
 };
-use vortex::array::expr::{col, eq, lit, root, select};
-use vortex::array::stream::ArrayStreamExt;
-use vortex::array::{ExecutionCtx, VortexSessionExecute, scalar::Scalar};
-use vortex::session::VortexSession;
-use vortex::VortexSessionDefault;
 use vortex_buffer::ByteBuffer;
 use vortex_file::{Footer, OpenOptionsSessionExt};
 use vortex_io::object_store::ObjectStoreReadAt;
@@ -132,17 +134,17 @@ pub(crate) fn rows_to_logs(
     let mut out = Vec::with_capacity(len);
     for row in 0..len {
         let row_block = block_num[row] as u64;
-        if let Some(filter) = block_filter
-            && row_block != filter
+        if let Some(filter) = block_filter &&
+            row_block != filter
         {
             continue;
         }
-        let addr = bytes_to_address(&address[row])
-            .map_err(|err| eyre!("row {row} address: {err}"))?;
+        let addr =
+            bytes_to_address(&address[row]).map_err(|err| eyre!("row {row} address: {err}"))?;
         let mut topics: Vec<B256> = Vec::new();
         if !topic0[row].is_empty() {
-            topics.push(bytes_to_b256(&topic0[row])
-                .map_err(|err| eyre!("row {row} topic0: {err}"))?);
+            topics
+                .push(bytes_to_b256(&topic0[row]).map_err(|err| eyre!("row {row} topic0: {err}"))?);
         }
         for (idx, t) in [&topic1[row], &topic2[row], &topic3[row]].iter().enumerate() {
             if let Some(bytes) = t.as_ref() {
@@ -180,9 +182,8 @@ where
         .map_err(|err| eyre!("vortex logs missing {name}: {err}"))?;
     let values: PrimitiveArray =
         field.clone().execute(ctx).map_err(|err| eyre!("decode {name}: {err}"))?;
-    Ok(values.with_iterator(|iter| {
-        iter.map(|v| v.copied().unwrap_or_default()).collect::<Vec<_>>()
-    }))
+    Ok(values
+        .with_iterator(|iter| iter.map(|v| v.copied().unwrap_or_default()).collect::<Vec<_>>()))
 }
 
 fn varbin_required(
@@ -190,10 +191,7 @@ fn varbin_required(
     array: &VortexStructArray,
     name: &str,
 ) -> Result<Vec<Vec<u8>>> {
-    Ok(varbin_optional(ctx, array, name)?
-        .into_iter()
-        .map(|v| v.unwrap_or_default())
-        .collect())
+    Ok(varbin_optional(ctx, array, name)?.into_iter().map(|v| v.unwrap_or_default()).collect())
 }
 
 fn varbin_optional(
@@ -230,14 +228,17 @@ fn bytes_to_address(b: &[u8]) -> Result<Address> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use object_store::ObjectStoreExt;
-    use object_store::memory::InMemory;
-    use vortex::array::IntoArray;
-    use vortex::array::arrays::StructArray;
-    use vortex::array::builders::{ArrayBuilder, VarBinViewBuilder};
-    use vortex::array::dtype::{DType, FieldNames, Nullability};
-    use vortex::array::validity::Validity;
-    use vortex::buffer::{Buffer, ByteBufferMut};
+    use object_store::{memory::InMemory, ObjectStoreExt};
+    use vortex::{
+        array::{
+            arrays::StructArray,
+            builders::{ArrayBuilder, VarBinViewBuilder},
+            dtype::{DType, FieldNames, Nullability},
+            validity::Validity,
+            IntoArray,
+        },
+        buffer::{Buffer, ByteBufferMut},
+    };
     use vortex_file::WriteOptionsSessionExt;
 
     #[tokio::test]
@@ -247,15 +248,11 @@ pub(crate) mod tests {
         let object_path = ObjectPath::from(format!("chunks/{chunk_path}"));
         let bytes = build_synthetic_logs_chunk().await;
         let file_size = bytes.len() as u64;
-        store
-            .put(&object_path, bytes.freeze().to_vec().into())
-            .await
-            .expect("put logs object");
+        store.put(&object_path, bytes.freeze().to_vec().into()).await.expect("put logs object");
 
-        let decoded =
-            decode_logs_chunk(store, object_path, 101, Some(file_size), None, &[])
-                .await
-                .expect("decode logs");
+        let decoded = decode_logs_chunk(store, object_path, 101, Some(file_size), None, &[])
+            .await
+            .expect("decode logs");
         // Block 101 has 2 logs (tx_idx=0 with 2 topics, tx_idx=1 anonymous).
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].tx_idx, 0);
@@ -273,29 +270,13 @@ pub(crate) mod tests {
             FieldNames::from(LOG_COLUMNS),
             vec![
                 primitive_array([100_i64, 101, 101]),
-                binary_array([
-                    Some(vec![0x10; 32]),
-                    Some(vec![0x11; 32]),
-                    Some(vec![0x11; 32]),
-                ]),
+                binary_array([Some(vec![0x10; 32]), Some(vec![0x11; 32]), Some(vec![0x11; 32])]),
                 primitive_array([0_i32, 0, 1]),
                 primitive_array([0_i32, 0, 1]),
-                binary_array([
-                    Some(vec![0x20; 32]),
-                    Some(vec![0x21; 32]),
-                    Some(vec![0x22; 32]),
-                ]),
-                binary_array([
-                    Some(vec![0x10; 20]),
-                    Some(vec![0x11; 20]),
-                    Some(vec![0x12; 20]),
-                ]),
+                binary_array([Some(vec![0x20; 32]), Some(vec![0x21; 32]), Some(vec![0x22; 32])]),
+                binary_array([Some(vec![0x10; 20]), Some(vec![0x11; 20]), Some(vec![0x12; 20])]),
                 // topic0 — anonymous log has empty topic0
-                binary_array([
-                    Some(vec![0xa0; 32]),
-                    Some(vec![0xa1; 32]),
-                    Some(Vec::new()),
-                ]),
+                binary_array([Some(vec![0xa0; 32]), Some(vec![0xa1; 32]), Some(Vec::new())]),
                 binary_array([None, Some(vec![0xb1; 32]), None]),
                 binary_array([None, None, None]),
                 binary_array([None, None, None]),

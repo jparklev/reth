@@ -3,7 +3,7 @@ name = "reth-bucket-state-client"
 version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Phase 26.x: HTTP/Vortex implementer of reth_provider::BucketStateClient. Fetches a signed Phase 26.2 plain-state checkpoint from an S3-compatible bucket, replays Phase 26.1 epoch deltas forward, and serves account/storage/bytecode reads from an in-memory HashMap."
+description = "Phase 26.x: HTTP/Vortex implementer of reth_provider::BucketStateClient. Fetches a signed Phase 26.2 hashed-state checkpoint from an S3-compatible bucket, replays Phase 26.1 epoch deltas forward, and serves account/storage/bytecode reads from lazy shard caches."
 
 [dependencies]
 # Trait we implement (extends BucketHeaderClient).
@@ -27,6 +27,8 @@ object_store = { version = "0.13", features = ["aws"] }
 ed25519-dalek = "2"
 sha2 = "0.10"
 hex = "0.4"
+dashmap.workspace = true
+moka = { workspace = true, features = ["sync"] }
 
 # Async + parsing
 tokio = { version = "1", features = ["full"] }
@@ -39,3 +41,6 @@ arc-swap = "1"
 thiserror = "2"
 tracing = "0.1"
 eyre = "0.6"
+
+[dev-dependencies]
+tempfile.workspace = true
