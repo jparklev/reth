@@ -452,11 +452,18 @@ impl HttpBucketStateClient {
                         // the mainnet state trie. Skipping them changes
                         // the computed state root and breaks
                         // verification against pinned_header.state_root.
-                        let account = Account {
-                            nonce: row.nonce,
-                            balance: row.balance,
-                            bytecode_hash: Some(row.code_hash),
-                        };
+                        //
+                        // Flatten the writer's KECCAK_EMPTY sentinel back
+                        // to None so the Compact-encoded `Account` in the
+                        // imported MDBX matches reth's own on-disk bytes
+                        // (reth writes None for EOAs). Trie-equivalent
+                        // via `Account::into_trie_account`, but required
+                        // for byte-for-byte verification against the
+                        // source datadir.
+                        let bytecode_hash =
+                            (row.code_hash != KECCAK_EMPTY).then_some(row.code_hash);
+                        let account =
+                            Account { nonce: row.nonce, balance: row.balance, bytecode_hash };
                         on_account(row.hashed_address, Some(account));
                     })
                     .await?;

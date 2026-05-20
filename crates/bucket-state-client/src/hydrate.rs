@@ -99,8 +99,15 @@ pub(crate) async fn materialize_accounts_chunk(
     }
     let mut count = 0u64;
     vortex_state::decode_accounts_chunk(bytes, |row| {
-        let account =
-            Account { nonce: row.nonce, balance: row.balance, bytecode_hash: Some(row.code_hash) };
+        // The writer flattens `bytecode_hash: None` to `KECCAK_EMPTY` to
+        // fit a fixed 32-byte column. Restore `None` on the consumer
+        // so the on-disk Compact encoding of `Account` round-trips
+        // byte-for-byte with what reth itself writes (it stores `None`
+        // for EOAs). Trie-equivalent either way via
+        // `Account::into_trie_account`, but byte-equality matters for
+        // forensic comparison against a source datadir.
+        let bytecode_hash = (row.code_hash != KECCAK_EMPTY).then_some(row.code_hash);
+        let account = Account { nonce: row.nonce, balance: row.balance, bytecode_hash };
         // Existing entry wins (it comes from delta replay, which is
         // newer than the checkpoint).
         //

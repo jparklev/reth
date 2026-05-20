@@ -180,6 +180,16 @@ async fn async_main(cli: Cli, task_runtime: reth_tasks::Runtime) -> eyre::Result
         cli.env.init::<reth_node_ethereum::node::EthereumNode>(AccessRights::RO, task_runtime)?;
     let factory = env.provider_factory.clone();
 
+    // CRITICAL: hold a single RO provider/tx across BOTH the header
+    // read and the full HashedAccounts/HashedStorages/Bytecodes walk.
+    // MDBX gives a consistent snapshot per read tx, so doing this
+    // guarantees the dumped state belongs to exactly `block_number`
+    // regardless of whether prod reth is paused. Previously we opened
+    // a tx for the header read, dropped it, then opened a second tx
+    // for `dump_state` — if reth advanced between those, the manifest
+    // pinned_header pointed at block N while the dumped tables came
+    // from block N+k, producing a deterministic state-root mismatch
+    // on the consumer side.
     let provider = factory.database_provider_ro()?;
     let info = provider.chain_info()?;
     let block_number = info.best_number;
@@ -195,10 +205,10 @@ async fn async_main(cli: Cli, task_runtime: reth_tasks::Runtime) -> eyre::Result
         shard_bits = cli.shard_bits,
         "anchored to local reth canonical head"
     );
-    drop(provider);
 
     let start = Instant::now();
-    let dump = dump_state(&factory, &cli).await?;
+    let dump = dump_state(&provider, &cli).await?;
+    drop(provider);
     info!(
         accounts = dump.total_accounts,
         storage_rows = dump.total_storage,
@@ -299,13 +309,15 @@ struct StateDump {
     total_code: u64,
 }
 
-async fn dump_state<N>(factory: &ProviderFactory<N>, cli: &Cli) -> eyre::Result<StateDump>
+async fn dump_state<N>(
+    provider: &reth_provider::DatabaseProvider<<N::DB as reth_db_api::database::Database>::TX, N>,
+    cli: &Cli,
+) -> eyre::Result<StateDump>
 where
     N: ProviderNodeTypes,
 {
     let mut dump = StateDump::default();
 
-    let provider = factory.database_provider_ro()?;
     let tx = provider.tx_ref();
 
     // ---- accounts (and code-hash collection) ----
