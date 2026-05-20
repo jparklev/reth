@@ -795,15 +795,24 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
     fn history_by_block_hash(&self, block_hash: BlockHash) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", ?block_hash, "Getting history by block hash");
         // Resolve hash → number so the bucket gate can compare against
-        // pinned_block_number. Look up in MDBX first (cheap); fall back
-        // to the bucket header client (covers historical blocks beyond
-        // MDBX's pruning horizon, where the bucket is the only source).
+        // pinned_block_number. Look up in MDBX first (cheap), then the
+        // bucket header client (covers historical blocks beyond MDBX's
+        // pruning horizon), then the state bucket's pinned-block hash
+        // (covers the single-point gap between head.json publication
+        // and the latest checkpoint).
         let provider = self.consistent_provider()?;
-        let number = provider.block_number(block_hash)?.or_else(|| {
-            self.bucket
-                .as_ref()
-                .and_then(|b| b.header_by_hash(block_hash).ok().flatten().map(|h| h.number))
-        });
+        let number = provider
+            .block_number(block_hash)?
+            .or_else(|| {
+                self.bucket
+                    .as_ref()
+                    .and_then(|b| b.header_by_hash(block_hash).ok().flatten().map(|h| h.number))
+            })
+            .or_else(|| {
+                self.state_bucket.as_ref().and_then(|s| {
+                    (s.pinned_block_hash() == Some(block_hash)).then_some(s.pinned_block_number())
+                })
+            });
         match provider.into_state_provider_at_block_hash(block_hash) {
             Ok(inner) => Ok(self.maybe_wrap_with_bucket(inner, number)),
             Err(err) => {
