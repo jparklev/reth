@@ -6,34 +6,43 @@
 //! then triggers only a short backfill (pinned → tip) instead of a full
 //! staged sync from genesis.
 //!
-//! **Spike scope**: this lands the engine-tree anchor (headers + per-stage
-//! `StageCheckpoint::new(pinned)`). It does NOT drain the bucket's plain
-//! state into MDBX or rebuild the trie. As-is, `eth_blockNumber` after this
-//! command returns `pinned`, the bucket-state RPC continues serving reads at
-//! ≤ pinned, but the *first* block executed past pinned will fail in
-//! `ExecutionStage` because `LatestStateProviderRef` reads plain state from
-//! empty MDBX tables. See `docs/CHECKPOINT-IMPORT-SYNC.md` for the
+//! **Spike #2 scope**: this lands the engine-tree anchor (headers + per-stage
+//! `StageCheckpoint::new(pinned)`) AND drains the bucket-state HashMaps into
+//! the hashed-keyed MDBX tables (`HashedAccounts`, `HashedStorages`,
+//! `Bytecodes`). With storage_v2 enabled (the default), reth's
+//! `LatestStateProviderRef` reads from these tables, so `ExecutionStage` past
+//! `pinned` can now load parent state. The trie tables (`AccountsTrie`,
+//! `StoragesTrie`) are still empty; `MerkleStage` will fail on the first
+//! backfill run until spike #3 computes + populates the trie from the
+//! hashed state. See `docs/CHECKPOINT-IMPORT-SYNC.md` for the
 //! productionization roadmap.
 
 use crate::common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs};
 use alloy_consensus::BlockHeader as AlloyBlockHeader;
+use alloy_primitives::{B256, U256};
 use clap::Parser;
 use reth_bucket_state_client::{
     BucketStateClientConfig, BucketStateConnConfig, HttpBucketStateClient,
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_cli::chainspec::ChainSpecParser;
+use reth_db_api::{tables, transaction::DbTxMut};
 use reth_node_api::NodePrimitives;
 use reth_node_core::args::BucketArgs;
-use reth_primitives_traits::{header::HeaderMut, SealedHeader};
+use reth_primitives_traits::{header::HeaderMut, Bytecode, SealedHeader, StorageEntry};
 use reth_provider::{
     BlockNumReader, BucketStateClient, DBProvider, DatabaseProviderFactory,
-    StaticFileProviderFactory, StaticFileWriter,
+    StaticFileProviderFactory, StaticFileWriter, StorageSettingsCache,
 };
-use std::sync::Arc;
-use tracing::info;
+use std::{sync::Arc, time::Instant};
+use tracing::{info, warn};
 
 use crate::init_state::without_evm::setup_without_evm;
+
+/// Number of `(account or storage slot)` writes after which to commit the
+/// pending DB transaction. Keeps MDBX dirty-page footprint bounded during
+/// the multi-hundred-million-entry drain.
+const DRAIN_COMMIT_THRESHOLD: usize = 1_000_000;
 
 /// Import a bucket-state checkpoint as the local canonical tip.
 #[derive(Debug, Parser)]
@@ -172,6 +181,23 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>>
         let header_for_setup: <N::Primitives as NodePrimitives>::BlockHeader =
             alloy_to_node_header::<N>(&pinned_header)?;
 
+        // Sanity: bucket-state-client is hash-keyed and writes only
+        // `HashedAccounts` / `HashedStorages`, which reth's
+        // `LatestStateProviderRef` consults only when storage_v2 is set.
+        // `init_genesis_with_settings` (called by `env.init`) already wrote
+        // `StorageSettings::v2()` because that's the default; this is a
+        // belt-and-suspenders check so a future storage_v1-default regression
+        // surfaces as a loud error here instead of silent execution divergence
+        // on the first backfill block past pinned.
+        let storage_settings = provider_rw.cached_storage_settings();
+        if !storage_settings.use_hashed_state() {
+            return Err(eyre::eyre!(
+                "import-bucket-checkpoint requires storage_v2 (use_hashed_state) so the \
+                 hashed-keyed bucket-state can be drained into HashedAccounts/HashedStorages. \
+                 Re-run with --storage.v2 (the default) on a fresh datadir."
+            ));
+        }
+
         setup_without_evm(
             &provider_rw,
             SealedHeader::new(header_for_setup, pinned_hash),
@@ -188,16 +214,183 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>>
         static_file_provider.commit()?;
         provider_rw.commit()?;
 
+        info!(target: "reth::cli", "Engine-tree anchor committed; starting plain-state drain");
+
+        // Step 3: eagerly hydrate every checkpoint shard. The bucket-state
+        // client's normal read path is lazy (shards materialize on first
+        // SLOAD that hits them); for the import we want the full snapshot
+        // in memory so we can drain it into MDBX in one shot.
+        let hydrate_t0 = Instant::now();
+        state_client
+            .hydrate_all_shards()
+            .map_err(|err| eyre::eyre!("hydrate_all_shards failed: {err}"))?;
+        info!(
+            target: "reth::cli",
+            elapsed_ms = hydrate_t0.elapsed().as_millis() as u64,
+            accounts = state_client.account_count(),
+            storage = state_client.storage_count(),
+            codes = state_client.code_count(),
+            "Bucket-state shards fully materialized"
+        );
+
+        // Step 4: drain the in-memory caches into MDBX. We write only the
+        // hashed-keyed tables because the bucket-state client doesn't know
+        // plain addresses (everything is keccak-prefix-sharded). With
+        // storage_v2, `LatestStateProviderRef::basic_account` reads
+        // `HashedAccounts` keyed by keccak(addr), and storage reads come
+        // from `HashedStorages` keyed by keccak(addr) + keccak(slot).
+        drain_state_into_mdbx(&provider_factory, &state_client)?;
+
+        // Spike #3 will run a compute_state_root_chunked pass + populate
+        // AccountsTrie/StoragesTrie. Without it, MerkleStage cannot
+        // incrementally compute the root from changesets (there are no
+        // changesets back to genesis) and will fail on the first backfill
+        // run. Logging loudly so this isn't a surprise.
+        warn!(
+            target: "reth::cli",
+            pinned_block,
+            "Trie tables (AccountsTrie/StoragesTrie) are still empty. \
+             MerkleStage will fail on the first backfill block past pinned \
+             until spike #3 (state-root compute pass) lands."
+        );
+
         info!(
             target: "reth::cli",
             pinned_block,
             pinned_hash = ?pinned_hash,
-            "Checkpoint import complete. Datadir is anchored at pinned block. \
-             NOTE: plain-state was NOT drained into MDBX; the very first block \
-             past pinned will fail in ExecutionStage until that follow-up ships."
+            "Checkpoint import complete. Datadir is anchored at pinned block \
+             and hashed plain state is drained."
         );
         Ok(())
     }
+}
+
+/// Drain the bucket-state-client's in-memory account/storage/code caches
+/// into MDBX. We use raw cursor `put` / `upsert` calls because the bucket
+/// caches yield rows in hash-bucket order (not sorted), so the
+/// append/append_dup MDBX fast path doesn't apply.
+///
+/// Commits in chunks of `DRAIN_COMMIT_THRESHOLD` to bound MDBX dirty-page
+/// accumulation. Per-account writes touch only `HashedAccounts`, per-storage
+/// writes touch `HashedStorages` (DupSort), and per-code writes touch
+/// `Bytecodes`. We do NOT touch `PlainAccountState`, `PlainStorageState`,
+/// `AccountChangeSets`, `StorageChangeSets`, `AccountsHistory`, or
+/// `StoragesHistory` — none of those are reachable from the bucket-state
+/// hash-keyed format, and with storage_v2 + the post-pinned engine-tree
+/// anchor, reth's stage pipeline doesn't need them for blocks ≤ pinned.
+fn drain_state_into_mdbx<PF>(
+    provider_factory: &PF,
+    state_client: &HttpBucketStateClient,
+) -> eyre::Result<()>
+where
+    PF: DatabaseProviderFactory,
+    PF::ProviderRW: DBProvider<Tx: DbTxMut>,
+{
+    use reth_db_api::cursor::DbCursorRW;
+
+    let total_t0 = Instant::now();
+    let mut total_accounts: usize = 0;
+    let mut total_storage: usize = 0;
+    let mut total_codes: usize = 0;
+
+    // --- Bytecodes pass ---
+    // Smallest of the three families. Single transaction is fine.
+    {
+        let provider_rw = provider_factory.database_provider_rw()?;
+        let tx = provider_rw.tx_ref();
+        for (code_hash, bytes) in state_client.iter_codes() {
+            tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(bytes))?;
+            total_codes += 1;
+        }
+        provider_rw.commit()?;
+        info!(target: "reth::cli", count = total_codes, "Drained Bytecodes");
+    }
+
+    // --- HashedAccounts pass ---
+    // Each row is ~100 bytes; commit every threshold to bound dirty pages.
+    {
+        let mut provider_rw = provider_factory.database_provider_rw()?;
+        let mut pending: usize = 0;
+        for (hashed_addr, account) in state_client.iter_accounts() {
+            provider_rw.tx_ref().put::<tables::HashedAccounts>(hashed_addr, account)?;
+            total_accounts += 1;
+            pending += 1;
+            if pending >= DRAIN_COMMIT_THRESHOLD {
+                provider_rw.commit()?;
+                provider_rw = provider_factory.database_provider_rw()?;
+                pending = 0;
+                info!(
+                    target: "reth::cli",
+                    drained = total_accounts,
+                    elapsed_s = total_t0.elapsed().as_secs(),
+                    "Drained HashedAccounts chunk"
+                );
+            }
+        }
+        provider_rw.commit()?;
+        info!(target: "reth::cli", count = total_accounts, "Drained HashedAccounts");
+    }
+
+    // --- HashedStorages pass ---
+    // DupSort table keyed by `B256` (hashed addr) with `StorageEntry`
+    // (key=hashed_slot, value=U256) as the duplicate value. The cache
+    // yields rows in HashMap order, NOT sorted by (addr, slot), so we
+    // can't use append_dup; we use `upsert` which does a full B-tree
+    // lookup but also handles the unsorted insertion order correctly.
+    //
+    // We materialize the cache iter into a Vec up front so we can do
+    // chunked commits without having to restart the moka iterator
+    // (moka's iter is single-pass and the second pass would have no
+    // ordering guarantee, so a skip-N replay would double-write some
+    // rows and miss others).
+    {
+        let mut storage_rows: Vec<(B256, B256, U256)> =
+            state_client.iter_storage().filter(|(_, _, v)| !v.is_zero()).collect();
+        info!(
+            target: "reth::cli",
+            count = storage_rows.len(),
+            "Collected HashedStorages rows for drain"
+        );
+        // Sort by (hashed_addr, hashed_slot) so DupSort upserts hit the
+        // MDBX append fast path within each address group.
+        storage_rows.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+
+        let mut idx: usize = 0;
+        while idx < storage_rows.len() {
+            let chunk_end = (idx + DRAIN_COMMIT_THRESHOLD).min(storage_rows.len());
+            let provider_rw = provider_factory.database_provider_rw()?;
+            {
+                let tx = provider_rw.tx_ref();
+                let mut cursor = tx.cursor_dup_write::<tables::HashedStorages>()?;
+                for (hashed_addr, hashed_slot, value) in &storage_rows[idx..chunk_end] {
+                    cursor
+                        .upsert(*hashed_addr, &StorageEntry { key: *hashed_slot, value: *value })?;
+                    total_storage += 1;
+                }
+            }
+            provider_rw.commit()?;
+            info!(
+                target: "reth::cli",
+                drained = total_storage,
+                of = storage_rows.len(),
+                elapsed_s = total_t0.elapsed().as_secs(),
+                "Drained HashedStorages chunk"
+            );
+            idx = chunk_end;
+        }
+        info!(target: "reth::cli", count = total_storage, "Drained HashedStorages");
+    }
+
+    info!(
+        target: "reth::cli",
+        accounts = total_accounts,
+        storage = total_storage,
+        codes = total_codes,
+        elapsed_s = total_t0.elapsed().as_secs(),
+        "Plain-state drain into MDBX complete"
+    );
+
+    Ok(())
 }
 
 impl<C: ChainSpecParser> ImportBucketCheckpointCommand<C> {

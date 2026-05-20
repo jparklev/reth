@@ -346,6 +346,53 @@ impl HttpBucketStateClient {
         self.head.latest_finalized_block_num
     }
 
+    /// Shard IDs declared by the checkpoint manifest.
+    pub fn shard_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.shards.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Eagerly materialize every checkpoint shard into the in-memory
+    /// caches. Used by `import-bucket-checkpoint` to convert the lazy
+    /// on-demand cache into a complete snapshot we can drain into MDBX.
+    /// This intentionally bypasses the on-demand singleflight gates in
+    /// `account` / `storage` / `code_by_hash`; after this returns,
+    /// `account_cache` / `storage_cache` / `code_cache` contain the
+    /// full bucket-known plain state.
+    pub fn hydrate_all_shards(&self) -> Result<(), BucketStateClientError> {
+        for shard in self.shard_ids() {
+            self.ensure_shard_materialized(shard)?;
+        }
+        Ok(())
+    }
+
+    /// Iterate every materialized `(keccak(addr), Account)` row currently
+    /// in the account cache. Tombstones (`None`) are skipped. Order is
+    /// moka's internal hash order, not sorted.
+    pub fn iter_accounts(&self) -> impl Iterator<Item = (B256, Account)> + '_ {
+        self.account_cache.iter().filter_map(|(k, v)| v.map(|acct| (*k, acct)))
+    }
+
+    /// Iterate every materialized `((keccak(addr), keccak(slot)), U256)`
+    /// storage row currently in the storage cache. Tombstones are skipped.
+    pub fn iter_storage(&self) -> impl Iterator<Item = (B256, B256, U256)> + '_ {
+        self.storage_cache.iter().filter_map(|(k, v)| v.map(|val| (k.0, k.1, val)))
+    }
+
+    /// Iterate every materialized `(code_hash, code_bytes)` blob currently
+    /// in the code cache. Tombstones and the empty-code sentinel
+    /// (`KECCAK_EMPTY` → empty bytes) are skipped.
+    pub fn iter_codes(&self) -> impl Iterator<Item = (B256, Bytes)> + '_ {
+        self.code_cache.iter().filter_map(|(k, v)| {
+            let hash = *k;
+            if hash == KECCAK_EMPTY {
+                return None;
+            }
+            v.and_then(|bytes| if bytes.is_empty() { None } else { Some((hash, bytes)) })
+        })
+    }
+
     /// Sync constructor — mirrors
     /// `HttpBucketHeaderClient::new_blocking` so it can be called
     /// from inside the reth NodeBuilder closure. Uses
