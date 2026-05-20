@@ -210,7 +210,13 @@ async fn async_main(cli: Cli, task_runtime: reth_tasks::Runtime) -> eyre::Result
         "hash-keyed state dump complete"
     );
 
-    let manifest = build_manifest(&cli, block_number, &block_hash, &state_root, &dump);
+    // For the Ethereum EthereumNode wiring used here, HeaderProvider::Header
+    // is `alloy_consensus::Header` (the ethereum block header). Concretize +
+    // clone for the manifest. If we ever generalize to other chains, this
+    // would need a header-into-alloy conversion.
+    let pinned_header: Option<alloy_consensus::Header> = Some(header.clone());
+    let manifest =
+        build_manifest(&cli, block_number, &block_hash, &state_root, pinned_header, &dump);
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     tokio::fs::write(cli.out_dir.join("manifest.json"), &manifest_bytes).await?;
 
@@ -614,8 +620,15 @@ struct FinalizedStateArtifactManifest {
     shards: Vec<ShardManifest>,
     /// Number of high-order bits of `keccak(addr)` that route to a shard.
     shard_bits: Option<u8>,
-    /// Always `"hashed"` in v3.
+    /// Always `"hashed"` in v3+.
     key_layout: Option<String>,
+    /// v4: full header for `block_number` / `block_hash`. The bucket-mode
+    /// reth client uses it to construct the EVM block env for eth_call
+    /// (mix_hash → prevrandao, timestamp, gas_limit, base_fee, etc.) and
+    /// to satisfy `header_by_hash` / `header_by_number` dispatch at the
+    /// pinned block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pinned_header: Option<alloy_consensus::Header>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -651,6 +664,7 @@ fn build_manifest(
     block_number: u64,
     block_hash: &str,
     state_root: &Option<String>,
+    pinned_header: Option<alloy_consensus::Header>,
     dump: &StateDump,
 ) -> FinalizedStateArtifactManifest {
     // Group sub-chunks by shard id. Each (shard, family) may have
@@ -686,7 +700,7 @@ fn build_manifest(
         .collect();
 
     FinalizedStateArtifactManifest {
-        version: 3,
+        version: 4,
         chain_id: 1,
         block_number,
         block_hash: block_hash.to_string(),
@@ -694,6 +708,7 @@ fn build_manifest(
         shards,
         shard_bits: Some(cli.shard_bits),
         key_layout: Some("hashed".to_string()),
+        pinned_header,
     }
 }
 

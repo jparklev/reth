@@ -211,6 +211,14 @@ pub trait BucketStateClient: BucketHeaderClient {
     fn pinned_block_hash(&self) -> Option<BlockHash> {
         None
     }
+
+    /// The full header for the pinned block. Used by `BlockchainProvider`'s
+    /// header_by_hash / header_by_number dispatch + by the eth_call env
+    /// builder so post-merge prevrandao (mix_hash), gas_limit, timestamp,
+    /// etc. are populated for bucket-served blocks.
+    fn pinned_header(&self) -> Option<Header> {
+        None
+    }
 }
 
 /// Convenience type alias for the optional bucket state client field

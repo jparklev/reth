@@ -341,6 +341,16 @@ impl<N: ProviderNodeTypes> HeaderProvider for BlockchainProvider<N> {
             // type and must be re-genericized then.
             return Ok(Some(unsafe { core::mem::transmute_copy(&header) }));
         }
+        // v4: also consult the state bucket's pinned_header — covers the
+        // single-point gap when the checkpoint is anchored at a block
+        // past head.json's latest_finalized (so the header chain doesn't
+        // index it yet). eth_call env construction needs this.
+        if let Some(state) = &self.state_bucket &&
+            state.pinned_block_hash() == Some(block_hash) &&
+            let Some(header) = state.pinned_header()
+        {
+            return Ok(Some(unsafe { core::mem::transmute_copy(&header) }));
+        }
         self.consistent_provider()?.header(block_hash)
     }
 
@@ -350,6 +360,13 @@ impl<N: ProviderNodeTypes> HeaderProvider for BlockchainProvider<N> {
             let Some(header) = bucket.header_by_number(num)?
         {
             // SAFETY: see header() above.
+            return Ok(Some(unsafe { core::mem::transmute_copy(&header) }));
+        }
+        // v4 fallback to state bucket pinned_header.
+        if let Some(state) = &self.state_bucket &&
+            num == state.pinned_block_number() &&
+            let Some(header) = state.pinned_header()
+        {
             return Ok(Some(unsafe { core::mem::transmute_copy(&header) }));
         }
         self.consistent_provider()?.header_by_number(num)

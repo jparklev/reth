@@ -17,7 +17,7 @@
 //! 3. Fetch `<prefix>/index.json[.sig]`, verify, parse as `CheckpointIndex`.
 //! 4. Pick the most recent entry ≤ `target_block` (default = head's `latest_finalized_block_num`).
 //! 5. Fetch the entry's `manifest.json[.sig]`, verify sig + sha, parse.
-//! 6. Validate the checkpoint manifest is v3 + hashed-keyed.
+//! 6. Validate the checkpoint manifest is v4 + hashed-keyed.
 //! 7. Scan the local disk cache for already-downloaded shards. Do not fetch or decode checkpoint
 //!    shards during boot.
 //! 8. Walk forward through epoch manifests from `checkpoint.block_number + 1 ..
@@ -215,6 +215,8 @@ pub struct FinalizedStateArtifactManifest {
     pub shard_bits: Option<u8>,
     #[serde(default)]
     pub key_layout: Option<String>,
+    #[serde(default)]
+    pub pinned_header: Option<Header>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +269,9 @@ pub struct HttpBucketStateClient {
     /// derive a hash for `pinned_block` (intermediate epoch advance
     /// without an authoritative hash).
     pinned_block_hash: Option<BlockHash>,
+    /// Full header matching `pinned_block_hash` when the checkpoint manifest
+    /// embeds it. Cleared if deltas advance beyond the checkpoint block.
+    pinned_header: Option<Header>,
     store: Arc<dyn ObjectStore>,
     manifest_dir: String,
     shard_bits: u8,
@@ -471,6 +476,7 @@ impl HttpBucketStateClient {
         let mut pinned_block = manifest.block_number;
         let checkpoint_block_hash = parse_block_hash(&manifest.block_hash).ok();
         let mut pinned_block_hash = checkpoint_block_hash;
+        let mut pinned_header = manifest.pinned_header.clone();
         let mut delta_stats = hydrate::DeltaHydrateStats::default();
 
         // 5. Phase 26.1 epoch-delta replay forward.
@@ -501,8 +507,10 @@ impl HttpBucketStateClient {
                     if pinned_block == head_block {
                         pinned_block_hash =
                             parse_block_hash(&head.latest_finalized_block_hash).ok();
+                        pinned_header = None;
                     } else {
                         pinned_block_hash = None;
+                        pinned_header = None;
                     }
                 }
             }
@@ -540,6 +548,7 @@ impl HttpBucketStateClient {
             head,
             pinned_block,
             pinned_block_hash,
+            pinned_header,
             store,
             manifest_dir,
             shard_bits,
@@ -771,6 +780,10 @@ impl BucketStateClient for HttpBucketStateClient {
     fn pinned_block_hash(&self) -> Option<BlockHash> {
         self.pinned_block_hash
     }
+
+    fn pinned_header(&self) -> Option<Header> {
+        self.pinned_header.clone()
+    }
 }
 
 /// Parse `"0x..."` (or bare hex) into a [`BlockHash`]. Used to lift
@@ -804,9 +817,9 @@ where
 fn validate_checkpoint_manifest(
     manifest: &FinalizedStateArtifactManifest,
 ) -> Result<(), BucketStateClientError> {
-    if manifest.version != 3 {
+    if manifest.version != 4 {
         return Err(BucketStateClientError::Decode(format!(
-            "unsupported checkpoint manifest version {}; bucket-state-client requires version 3 hashed checkpoints",
+            "unsupported checkpoint manifest version {}; bucket-state-client requires version 4 hashed checkpoints",
             manifest.version
         )));
     }
@@ -818,11 +831,11 @@ fn validate_checkpoint_manifest(
     }
     if manifest.shards.is_empty() {
         return Err(BucketStateClientError::Decode(
-            "checkpoint manifest v3 must contain hashed shards".into(),
+            "checkpoint manifest v4 must contain hashed shards".into(),
         ));
     }
     let shard_bits = manifest.shard_bits.ok_or_else(|| {
-        BucketStateClientError::Decode("checkpoint manifest v3 missing shard_bits".into())
+        BucketStateClientError::Decode("checkpoint manifest v4 missing shard_bits".into())
     })?;
     if shard_bits > 32 {
         return Err(BucketStateClientError::Decode(format!(
@@ -1284,12 +1297,12 @@ mod tests {
     }
 
     #[test]
-    fn manifest_pre_v3_is_rejected() {
+    fn manifest_pre_v4_is_rejected() {
         let mut manifest = checkpoint_manifest(0, vec![empty_shard_manifest(0)]);
-        for version in [1, 2] {
+        for version in [1, 2, 3] {
             manifest.version = version;
             let err = validate_checkpoint_manifest(&manifest).unwrap_err();
-            assert!(err.to_string().contains("requires version 3 hashed checkpoints"));
+            assert!(err.to_string().contains("requires version 4 hashed checkpoints"));
         }
     }
 
@@ -1322,6 +1335,19 @@ mod tests {
 
         // No deltas applied; pinned hash == checkpoint hash.
         assert_eq!(client.pinned_block_hash(), Some(hash));
+    }
+
+    #[test]
+    fn pinned_header_round_trips_via_manifest() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let mut manifest = checkpoint_manifest(4, vec![empty_shard_manifest(0)]);
+        let header = synthetic_header(manifest.block_number);
+        manifest.pinned_header = Some(header.clone());
+
+        let client = test_client(store, manifest, tempdir.path().to_path_buf());
+
+        assert_eq!(client.pinned_header(), Some(header));
     }
 
     #[test]
@@ -1381,6 +1407,7 @@ mod tests {
             },
             pinned_block: manifest.block_number,
             pinned_block_hash: parse_block_hash(&manifest.block_hash).ok(),
+            pinned_header: manifest.pinned_header.clone(),
             store,
             manifest_dir: "checkpoints/100".into(),
             shard_bits,
@@ -1400,11 +1427,12 @@ mod tests {
         shard_bits: u8,
         shards: Vec<ShardManifest>,
     ) -> FinalizedStateArtifactManifest {
+        let pinned_header = synthetic_header(100);
         FinalizedStateArtifactManifest {
-            version: 3,
+            version: 4,
             chain_id: 1,
             block_number: 100,
-            block_hash: "0x00".into(),
+            block_hash: format!("0x{}", hex::encode(pinned_header.hash_slow().as_slice())),
             state_root: None,
             accounts: None,
             storage: None,
@@ -1412,6 +1440,21 @@ mod tests {
             shards,
             shard_bits: Some(shard_bits),
             key_layout: Some("hashed".into()),
+            pinned_header: Some(pinned_header),
+        }
+    }
+
+    fn synthetic_header(number: u64) -> Header {
+        Header {
+            number,
+            parent_hash: B256::from([0x11; 32]),
+            beneficiary: Address::from([0x22; 20]),
+            gas_limit: 30_000_000,
+            gas_used: 12_345,
+            timestamp: 1_700_000_000 + number,
+            mix_hash: B256::from([0x33; 32]),
+            base_fee_per_gas: Some(1_000_000_000),
+            ..Default::default()
         }
     }
 
