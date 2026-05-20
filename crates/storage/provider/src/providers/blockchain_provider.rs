@@ -383,7 +383,10 @@ impl<N: ProviderNodeTypes> HeaderProvider for BlockchainProvider<N> {
         &self,
         number: BlockNumber,
     ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
-        self.consistent_provider()?.sealed_header(number)
+        // Delegate through the bucket-aware header_by_number path so
+        // queries at the pinned block resolve via the state bucket's
+        // pinned_header even if the consistent_provider can't find it.
+        Ok(self.header_by_number(number)?.map(SealedHeader::seal_slow))
     }
 
     fn sealed_headers_range(
@@ -963,11 +966,21 @@ where
         &self,
         id: BlockId,
     ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
-        self.consistent_provider()?.sealed_header_by_id(id)
+        // Route through bucket-aware header_by_id so eth_call's
+        // evm_env_at(BlockId) can resolve headers at the bucket's
+        // pinned block (not in the local consistent_provider).
+        Ok(self.header_by_id(id)?.map(SealedHeader::seal_slow))
     }
 
     fn header_by_id(&self, id: BlockId) -> ProviderResult<Option<Self::Header>> {
-        self.consistent_provider()?.header_by_id(id)
+        match id {
+            BlockId::Hash(rpc_hash) => self.header(rpc_hash.block_hash),
+            BlockId::Number(BlockNumberOrTag::Number(num)) => self.header_by_number(num),
+            // For tags (Latest/Finalized/Safe/Earliest/Pending) the
+            // consistent_provider's resolution against the canonical
+            // chain is correct — those refer to live tip state.
+            _ => self.consistent_provider()?.header_by_id(id),
+        }
     }
 }
 
