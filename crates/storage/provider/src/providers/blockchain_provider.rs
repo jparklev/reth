@@ -789,8 +789,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
         let hash = provider
             .block_hash(block_number)?
             .ok_or_else(|| ProviderError::HeaderNotFound(block_number.into()))?;
-        let inner = provider.into_state_provider_at_block_hash(hash)?;
-        Ok(self.maybe_wrap_with_bucket(inner, Some(block_number)))
+        self.history_by_block_hash(hash)
     }
 
     fn history_by_block_hash(&self, block_hash: BlockHash) -> ProviderResult<StateProviderBox> {
@@ -799,13 +798,36 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
         // pinned_block_number. Look up in MDBX first (cheap); fall back
         // to the bucket header client (covers historical blocks beyond
         // MDBX's pruning horizon, where the bucket is the only source).
-        let number = self.consistent_provider()?.block_number(block_hash)?.or_else(|| {
+        let provider = self.consistent_provider()?;
+        let number = provider.block_number(block_hash)?.or_else(|| {
             self.bucket
                 .as_ref()
                 .and_then(|b| b.header_by_hash(block_hash).ok().flatten().map(|h| h.number))
         });
-        let inner = self.consistent_provider()?.into_state_provider_at_block_hash(block_hash)?;
-        Ok(self.maybe_wrap_with_bucket(inner, number))
+        match provider.into_state_provider_at_block_hash(block_hash) {
+            Ok(inner) => Ok(self.maybe_wrap_with_bucket(inner, number)),
+            Err(err) => {
+                // MDBX has no state for this block — the live datadir
+                // may have been pruned past it, or this binary is
+                // running on a dev datadir alongside an archive bucket.
+                // If the bucket can answer (number ≤ pinned), build a
+                // bucket-overlay backed by `latest()` as a stub inner
+                // (lookups fall through to the bucket's hash-keyed
+                // caches; misses degrade to `None`).
+                if let (Some(state_bucket), Some(num)) = (&self.state_bucket, number) &&
+                    num <= state_bucket.pinned_block_number()
+                {
+                    debug!(target: "providers::blockchain", %block_hash, %num,
+                        "MDBX has no historic state — using bucket overlay with latest() stub");
+                    let stub_inner = self.database.latest()?;
+                    return Ok(Box::new(super::bucket::BucketStateProvider::new(
+                        state_bucket.clone(),
+                        stub_inner,
+                    )));
+                }
+                Err(err)
+            }
+        }
     }
 
     fn state_by_block_hash(&self, hash: BlockHash) -> ProviderResult<StateProviderBox> {
