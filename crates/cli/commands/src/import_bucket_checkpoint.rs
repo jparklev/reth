@@ -206,6 +206,18 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>>
             },
         )?;
 
+        // Pad the v2 changeset static-file segments up to pinned-1 with
+        // empty entries. Reth's boot-time consistency check compares each
+        // stage checkpoint against its segment's tip; without this padding,
+        // `AccountChangeSets` and `StorageChangeSets` stay at tip=0 while
+        // `AccountsHistory` / `StoragesHistory` stage checkpoints jump to
+        // pinned, and the launcher panics with "RocksDB and static file
+        // inconsistency was found that would trigger an unwind to block 0".
+        // `init_from_state_dump`'s v2 path does this via
+        // `prepare_account_changeset_writer` / `prepare_storage_changeset_writer`;
+        // mirror the same logic here.
+        pad_v2_changeset_segments::<N>(&static_file_provider, pinned_block)?;
+
         // Static-files commit must happen before the DB tx commit so the
         // header is durably visible. This mirrors the order in
         // `crates/cli/commands/src/init_state/mod.rs` line 111.
@@ -253,6 +265,72 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>>
         );
         Ok(())
     }
+}
+
+/// Pad the v2 changeset static-file segments (`AccountChangeSets`,
+/// `StorageChangeSets`) with empty entries up to `pinned_block - 1`.
+/// Reth's startup `check_consistency` compares each stage checkpoint
+/// against its segment's tip; since the import advances
+/// `AccountsHistory` / `StoragesHistory` stage checkpoints to `pinned`
+/// but the segments would otherwise stay at tip=0, the launcher would
+/// trigger an unwind to block 0. Padding closes the gap.
+///
+/// Note: writing 25M empty changeset entries is fast — they're size-zero
+/// rows in a static file, just incrementing the segment's block_end.
+fn pad_v2_changeset_segments<N>(
+    static_file_provider: &reth_provider::providers::StaticFileProvider<N::Primitives>,
+    pinned_block: u64,
+) -> eyre::Result<()>
+where
+    N: CliNodeTypes,
+{
+    use reth_static_file_types::StaticFileSegment;
+    if pinned_block == 0 {
+        return Ok(());
+    }
+    let target = pinned_block - 1;
+    let t0 = Instant::now();
+    for segment in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets] {
+        let mut writer = static_file_provider.get_writer(pinned_block, segment)?;
+        let next_block = writer.next_block_number();
+        if next_block > target {
+            continue;
+        }
+        info!(
+            target: "reth::cli",
+            ?segment,
+            from_block = next_block,
+            to_block = target,
+            "Padding empty v2 changeset segment before drain"
+        );
+        for empty_block in next_block..=target {
+            match segment {
+                StaticFileSegment::AccountChangeSets => {
+                    writer.append_account_changeset(Vec::new(), empty_block)?;
+                }
+                StaticFileSegment::StorageChangeSets => {
+                    writer.append_storage_changeset(Vec::new(), empty_block)?;
+                }
+                _ => unreachable!(),
+            }
+            if empty_block.is_multiple_of(5_000_000) {
+                info!(
+                    target: "reth::cli",
+                    ?segment,
+                    padded_to = empty_block,
+                    elapsed_s = t0.elapsed().as_secs(),
+                    "Padding progress"
+                );
+            }
+        }
+    }
+    info!(
+        target: "reth::cli",
+        target,
+        elapsed_s = t0.elapsed().as_secs(),
+        "v2 changeset segment padding complete"
+    );
+    Ok(())
 }
 
 /// Stream every shard's checkpoint artifacts into MDBX. For each shard we
