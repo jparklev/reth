@@ -36,7 +36,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// The main type for interacting with the blockchain.
 ///
