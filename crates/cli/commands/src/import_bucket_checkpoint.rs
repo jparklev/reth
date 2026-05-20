@@ -99,7 +99,11 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>>
             checkpoint_prefix: self.bucket.bucket_state_prefix.clone(),
             target_block: None,
             apply_deltas: true,
-            max_concurrent_shard_loads: 2,
+            // Offline import: no concurrent eth_call traffic to OOM, and
+            // the box typically has plenty of RAM (tens of GB). Crank up
+            // shard fetch concurrency to amortize S3 latency across the
+            // ~thousands of shards in a full mainnet checkpoint.
+            max_concurrent_shard_loads: 32,
         };
 
         let state_client = HttpBucketStateClient::new_blocking(state_cfg)
