@@ -288,22 +288,28 @@ where
     if pinned_block == 0 {
         return Ok(());
     }
-    let target = pinned_block - 1;
     let t0 = Instant::now();
     for segment in [StaticFileSegment::AccountChangeSets, StaticFileSegment::StorageChangeSets] {
         let mut writer = static_file_provider.get_writer(pinned_block, segment)?;
         let next_block = writer.next_block_number();
-        if next_block > target {
+        if next_block > pinned_block {
             continue;
         }
         info!(
             target: "reth::cli",
             ?segment,
             from_block = next_block,
-            to_block = target,
+            to_block = pinned_block,
             "Padding empty v2 changeset segment before drain"
         );
-        for empty_block in next_block..=target {
+        // Pad from `next_block` up to AND INCLUDING `pinned_block` so the
+        // segment tip lines up with the stage checkpoint that
+        // `setup_without_evm` set to `pinned_block`. If we stop at
+        // `pinned_block - 1` the launcher's consistency check detects
+        // `sf_tip=N-1, checkpoint=N` and triggers an unwind to N-1,
+        // which then immediately fails MerkleStage because the dummy
+        // header at N-1 has an empty-trie state root.
+        for empty_block in next_block..=pinned_block {
             match segment {
                 StaticFileSegment::AccountChangeSets => {
                     writer.append_account_changeset(Vec::new(), empty_block)?;
@@ -326,7 +332,7 @@ where
     }
     info!(
         target: "reth::cli",
-        target,
+        pinned_block,
         elapsed_s = t0.elapsed().as_secs(),
         "v2 changeset segment padding complete"
     );
