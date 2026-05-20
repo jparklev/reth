@@ -1194,11 +1194,17 @@ where
     }
 }
 
-/// Computes the state root (from scratch) with periodic commits to free MDBX dirty pages.
+/// Computes the state root from the current hashed state, committing trie updates in chunks.
 ///
-/// Opens a fresh transaction each iteration to release dirty pages, preventing OOM on large
-/// states where trie updates accumulate gigabytes of MDBX dirty pages.
-fn compute_state_root_chunked<PF>(provider_factory: &PF) -> Result<B256, InitStorageError>
+/// Walks `HashedAccounts` / `HashedStorages` and writes `AccountsTrie` / `StoragesTrie` as a
+/// side effect. To rebuild from scratch, callers must clear the trie tables before calling
+/// this function; otherwise the computation extends whatever trie nodes already exist.
+///
+/// Opens and commits a fresh write transaction for each chunk to release MDBX dirty pages,
+/// preventing OOM on large states where trie updates accumulate gigabytes of dirty pages.
+/// Callers must ensure the hashed state and trie tables are not mutated concurrently while
+/// the computation is running.
+pub fn compute_state_root_chunked<PF>(provider_factory: &PF) -> Result<B256, InitStorageError>
 where
     PF: DatabaseProviderFactory<
         ProviderRW: DBProvider<Tx: DbTxMut> + TrieWriter + StorageSettingsCache,

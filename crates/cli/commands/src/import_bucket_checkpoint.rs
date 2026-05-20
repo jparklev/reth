@@ -6,16 +6,16 @@
 //! then triggers only a short backfill (pinned → tip) instead of a full
 //! staged sync from genesis.
 //!
-//! **Spike #2 scope**: this lands the engine-tree anchor (headers + per-stage
-//! `StageCheckpoint::new(pinned)`) AND drains the bucket-state HashMaps into
-//! the hashed-keyed MDBX tables (`HashedAccounts`, `HashedStorages`,
-//! `Bytecodes`). With storage_v2 enabled (the default), reth's
-//! `LatestStateProviderRef` reads from these tables, so `ExecutionStage` past
-//! `pinned` can now load parent state. The trie tables (`AccountsTrie`,
-//! `StoragesTrie`) are still empty; `MerkleStage` will fail on the first
-//! backfill run until spike #3 computes + populates the trie from the
-//! hashed state. See `docs/CHECKPOINT-IMPORT-SYNC.md` for the
-//! productionization roadmap.
+//! **Spike #3 scope**: this lands the engine-tree anchor (headers + per-stage
+//! `StageCheckpoint::new(pinned)`), drains the bucket-state HashMaps into the
+//! hashed-keyed MDBX tables (`HashedAccounts`, `HashedStorages`, `Bytecodes`),
+//! and then runs `compute_state_root_chunked` to populate `AccountsTrie` /
+//! `StoragesTrie` and verify the computed root against
+//! `pinned_header.state_root`. With storage_v2 enabled (the default), reth's
+//! `LatestStateProviderRef` reads from the hashed tables, so `ExecutionStage`
+//! past `pinned` can load parent state; populating the trie unblocks
+//! `MerkleStage` from the very first backfill block. See
+//! `docs/CHECKPOINT-IMPORT-SYNC.md` for the productionization roadmap.
 
 use crate::common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs};
 use alloy_consensus::BlockHeader as AlloyBlockHeader;
@@ -26,6 +26,7 @@ use reth_bucket_state_client::{
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_db_api::{tables, transaction::DbTxMut};
+use reth_db_common::init::compute_state_root_chunked;
 use reth_node_api::NodePrimitives;
 use reth_node_core::args::BucketArgs;
 use reth_primitives_traits::{header::HeaderMut, Bytecode, SealedHeader, StorageEntry};
@@ -34,7 +35,7 @@ use reth_provider::{
     StaticFileProviderFactory, StaticFileWriter, StorageSettingsCache,
 };
 use std::{sync::Arc, time::Instant};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::init_state::without_evm::setup_without_evm;
 
@@ -243,25 +244,61 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>>
         // and storage reads come from `HashedStorages`.
         drain_shards_into_mdbx(&provider_factory, &state_client)?;
 
-        // Spike #3 will run a compute_state_root_chunked pass + populate
-        // AccountsTrie/StoragesTrie. Without it, MerkleStage cannot
-        // incrementally compute the root from changesets (there are no
-        // changesets back to genesis) and will fail on the first backfill
-        // run. Logging loudly so this isn't a surprise.
-        warn!(
+        // Step 4: compute the state root from the hashed plain state and
+        // verify it matches the pinned header. This walks
+        // `HashedAccounts`/`HashedStorages` and writes
+        // `AccountsTrie`/`StoragesTrie`, which is what unblocks `MerkleStage`
+        // from running incrementally on the first backfill block past pinned
+        // (there are no changesets back to genesis, so the trie has to exist
+        // before block N+1 is executed).
+        //
+        // Clear the trie tables first so a re-run on a partially populated
+        // datadir doesn't try to extend stale trie nodes — `compute_state_root_chunked`
+        // expects a clean slate.
+        let expected_state_root = pinned_header.state_root();
+        info!(
             target: "reth::cli",
-            pinned_block,
-            "Trie tables (AccountsTrie/StoragesTrie) are still empty. \
-             MerkleStage will fail on the first backfill block past pinned \
-             until spike #3 (state-root compute pass) lands."
+            ?expected_state_root,
+            "Starting state-root computation from hashed plain state"
         );
+
+        {
+            let provider_rw = provider_factory.database_provider_rw()?;
+            provider_rw.tx_ref().clear::<tables::AccountsTrie>()?;
+            provider_rw.tx_ref().clear::<tables::StoragesTrie>()?;
+            provider_rw.commit()?;
+        }
+
+        let t_trie = Instant::now();
+        let computed_state_root = compute_state_root_chunked(&provider_factory)
+            .map_err(|err| eyre::eyre!("state root computation failed: {err}"))?;
+        let trie_elapsed_s = t_trie.elapsed().as_secs();
+
+        if computed_state_root != expected_state_root {
+            error!(
+                target: "reth::cli",
+                ?computed_state_root,
+                ?expected_state_root,
+                pinned_block,
+                trie_elapsed_s,
+                "Computed state root does not match pinned header state root; \
+                 bucket data is inconsistent with the pinned header"
+            );
+            return Err(eyre::eyre!(
+                "state root mismatch: computed {computed_state_root:?}, \
+                 expected {expected_state_root:?} (pinned block {pinned_block})"
+            ));
+        }
 
         info!(
             target: "reth::cli",
             pinned_block,
             pinned_hash = ?pinned_hash,
-            "Checkpoint import complete. Datadir is anchored at pinned block \
-             and hashed plain state is drained."
+            ?computed_state_root,
+            trie_elapsed_s,
+            "Checkpoint import complete. Datadir is anchored at pinned block, \
+             hashed plain state is drained, and the computed state root matches \
+             the pinned header."
         );
         Ok(())
     }
