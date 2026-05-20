@@ -398,6 +398,18 @@ impl<N: ProviderNodeTypes> BlockHashReader for BlockchainProvider<N> {
         {
             return Ok(Some(header.hash_slow()));
         }
+        // The bucket *header* client only covers blocks up to
+        // head.json's latest_finalized_block_num. The *state* client
+        // may be pinned at a later block (a checkpoint emitted by a
+        // node that ran ahead of head.json's publication cadence).
+        // Cover that single-point gap so queries at the checkpoint
+        // block resolve even when the header chain hasn't caught up.
+        if let Some(state) = &self.state_bucket &&
+            number == state.pinned_block_number() &&
+            let Some(hash) = state.pinned_block_hash()
+        {
+            return Ok(Some(hash));
+        }
         self.consistent_provider()?.block_hash(number)
     }
 
