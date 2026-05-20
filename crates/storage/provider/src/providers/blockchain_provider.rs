@@ -163,30 +163,35 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
     /// `BlockId::Latest` to a concrete block hash before fetching
     /// state — still sees the bucket overlay.
     ///
-    /// `hint_block_hash` gates the wrap so historical state queries
-    /// (block != pinned) bypass the bucket and go straight to MDBX.
-    /// Without this gate, `eth_getBalance(addr, block=N)` for `N` !=
-    /// pinned_block returns the pinned-block balance, which is wrong.
+    /// Hybrid gate: bucket owns *archive depth*, MDBX owns *tip*.
     ///
-    /// `None` means "caller didn't know which block this is for"
-    /// (`latest()` path resolves to pinned naturally) — we wrap
-    /// unconditionally in that case to preserve the eth_call latest
-    /// dispatch flow.
+    /// Wraps the inner provider with the bucket overlay iff the query
+    /// is for a block at or before the bucket's pinned (checkpoint+deltas)
+    /// block. Queries for blocks past pinned fall through to MDBX —
+    /// the live local state is what serves the tip.
     ///
-    /// If the bucket client doesn't expose `pinned_block_hash()`
-    /// (default trait impl returns `None`), we also wrap
-    /// unconditionally — matches pre-gate behavior.
+    /// `None` hint means "caller didn't say which block" (`latest()`
+    /// path) — we wrap unconditionally so eth_call/eth_estimateGas
+    /// against latest still gets the bucket overlay.
+    ///
+    /// Correctness caveat: when the hint is *strictly less than* pinned,
+    /// the bucket returns its pinned-block state for that account/slot/
+    /// code, not the state-as-of the requested block. For our snapshot-
+    /// distance archive use this is acceptable; a multi-checkpoint or
+    /// changeset-roll-back scheme is a separate ship. The MDBX layer
+    /// (HistoricalStateProvider) handles in-window historic queries
+    /// correctly via changesets — bucket fallback only kicks in when
+    /// MDBX can't reach back that far.
     fn maybe_wrap_with_bucket(
         &self,
         inner: StateProviderBox,
-        hint_block_hash: Option<BlockHash>,
+        hint_block_number: Option<BlockNumber>,
     ) -> StateProviderBox {
         let Some(state_bucket) = &self.state_bucket else { return inner };
-        if let (Some(hint), Some(pinned)) = (hint_block_hash, state_bucket.pinned_block_hash())
-            && hint != pinned
+        if let Some(hint) = hint_block_number &&
+            hint > state_bucket.pinned_block_number()
         {
-            // Historical-block query against a different block than
-            // the bucket is pinned to. Bypass bucket; serve from MDBX.
+            // Tip-direction query — leave it to the live MDBX state.
             return inner;
         }
         Box::new(super::bucket::BucketStateProvider::new(state_bucket.clone(), inner))
@@ -387,9 +392,9 @@ impl<N: ProviderNodeTypes> BlockHashReader for BlockchainProvider<N> {
         // `eth_getBalance(addr, <number>)` to resolve historic blocks
         // when the local node hasn't synced them (--dev mode, fresh
         // datadir alongside a checkpoint, etc.).
-        if let Some(bucket) = &self.bucket
-            && number <= bucket.latest_finalized_block_number()
-            && let Some(header) = bucket.header_by_number(number)?
+        if let Some(bucket) = &self.bucket &&
+            number <= bucket.latest_finalized_block_number() &&
+            let Some(header) = bucket.header_by_number(number)?
         {
             return Ok(Some(header.hash_slow()));
         }
@@ -773,13 +778,22 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
             .block_hash(block_number)?
             .ok_or_else(|| ProviderError::HeaderNotFound(block_number.into()))?;
         let inner = provider.into_state_provider_at_block_hash(hash)?;
-        Ok(self.maybe_wrap_with_bucket(inner, Some(hash)))
+        Ok(self.maybe_wrap_with_bucket(inner, Some(block_number)))
     }
 
     fn history_by_block_hash(&self, block_hash: BlockHash) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::blockchain", ?block_hash, "Getting history by block hash");
+        // Resolve hash → number so the bucket gate can compare against
+        // pinned_block_number. Look up in MDBX first (cheap); fall back
+        // to the bucket header client (covers historical blocks beyond
+        // MDBX's pruning horizon, where the bucket is the only source).
+        let number = self.consistent_provider()?.block_number(block_hash)?.or_else(|| {
+            self.bucket
+                .as_ref()
+                .and_then(|b| b.header_by_hash(block_hash).ok().flatten().map(|h| h.number))
+        });
         let inner = self.consistent_provider()?.into_state_provider_at_block_hash(block_hash)?;
-        Ok(self.maybe_wrap_with_bucket(inner, Some(block_hash)))
+        Ok(self.maybe_wrap_with_bucket(inner, number))
     }
 
     fn state_by_block_hash(&self, hash: BlockHash) -> ProviderResult<StateProviderBox> {
