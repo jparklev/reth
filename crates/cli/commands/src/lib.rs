@@ -15,6 +15,7 @@ pub mod download;
 pub mod dump_genesis;
 pub mod export_era;
 pub mod import;
+pub mod import_bucket_checkpoint;
 pub mod import_core;
 pub mod import_era;
 pub mod init_cmd;

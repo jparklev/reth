@@ -184,6 +184,9 @@ where
         }
         Commands::Init(command) => runner.run_blocking_until_ctrl_c(command.execute::<N>(rt)),
         Commands::InitState(command) => runner.run_blocking_until_ctrl_c(command.execute::<N>(rt)),
+        Commands::ImportBucketCheckpoint(command) => {
+            runner.run_blocking_until_ctrl_c(command.execute::<N>(rt))
+        }
         Commands::Import(command) => {
             runner.run_blocking_until_ctrl_c(command.execute::<N, _>(components, rt))
         }

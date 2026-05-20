@@ -57,6 +57,7 @@ reth-trie-common = { workspace = true, optional = true }
 reth-primitives-traits.workspace = true
 reth-discv4.workspace = true
 reth-discv5.workspace = true
+reth-bucket-state-client = { path = "../../bucket-state-client" }
 
 # ethereum
 alloy-eips.workspace = true

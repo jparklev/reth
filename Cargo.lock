@@ -8977,6 +8977,7 @@ dependencies = [
  "ratatui",
  "rayon",
  "reqwest 0.13.3",
+ "reth-bucket-state-client",
  "reth-chainspec",
  "reth-cli",
  "reth-cli-runner",

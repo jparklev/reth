@@ -8,7 +8,7 @@ use reth_cli_commands::{
     common::{CliComponentsBuilder, CliNodeTypes, HeaderMut},
     config_cmd, db, download,
     download::manifest_cmd,
-    dump_genesis, export_era, import, import_era, init_cmd, init_state,
+    dump_genesis, export_era, import, import_bucket_checkpoint, import_era, init_cmd, init_state,
     launcher::FnLauncher,
     node::{self, NoArgs},
     p2p, prune, re_execute, stage,
@@ -268,6 +268,9 @@ pub enum Commands<
     /// Initialize the database from a state dump file.
     #[command(name = "init-state")]
     InitState(init_state::InitStateCommand<C>),
+    /// Import a bucket-state checkpoint as the local canonical tip.
+    #[command(name = "import-bucket-checkpoint")]
+    ImportBucketCheckpoint(import_bucket_checkpoint::ImportBucketCheckpointCommand<C>),
     /// This syncs RLP encoded blocks from a file or files.
     #[command(name = "import")]
     Import(import::ImportCommand<C>),
@@ -334,6 +337,7 @@ impl<C: ChainSpecParser, Ext: clap::Args + fmt::Debug, SubCmd: Subcommand + fmt:
             Self::Node(cmd) => cmd.chain_spec(),
             Self::Init(cmd) => cmd.chain_spec(),
             Self::InitState(cmd) => cmd.chain_spec(),
+            Self::ImportBucketCheckpoint(cmd) => cmd.chain_spec(),
             Self::Import(cmd) => cmd.chain_spec(),
             Self::ExportEra(cmd) => cmd.chain_spec(),
             Self::ImportEra(cmd) => cmd.chain_spec(),
