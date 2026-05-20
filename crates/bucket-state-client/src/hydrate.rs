@@ -103,12 +103,19 @@ pub(crate) async fn materialize_accounts_chunk(
             Account { nonce: row.nonce, balance: row.balance, bytecode_hash: Some(row.code_hash) };
         // Existing entry wins (it comes from delta replay, which is
         // newer than the checkpoint).
+        //
+        // The `is_account_tombstone` heuristic is meaningful only for
+        // *delta replay* (where a row matching nonce=0/balance=0/
+        // code=KECCAK_EMPTY after a non-empty pre-state encodes
+        // selfdestruct). In the initial checkpoint, those same field
+        // values describe a zero-balance EOA that IS part of canonical
+        // mainnet state (received an airdrop, never moved it). Marking
+        // them as `None` in the cache causes `basic_account` to miss
+        // and fall through to the inner provider — which on a
+        // bucket-only deployment is empty, so the response wrongly
+        // reports the account as nonexistent.
         if account_cache.get(&row.hashed_address).is_none() {
-            if is_account_tombstone(&account) {
-                account_cache.insert(row.hashed_address, None);
-            } else {
-                account_cache.insert(row.hashed_address, Some(account));
-            }
+            account_cache.insert(row.hashed_address, Some(account));
         }
         count += 1;
     })

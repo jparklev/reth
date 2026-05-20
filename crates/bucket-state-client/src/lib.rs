@@ -441,16 +441,23 @@ impl HttpBucketStateClient {
                         continue;
                     }
                     vortex_state::decode_accounts_chunk(bytes, |row| {
+                        // Initial-checkpoint drain: pass every account
+                        // through verbatim. The `is_account_tombstone`
+                        // heuristic is meaningful for *delta replay*
+                        // (where nonce=0/balance=0/code=KECCAK_EMPTY
+                        // after a non-empty pre-state means selfdestruct)
+                        // but on initial checkpoint a zero-balance EOA
+                        // is canonical — addresses that received an
+                        // airdrop and never moved it are still part of
+                        // the mainnet state trie. Skipping them changes
+                        // the computed state root and breaks
+                        // verification against pinned_header.state_root.
                         let account = Account {
                             nonce: row.nonce,
                             balance: row.balance,
                             bytecode_hash: Some(row.code_hash),
                         };
-                        if hydrate::is_account_tombstone(&account) {
-                            on_account(row.hashed_address, None);
-                        } else {
-                            on_account(row.hashed_address, Some(account));
-                        }
+                        on_account(row.hashed_address, Some(account));
                     })
                     .await?;
                 }
