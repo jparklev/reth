@@ -393,6 +393,93 @@ impl HttpBucketStateClient {
         })
     }
 
+    /// Stream every row of a single shard's checkpoint artifacts through
+    /// the caller's closures, without populating the moka caches. Used
+    /// by `import-bucket-checkpoint` to bound peak memory: a full mainnet
+    /// checkpoint's plain state is ~100+ GB, too large to hold in RAM
+    /// in moka and then drain to MDBX; instead the caller iterates
+    /// shard-by-shard, drains each shard's rows to MDBX, and drops the
+    /// decoded data before fetching the next shard.
+    ///
+    /// Tombstones are passed through verbatim — the caller decides
+    /// whether to skip them.
+    pub fn drain_shard_streaming<FA, FS, FC>(
+        &self,
+        shard: u32,
+        mut on_account: FA,
+        mut on_storage: FS,
+        mut on_code: FC,
+    ) -> Result<(), BucketStateClientError>
+    where
+        FA: FnMut(B256, Option<Account>),
+        FS: FnMut(B256, B256, Option<U256>),
+        FC: FnMut(B256, Option<Bytes>),
+    {
+        let handle = Handle::try_current().map_err(|_| {
+            BucketStateClientError::Backend(
+                "drain_shard_streaming requires a tokio runtime context".into(),
+            )
+        })?;
+        let manifest = self.shards.get(&shard).ok_or_else(|| {
+            BucketStateClientError::Decode(format!("checkpoint manifest has no shard {shard}"))
+        })?;
+        let shard_dir = self.shard_cache_dir(shard);
+
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                // Bound this drain's network concurrency by the global
+                // semaphore so we don't trample the running service if
+                // they share a process.
+                let _permit =
+                    self.shard_load_permits.clone().acquire_owned().await.map_err(|err| {
+                        BucketStateClientError::Backend(format!("drain semaphore closed: {err}"))
+                    })?;
+
+                for (idx, artifact) in manifest.accounts.iter().enumerate() {
+                    let bytes = self.fetch_chunk_bytes(&shard_dir, idx, artifact).await?;
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    vortex_state::decode_accounts_chunk(bytes, |row| {
+                        let account = Account {
+                            nonce: row.nonce,
+                            balance: row.balance,
+                            bytecode_hash: Some(row.code_hash),
+                        };
+                        if hydrate::is_account_tombstone(&account) {
+                            on_account(row.hashed_address, None);
+                        } else {
+                            on_account(row.hashed_address, Some(account));
+                        }
+                    })
+                    .await?;
+                }
+                for (idx, artifact) in manifest.storage.iter().enumerate() {
+                    let bytes = self.fetch_chunk_bytes(&shard_dir, idx, artifact).await?;
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    vortex_state::decode_storage_chunk(bytes, |row| {
+                        on_storage(row.hashed_address, row.hashed_slot, Some(row.value));
+                    })
+                    .await?;
+                }
+                for (idx, artifact) in manifest.code.iter().enumerate() {
+                    let bytes = self.fetch_chunk_bytes(&shard_dir, idx, artifact).await?;
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    vortex_state::decode_code_chunk(bytes, |row| {
+                        on_code(row.code_hash, Some(row.code));
+                    })
+                    .await?;
+                }
+                Ok::<(), BucketStateClientError>(())
+            })
+        })?;
+        Ok(())
+    }
+
     /// Sync constructor — mirrors
     /// `HttpBucketHeaderClient::new_blocking` so it can be called
     /// from inside the reth NodeBuilder closure. Uses

@@ -19,7 +19,6 @@
 
 use crate::common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs};
 use alloy_consensus::BlockHeader as AlloyBlockHeader;
-use alloy_primitives::{B256, U256};
 use clap::Parser;
 use reth_bucket_state_client::{
     BucketStateClientConfig, BucketStateConnConfig, HttpBucketStateClient,
@@ -38,11 +37,6 @@ use std::{sync::Arc, time::Instant};
 use tracing::{info, warn};
 
 use crate::init_state::without_evm::setup_without_evm;
-
-/// Number of `(account or storage slot)` writes after which to commit the
-/// pending DB transaction. Keeps MDBX dirty-page footprint bounded during
-/// the multi-hundred-million-entry drain.
-const DRAIN_COMMIT_THRESHOLD: usize = 1_000_000;
 
 /// Import a bucket-state checkpoint as the local canonical tip.
 #[derive(Debug, Parser)]
@@ -220,30 +214,22 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>>
 
         info!(target: "reth::cli", "Engine-tree anchor committed; starting plain-state drain");
 
-        // Step 3: eagerly hydrate every checkpoint shard. The bucket-state
-        // client's normal read path is lazy (shards materialize on first
-        // SLOAD that hits them); for the import we want the full snapshot
-        // in memory so we can drain it into MDBX in one shot.
-        let hydrate_t0 = Instant::now();
-        state_client
-            .hydrate_all_shards()
-            .map_err(|err| eyre::eyre!("hydrate_all_shards failed: {err}"))?;
-        info!(
-            target: "reth::cli",
-            elapsed_ms = hydrate_t0.elapsed().as_millis() as u64,
-            accounts = state_client.account_count(),
-            storage = state_client.storage_count(),
-            codes = state_client.code_count(),
-            "Bucket-state shards fully materialized"
-        );
-
-        // Step 4: drain the in-memory caches into MDBX. We write only the
-        // hashed-keyed tables because the bucket-state client doesn't know
-        // plain addresses (everything is keccak-prefix-sharded). With
-        // storage_v2, `LatestStateProviderRef::basic_account` reads
-        // `HashedAccounts` keyed by keccak(addr), and storage reads come
-        // from `HashedStorages` keyed by keccak(addr) + keccak(slot).
-        drain_state_into_mdbx(&provider_factory, &state_client)?;
+        // Step 3: stream every shard's rows through MDBX cursor writes.
+        //
+        // We deliberately bypass `hydrate_all_shards` + `iter_*` here:
+        // the full mainnet plain state is ~100+ GB, too large to hold
+        // in the moka caches alongside reth's own working set. The
+        // streaming API fetches one shard at a time, decodes its rows
+        // directly into MDBX put/upsert calls, and drops the decoded
+        // bytes before fetching the next shard — peak RAM stays bounded
+        // by `max_concurrent_shard_loads × per-shard-decode-buffer`.
+        //
+        // We write only the hashed-keyed tables because the bucket-state
+        // client is hash-prefix-sharded and doesn't expose plain
+        // addresses. With storage_v2 (verified above),
+        // `LatestStateProviderRef::basic_account` reads `HashedAccounts`
+        // and storage reads come from `HashedStorages`.
+        drain_shards_into_mdbx(&provider_factory, &state_client)?;
 
         // Spike #3 will run a compute_state_root_chunked pass + populate
         // AccountsTrie/StoragesTrie. Without it, MerkleStage cannot
@@ -269,20 +255,16 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>>
     }
 }
 
-/// Drain the bucket-state-client's in-memory account/storage/code caches
-/// into MDBX. We use raw cursor `put` / `upsert` calls because the bucket
-/// caches yield rows in hash-bucket order (not sorted), so the
-/// append/append_dup MDBX fast path doesn't apply.
+/// Stream every shard's checkpoint artifacts into MDBX. For each shard we
+/// open one RW transaction, fetch + decode the shard's rows directly via
+/// `HttpBucketStateClient::drain_shard_streaming` (which writes to our
+/// closures, not to the moka caches), `put` accounts + `upsert` storage
+/// rows + `put` bytecodes, then commit the transaction. Peak memory is
+/// bounded by one shard's decoded contents, not the cumulative state.
 ///
-/// Commits in chunks of `DRAIN_COMMIT_THRESHOLD` to bound MDBX dirty-page
-/// accumulation. Per-account writes touch only `HashedAccounts`, per-storage
-/// writes touch `HashedStorages` (DupSort), and per-code writes touch
-/// `Bytecodes`. We do NOT touch `PlainAccountState`, `PlainStorageState`,
-/// `AccountChangeSets`, `StorageChangeSets`, `AccountsHistory`, or
-/// `StoragesHistory` — none of those are reachable from the bucket-state
-/// hash-keyed format, and with storage_v2 + the post-pinned engine-tree
-/// anchor, reth's stage pipeline doesn't need them for blocks ≤ pinned.
-fn drain_state_into_mdbx<PF>(
+/// Tombstones (`None` values) are skipped — `LatestStateProviderRef`
+/// already treats missing entries as zero / empty / absent.
+fn drain_shards_into_mdbx<PF>(
     provider_factory: &PF,
     state_client: &HttpBucketStateClient,
 ) -> eyre::Result<()>
@@ -293,96 +275,89 @@ where
     use reth_db_api::cursor::DbCursorRW;
 
     let total_t0 = Instant::now();
+    let shard_ids = state_client.shard_ids();
+    let total_shards = shard_ids.len();
     let mut total_accounts: usize = 0;
     let mut total_storage: usize = 0;
     let mut total_codes: usize = 0;
+    let mut last_log_t = Instant::now();
 
-    // --- Bytecodes pass ---
-    // Smallest of the three families. Single transaction is fine.
-    {
+    for (shard_idx, shard) in shard_ids.into_iter().enumerate() {
         let provider_rw = provider_factory.database_provider_rw()?;
-        let tx = provider_rw.tx_ref();
-        for (code_hash, bytes) in state_client.iter_codes() {
-            tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(bytes))?;
-            total_codes += 1;
+        let mut shard_accounts: usize = 0;
+        let mut shard_storage: usize = 0;
+        let mut shard_codes: usize = 0;
+        {
+            let tx = provider_rw.tx_ref();
+            let mut storage_cursor = tx.cursor_dup_write::<tables::HashedStorages>()?;
+            state_client.drain_shard_streaming(
+                shard,
+                |hashed_addr, maybe_account| {
+                    let Some(account) = maybe_account else {
+                        return;
+                    };
+                    // The hashed-state table accepts non-sorted puts; for
+                    // a one-time import the per-row B-tree cost is worth
+                    // it to avoid an external sort.
+                    if let Err(err) = tx.put::<tables::HashedAccounts>(hashed_addr, account) {
+                        warn!(target: "reth::cli", ?err, "HashedAccounts put failed");
+                    }
+                    shard_accounts += 1;
+                },
+                |hashed_addr, hashed_slot, maybe_value| {
+                    let Some(value) = maybe_value else {
+                        return;
+                    };
+                    // Skip zero values: empty slots are absence, not a
+                    // stored zero. Storing them bloats MDBX and diverges
+                    // from the LatestStateProviderRef "missing == zero"
+                    // contract.
+                    if value.is_zero() {
+                        return;
+                    }
+                    if let Err(err) = storage_cursor
+                        .upsert(hashed_addr, &StorageEntry { key: hashed_slot, value })
+                    {
+                        warn!(target: "reth::cli", ?err, "HashedStorages upsert failed");
+                    }
+                    shard_storage += 1;
+                },
+                |code_hash, maybe_bytes| {
+                    let Some(bytes) = maybe_bytes else {
+                        return;
+                    };
+                    if bytes.is_empty() {
+                        return;
+                    }
+                    if let Err(err) =
+                        tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(bytes))
+                    {
+                        warn!(target: "reth::cli", ?err, "Bytecodes put failed");
+                    }
+                    shard_codes += 1;
+                },
+            )?;
         }
         provider_rw.commit()?;
-        info!(target: "reth::cli", count = total_codes, "Drained Bytecodes");
-    }
+        total_accounts += shard_accounts;
+        total_storage += shard_storage;
+        total_codes += shard_codes;
 
-    // --- HashedAccounts pass ---
-    // Each row is ~100 bytes; commit every threshold to bound dirty pages.
-    {
-        let mut provider_rw = provider_factory.database_provider_rw()?;
-        let mut pending: usize = 0;
-        for (hashed_addr, account) in state_client.iter_accounts() {
-            provider_rw.tx_ref().put::<tables::HashedAccounts>(hashed_addr, account)?;
-            total_accounts += 1;
-            pending += 1;
-            if pending >= DRAIN_COMMIT_THRESHOLD {
-                provider_rw.commit()?;
-                provider_rw = provider_factory.database_provider_rw()?;
-                pending = 0;
-                info!(
-                    target: "reth::cli",
-                    drained = total_accounts,
-                    elapsed_s = total_t0.elapsed().as_secs(),
-                    "Drained HashedAccounts chunk"
-                );
-            }
-        }
-        provider_rw.commit()?;
-        info!(target: "reth::cli", count = total_accounts, "Drained HashedAccounts");
-    }
-
-    // --- HashedStorages pass ---
-    // DupSort table keyed by `B256` (hashed addr) with `StorageEntry`
-    // (key=hashed_slot, value=U256) as the duplicate value. The cache
-    // yields rows in HashMap order, NOT sorted by (addr, slot), so we
-    // can't use append_dup; we use `upsert` which does a full B-tree
-    // lookup but also handles the unsorted insertion order correctly.
-    //
-    // We materialize the cache iter into a Vec up front so we can do
-    // chunked commits without having to restart the moka iterator
-    // (moka's iter is single-pass and the second pass would have no
-    // ordering guarantee, so a skip-N replay would double-write some
-    // rows and miss others).
-    {
-        let mut storage_rows: Vec<(B256, B256, U256)> =
-            state_client.iter_storage().filter(|(_, _, v)| !v.is_zero()).collect();
-        info!(
-            target: "reth::cli",
-            count = storage_rows.len(),
-            "Collected HashedStorages rows for drain"
-        );
-        // Sort by (hashed_addr, hashed_slot) so DupSort upserts hit the
-        // MDBX append fast path within each address group.
-        storage_rows.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-
-        let mut idx: usize = 0;
-        while idx < storage_rows.len() {
-            let chunk_end = (idx + DRAIN_COMMIT_THRESHOLD).min(storage_rows.len());
-            let provider_rw = provider_factory.database_provider_rw()?;
-            {
-                let tx = provider_rw.tx_ref();
-                let mut cursor = tx.cursor_dup_write::<tables::HashedStorages>()?;
-                for (hashed_addr, hashed_slot, value) in &storage_rows[idx..chunk_end] {
-                    cursor
-                        .upsert(*hashed_addr, &StorageEntry { key: *hashed_slot, value: *value })?;
-                    total_storage += 1;
-                }
-            }
-            provider_rw.commit()?;
+        // Log every ~30s or every 64 shards so the operator can see
+        // progress on a multi-hour import without spamming.
+        if last_log_t.elapsed().as_secs() >= 30 || shard_idx.is_multiple_of(64) {
             info!(
                 target: "reth::cli",
-                drained = total_storage,
-                of = storage_rows.len(),
+                shard = shard_idx + 1,
+                of = total_shards,
+                accounts = total_accounts,
+                storage = total_storage,
+                codes = total_codes,
                 elapsed_s = total_t0.elapsed().as_secs(),
-                "Drained HashedStorages chunk"
+                "Drain progress"
             );
-            idx = chunk_end;
+            last_log_t = Instant::now();
         }
-        info!(target: "reth::cli", count = total_storage, "Drained HashedStorages");
     }
 
     info!(
