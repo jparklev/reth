@@ -191,6 +191,7 @@ impl EngineNodeLauncher {
                                 checkpoint_prefix: bucket_args.bucket_state_prefix.clone(),
                                 target_block: None,
                                 apply_deltas: true,
+                                max_concurrent_shard_loads: 2,
                             };
                             let state_client =
                                 reth_bucket_state_client::HttpBucketStateClient::new_blocking(
