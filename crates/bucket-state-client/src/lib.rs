@@ -43,6 +43,8 @@ use std::{
     time::Instant,
 };
 
+use tokio::sync::Semaphore;
+
 use alloy_consensus::{constants::KECCAK_EMPTY, Header};
 use alloy_primitives::{keccak256, Address, BlockHash, BlockNumber, Bytes, TxHash, B256, U256};
 use dashmap::{DashMap, DashSet};
@@ -123,6 +125,16 @@ pub struct BucketStateClientConfig {
     /// head when `true` (the default). Disable for tests or when
     /// only a single point-in-time state is needed.
     pub apply_deltas: bool,
+    /// Maximum number of distinct shards that can be materializing
+    /// (fetch + decode) at once across the whole process. Bounds
+    /// transient memory: a single fat-contract storage shard can
+    /// peak in the hundreds of MB during decode, and unbounded
+    /// concurrency (one parallel materialization per concurrent
+    /// SLOAD that misses cache) is what OOM'd cold eth_calls. `1`
+    /// fully serializes shard materializations. Defaults to `2`
+    /// which empirically keeps RSS under control on the relay's
+    /// 4-core / 8 GB-headroom target box.
+    pub max_concurrent_shard_loads: usize,
 }
 
 impl BucketStateClientConfig {
@@ -132,6 +144,7 @@ impl BucketStateClientConfig {
             checkpoint_prefix: "checkpoints".into(),
             target_block: None,
             apply_deltas: true,
+            max_concurrent_shard_loads: 2,
         }
     }
 }
@@ -283,6 +296,13 @@ pub struct HttpBucketStateClient {
     loaded_shards: DashSet<u32>,
     materialized_shards: DashSet<u32>,
     shard_singleflight: DashMap<u32, Arc<Mutex<Option<Result<(), BucketStateClientError>>>>>,
+    /// Bounds global concurrent shard materializations. Without
+    /// this, N parallel SLOAD misses across N distinct shards trigger
+    /// N parallel multi-hundred-MB Vortex decodes; a single eth_call
+    /// has been observed to OOM at 8 GB. The semaphore is acquired
+    /// for the lifetime of the network fetch + Vortex decode. Sized
+    /// from `BucketStateClientConfig::max_concurrent_shard_loads`.
+    shard_load_permits: Arc<Semaphore>,
     stats: HydrateStats,
 }
 
@@ -544,6 +564,7 @@ impl HttpBucketStateClient {
             "bucket-state-client snapshot initialized"
         );
 
+        let max_loads = config.max_concurrent_shard_loads.max(1);
         Ok(Self {
             head,
             pinned_block,
@@ -560,6 +581,7 @@ impl HttpBucketStateClient {
             loaded_shards,
             materialized_shards: DashSet::new(),
             shard_singleflight: DashMap::new(),
+            shard_load_permits: Arc::new(Semaphore::new(max_loads)),
             stats,
         })
     }
@@ -579,8 +601,11 @@ impl HttpBucketStateClient {
         if self.materialized_shards.contains(&shard) {
             return Ok(());
         }
-        if let Some(previous) = &*result {
-            return previous.clone();
+        // Only memoize Ok() — past errors must be retryable, otherwise
+        // a single transient S3 5xx during a cold eth_call poisons the
+        // shard for the whole process lifetime.
+        if let Some(Ok(())) = &*result {
+            return Ok(());
         }
         let handle = Handle::try_current().map_err(|_| {
             BucketStateClientError::Backend(
@@ -599,18 +624,41 @@ impl HttpBucketStateClient {
             BucketStateClientError::Decode(format!("checkpoint manifest has no shard {shard}"))
         })?;
         let shard_dir = self.shard_cache_dir(shard);
-        let accounts = self.chunk_bytes_for_refs(&shard_dir, &manifest.accounts).await?;
-        let storage = self.chunk_bytes_for_refs(&shard_dir, &manifest.storage).await?;
-        let code = self.chunk_bytes_for_refs(&shard_dir, &manifest.code).await?;
-        let counts = hydrate::materialize_shard(
-            accounts,
-            storage,
-            code,
-            &self.account_cache,
-            &self.storage_cache,
-            &self.code_cache,
-        )
-        .await?;
+
+        // Global concurrency bound. Held across the entire fetch +
+        // decode pipeline. Without it, N parallel SLOAD misses across
+        // N shards stack N parallel decode buffers and OOM.
+        let _permit = self.shard_load_permits.clone().acquire_owned().await.map_err(|err| {
+            BucketStateClientError::Backend(format!("shard load semaphore closed: {err}"))
+        })?;
+
+        // Re-check after acquiring the permit — another thread may
+        // have completed the materialization while we were waiting.
+        if self.materialized_shards.contains(&shard) {
+            return Ok(());
+        }
+
+        let mut counts = hydrate::MaterializedShardCounts::default();
+        // Stream each chunk through the pipeline: fetch -> decode ->
+        // insert -> drop bytes. Peak transient memory is one chunk's
+        // worth of compressed bytes + one chunk's worth of decoded
+        // columns, NOT the sum of all chunks across all 3 families.
+        for (idx, artifact) in manifest.accounts.iter().enumerate() {
+            let bytes = self.fetch_chunk_bytes(&shard_dir, idx, artifact).await?;
+            counts.add_accounts(
+                hydrate::materialize_accounts_chunk(bytes, &self.account_cache).await?,
+            );
+        }
+        for (idx, artifact) in manifest.storage.iter().enumerate() {
+            let bytes = self.fetch_chunk_bytes(&shard_dir, idx, artifact).await?;
+            counts
+                .add_storage(hydrate::materialize_storage_chunk(bytes, &self.storage_cache).await?);
+        }
+        for (idx, artifact) in manifest.code.iter().enumerate() {
+            let bytes = self.fetch_chunk_bytes(&shard_dir, idx, artifact).await?;
+            counts.add_code(hydrate::materialize_code_chunk(bytes, &self.code_cache).await?);
+        }
+
         self.loaded_shards.insert(shard);
         self.materialized_shards.insert(shard);
         debug!(
@@ -624,25 +672,20 @@ impl HttpBucketStateClient {
         Ok(())
     }
 
-    async fn chunk_bytes_for_refs(
+    async fn fetch_chunk_bytes(
         &self,
         shard_dir: &Path,
-        refs: &[StateArtifactRef],
-    ) -> Result<Vec<Vec<u8>>, BucketStateClientError> {
-        let mut chunks = Vec::with_capacity(refs.len());
-        for (idx, artifact) in refs.iter().enumerate() {
-            let file_name = artifact_cache_file_name(artifact, idx);
-            chunks.push(
-                self.chunk_bytes_from_disk_or_bucket(
-                    shard_dir,
-                    &file_name,
-                    &artifact.object_key,
-                    &artifact.content_sha256,
-                )
-                .await?,
-            );
-        }
-        Ok(chunks)
+        idx: usize,
+        artifact: &StateArtifactRef,
+    ) -> Result<Vec<u8>, BucketStateClientError> {
+        let file_name = artifact_cache_file_name(artifact, idx);
+        self.chunk_bytes_from_disk_or_bucket(
+            shard_dir,
+            &file_name,
+            &artifact.object_key,
+            &artifact.content_sha256,
+        )
+        .await
     }
 
     async fn chunk_bytes_from_disk_or_bucket(
@@ -1135,6 +1178,7 @@ mod tests {
         assert_eq!(cfg.checkpoint_prefix, "checkpoints");
         assert!(cfg.apply_deltas);
         assert!(cfg.target_block.is_none());
+        assert_eq!(cfg.max_concurrent_shard_loads, 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1256,6 +1300,58 @@ mod tests {
         assert!(err
             .to_string()
             .contains("GET checkpoints/100/shard-0000/accounts-part-0000.vortex"));
+    }
+
+    /// A transient S3 failure must not poison the shard for the
+    /// process lifetime — the next call should re-attempt the fetch.
+    /// Regression for the old behavior of caching `Err(...)` in the
+    /// singleflight gate forever, which made one bad cold call wedge
+    /// a contract until the node was restarted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shard_load_error_is_not_memoized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
+        let manifest_dir = "checkpoints/100";
+        let addr = Address::from([0x55; 20]);
+        let hashed_addr = keccak256(addr);
+        let account = Account {
+            nonce: 9,
+            balance: U256::from(99),
+            bytecode_hash: Some(B256::from([0xcc; 32])),
+        };
+        // Build a shard manifest that references storage + code as
+        // empty (so those fetches won't be attempted), accounts as
+        // the only chunk.
+        let mut shard = empty_shard_manifest(0);
+        let mut accounts_ref = artifact_ref(0, "accounts", 0);
+        let bytes = accounts_chunk(&[(
+            hashed_addr,
+            account.nonce,
+            account.balance,
+            account.bytecode_hash.unwrap(),
+        )])
+        .await;
+        accounts_ref.content_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        shard.accounts.push(accounts_ref);
+        let client = test_client(
+            Arc::clone(&store),
+            checkpoint_manifest(0, vec![shard]),
+            tmp.path().to_path_buf(),
+        );
+
+        // First call fails (object not yet present in the store).
+        assert!(client.account(addr).is_err());
+        // Repair the bucket as if the transient failure has cleared.
+        store
+            .put(
+                &ObjectPath::from(format!("{manifest_dir}/shard-0000/accounts-part-0000.vortex")),
+                bytes.into(),
+            )
+            .await
+            .unwrap();
+        // Second call must succeed — the old code path memoized the
+        // Err and would return the same error forever.
+        assert_eq!(client.account(addr).unwrap(), Some(account));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1419,6 +1515,7 @@ mod tests {
             loaded_shards: DashSet::new(),
             materialized_shards: DashSet::new(),
             shard_singleflight: DashMap::new(),
+            shard_load_permits: Arc::new(Semaphore::new(2)),
             stats: HydrateStats::default(),
         }
     }

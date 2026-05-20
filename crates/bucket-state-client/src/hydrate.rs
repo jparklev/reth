@@ -75,71 +75,84 @@ pub(crate) struct MaterializedShardCounts {
     pub code: u64,
 }
 
-/// Decode the checkpoint chunks for one shard and merge them into the
-/// hash-keyed caches.
-pub(crate) async fn materialize_shard(
-    accounts_chunks: Vec<Vec<u8>>,
-    storage_chunks: Vec<Vec<u8>>,
-    code_chunks: Vec<Vec<u8>>,
+impl MaterializedShardCounts {
+    pub(crate) fn add_accounts(&mut self, n: u64) {
+        self.accounts += n;
+    }
+    pub(crate) fn add_storage(&mut self, n: u64) {
+        self.storage += n;
+    }
+    pub(crate) fn add_code(&mut self, n: u64) {
+        self.code += n;
+    }
+}
+
+/// Decode a single chunk's worth of account rows directly into the
+/// shared cache. Streaming: rows are inserted as they are produced
+/// and no `Vec<Row>` intermediate is built.
+pub(crate) async fn materialize_accounts_chunk(
+    bytes: Vec<u8>,
     account_cache: &Cache<B256, Option<Account>>,
+) -> Result<u64, BucketStateClientError> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let mut count = 0u64;
+    vortex_state::decode_accounts_chunk(bytes, |row| {
+        let account =
+            Account { nonce: row.nonce, balance: row.balance, bytecode_hash: Some(row.code_hash) };
+        // Existing entry wins (it comes from delta replay, which is
+        // newer than the checkpoint).
+        if account_cache.get(&row.hashed_address).is_none() {
+            if is_account_tombstone(&account) {
+                account_cache.insert(row.hashed_address, None);
+            } else {
+                account_cache.insert(row.hashed_address, Some(account));
+            }
+        }
+        count += 1;
+    })
+    .await?;
+    Ok(count)
+}
+
+/// Streaming storage chunk decode. See `materialize_accounts_chunk`.
+pub(crate) async fn materialize_storage_chunk(
+    bytes: Vec<u8>,
     storage_cache: &Cache<(B256, B256), Option<U256>>,
+) -> Result<u64, BucketStateClientError> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let mut count = 0u64;
+    vortex_state::decode_storage_chunk(bytes, |row| {
+        let key = (row.hashed_address, row.hashed_slot);
+        if storage_cache.get(&key).is_none() {
+            storage_cache.insert(key, Some(row.value));
+        }
+        count += 1;
+    })
+    .await?;
+    Ok(count)
+}
+
+/// Streaming bytecode chunk decode. See `materialize_accounts_chunk`.
+pub(crate) async fn materialize_code_chunk(
+    bytes: Vec<u8>,
     code_cache: &Cache<B256, Option<Bytes>>,
-) -> Result<MaterializedShardCounts, BucketStateClientError> {
-    let mut counts = MaterializedShardCounts::default();
-
-    // Empty shard files mean "this family has no rows in this shard."
-    // Skip Vortex decode for empties; trying to parse a 0-byte buffer
-    // errors with "Invalid range".
-    for accounts_bytes in accounts_chunks {
-        if accounts_bytes.is_empty() {
-            continue;
-        }
-        let rows_a = vortex_state::decode_accounts_chunk(accounts_bytes).await?;
-        for row in rows_a {
-            let account = Account {
-                nonce: row.nonce,
-                balance: row.balance,
-                bytecode_hash: Some(row.code_hash),
-            };
-            if account_cache.get(&row.hashed_address).is_none() {
-                if is_account_tombstone(&account) {
-                    account_cache.insert(row.hashed_address, None);
-                } else {
-                    account_cache.insert(row.hashed_address, Some(account));
-                }
-            }
-            counts.accounts += 1;
-        }
+) -> Result<u64, BucketStateClientError> {
+    if bytes.is_empty() {
+        return Ok(0);
     }
-
-    for storage_bytes in storage_chunks {
-        if storage_bytes.is_empty() {
-            continue;
+    let mut count = 0u64;
+    vortex_state::decode_code_chunk(bytes, |row| {
+        if code_cache.get(&row.code_hash).is_none() {
+            code_cache.insert(row.code_hash, Some(row.code));
         }
-        let rows_s = vortex_state::decode_storage_chunk(storage_bytes).await?;
-        for row in rows_s {
-            let key = (row.hashed_address, row.hashed_slot);
-            if storage_cache.get(&key).is_none() {
-                storage_cache.insert(key, Some(row.value));
-            }
-            counts.storage += 1;
-        }
-    }
-
-    for code_bytes in code_chunks {
-        if code_bytes.is_empty() {
-            continue;
-        }
-        let rows_c = vortex_state::decode_code_chunk(code_bytes).await?;
-        for row in rows_c {
-            if code_cache.get(&row.code_hash).is_none() {
-                code_cache.insert(row.code_hash, Some(row.code));
-            }
-            counts.code += 1;
-        }
-    }
-
-    Ok(counts)
+        count += 1;
+    })
+    .await?;
+    Ok(count)
 }
 
 /// Apply a single epoch's delta artifacts to the in-memory caches.
@@ -172,13 +185,11 @@ pub(crate) async fn apply_epoch_deltas(
         let bytes = fetch_object(&store, &key).await?;
         verify_chunk_sha(&bytes, &a.content_sha256, &key)?;
         stats.bytes_fetched += bytes.len() as u64;
-        let rows = vortex_state::decode_account_deltas_chunk(bytes).await?;
-        for row in rows {
-            if row.block_num <= pinned_block {
-                continue; // already covered by the checkpoint
-            }
-            if row.block_num > head_block {
-                break; // sorted asc by block_num
+        let mut local_applied = applied;
+        let mut rows_seen = 0u64;
+        vortex_state::decode_account_deltas_chunk(bytes, |row| {
+            if row.block_num <= pinned_block || row.block_num > head_block {
+                return;
             }
             let hashed_address = keccak256(row.address);
             if row.nonce == 0 && row.balance.is_zero() && row.code_hash == KECCAK_EMPTY {
@@ -193,24 +204,25 @@ pub(crate) async fn apply_epoch_deltas(
                     }),
                 );
             }
-            stats.account_rows += 1;
-            if row.block_num > applied {
-                applied = row.block_num;
+            rows_seen += 1;
+            if row.block_num > local_applied {
+                local_applied = row.block_num;
             }
-        }
+        })
+        .await?;
+        stats.account_rows += rows_seen;
+        applied = local_applied;
     }
     if let Some(s) = epoch_artifacts.state_storage_deltas {
         let key = chunks_key(&s.path);
         let bytes = fetch_object(&store, &key).await?;
         verify_chunk_sha(&bytes, &s.content_sha256, &key)?;
         stats.bytes_fetched += bytes.len() as u64;
-        let rows = vortex_state::decode_storage_deltas_chunk(bytes).await?;
-        for row in rows {
-            if row.block_num <= pinned_block {
-                continue;
-            }
-            if row.block_num > head_block {
-                break;
+        let mut local_applied = applied;
+        let mut rows_seen = 0u64;
+        vortex_state::decode_storage_deltas_chunk(bytes, |row| {
+            if row.block_num <= pinned_block || row.block_num > head_block {
+                return;
             }
             // `value=0` here means "the slot was cleared in this epoch"
             // — we still insert so callers see Some(0) rather than fall
@@ -220,33 +232,37 @@ pub(crate) async fn apply_epoch_deltas(
                 (keccak256(row.address), keccak256(row.slot.to_be_bytes::<32>())),
                 Some(row.value),
             );
-            stats.storage_rows += 1;
-            if row.block_num > applied {
-                applied = row.block_num;
+            rows_seen += 1;
+            if row.block_num > local_applied {
+                local_applied = row.block_num;
             }
-        }
+        })
+        .await?;
+        stats.storage_rows += rows_seen;
+        applied = local_applied;
     }
     if let Some(c) = epoch_artifacts.state_code_deltas {
         let key = chunks_key(&c.path);
         let bytes = fetch_object(&store, &key).await?;
         verify_chunk_sha(&bytes, &c.content_sha256, &key)?;
         stats.bytes_fetched += bytes.len() as u64;
-        let rows = vortex_state::decode_code_deltas_chunk(bytes).await?;
-        for row in rows {
-            if row.block_num <= pinned_block {
-                continue;
-            }
-            if row.block_num > head_block {
-                break;
+        let mut local_applied = applied;
+        let mut rows_seen = 0u64;
+        vortex_state::decode_code_deltas_chunk(bytes, |row| {
+            if row.block_num <= pinned_block || row.block_num > head_block {
+                return;
             }
             if code_cache.get(&row.code_hash).is_none() {
                 code_cache.insert(row.code_hash, Some(row.code));
             }
-            stats.code_rows += 1;
-            if row.block_num > applied {
-                applied = row.block_num;
+            rows_seen += 1;
+            if row.block_num > local_applied {
+                local_applied = row.block_num;
             }
-        }
+        })
+        .await?;
+        stats.code_rows += rows_seen;
+        applied = local_applied;
     }
     stats.epochs_replayed += 1;
     debug!(
