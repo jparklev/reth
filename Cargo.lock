@@ -8532,6 +8532,7 @@ dependencies = [
  "eyre",
  "hex",
  "object_store",
+ "reth-bucket-state-client",
  "reth-cli-commands",
  "reth-db-api",
  "reth-ethereum-cli",

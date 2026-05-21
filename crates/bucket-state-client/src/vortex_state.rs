@@ -103,7 +103,7 @@ pub struct CodeDeltaRow {
 // each `Vec` triggering a separate `malloc` call (the worst part for
 // fragmentation / allocator overhead).
 
-pub(crate) async fn decode_accounts_chunk<F>(
+pub async fn decode_accounts_chunk<F>(
     bytes: Vec<u8>,
     mut sink: F,
 ) -> Result<usize, BucketStateClientError>
@@ -131,7 +131,7 @@ where
     Ok(n)
 }
 
-pub(crate) async fn decode_storage_chunk<F>(
+pub async fn decode_storage_chunk<F>(
     bytes: Vec<u8>,
     mut sink: F,
 ) -> Result<usize, BucketStateClientError>
@@ -152,7 +152,7 @@ where
     Ok(n)
 }
 
-pub(crate) async fn decode_code_chunk<F>(
+pub async fn decode_code_chunk<F>(
     bytes: Vec<u8>,
     mut sink: F,
 ) -> Result<usize, BucketStateClientError>

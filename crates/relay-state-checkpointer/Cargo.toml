@@ -9,6 +9,10 @@ description = "Phase 26.2: full plain-state checkpoint emitter — reads a local
 name = "relay-state-checkpointer"
 path = "src/main.rs"
 
+[[bin]]
+name = "shard_probe"
+path = "src/bin/shard_probe.rs"
+
 [dependencies]
 # Reth — re-use the EnvironmentArgs/AccessRights bootstrap from the
 # existing CLI commands instead of re-deriving the 5-arg
@@ -23,6 +27,9 @@ reth-node-types.workspace = true
 reth-storage-errors.workspace = true
 reth-node-ethereum.workspace = true
 reth-tasks.workspace = true
+# For the shard_probe diagnostic binary: re-use the bucket-state-client's
+# public Vortex decoders to read shard chunks from disk cache.
+reth-bucket-state-client = { path = "../bucket-state-client" }
 
 # Vortex — same git fork the relay project uses, byte-equivalent
 # column layouts shared with relay-rpc readers.

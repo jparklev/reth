@@ -64,7 +64,7 @@ use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
 mod hydrate;
-mod vortex_state;
+pub mod vortex_state;
 
 pub use hydrate::HydrateStats;
 
