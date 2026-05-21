@@ -1122,7 +1122,10 @@ where
 
 /// Computes the state root (from scratch) based on the accounts and storages present in the
 /// database.
-fn compute_state_root<Provider>(
+///
+/// Made `pub` so tests outside this module (and other CLI commands) can compare its result
+/// against `compute_state_root_chunked` for correctness checking.
+pub fn compute_state_root<Provider>(
     provider: &Provider,
     prefix_sets: Option<TriePrefixSets>,
 ) -> Result<B256, InitStorageError>
@@ -1694,5 +1697,325 @@ mod tests {
         let result = init_genesis_with_settings(&factory, settings);
 
         assert!(result.is_ok());
+    }
+
+    /// Fast small-scale repro for the chunked state-root bug. Populates synthetic
+    /// HashedAccounts + HashedStorages, then computes the root with both the
+    /// single-transaction `compute_state_root` and the multi-transaction
+    /// `compute_state_root_chunked`. They MUST agree — disagreement is the bug.
+    ///
+    /// The bug only shows up when the chunked function spans multiple chunks, so
+    /// we generate enough state that the default `STATE_ROOT_COMMIT_THRESHOLD`
+    /// (25_000) is crossed several times.
+    fn run_chunked_vs_single_repro(
+        num_accounts: usize,
+        slots_per_account: usize,
+        storage_settings: StorageSettings,
+    ) -> (B256, B256) {
+        use reth_db_api::{cursor::DbCursorRW, transaction::DbTxMut};
+
+        let factory = create_test_provider_factory_with_chain_spec(MAINNET.clone());
+        factory.set_storage_settings_cache(storage_settings);
+
+        // Deterministic synthetic state.
+        let mut accounts: Vec<(B256, Account)> = Vec::with_capacity(num_accounts);
+        let mut storages: Vec<(B256, Vec<(B256, U256)>)> = Vec::with_capacity(num_accounts);
+        for i in 0..num_accounts {
+            // Hash the index to spread accounts across the keyspace.
+            let mut buf = [0u8; 32];
+            buf[24..32].copy_from_slice(&(i as u64).to_be_bytes());
+            let hashed_addr = keccak256(buf);
+            let acct = Account {
+                nonce: i as u64,
+                balance: U256::from(i as u64 * 1_000_000_000u64 + 1),
+                bytecode_hash: None,
+            };
+            accounts.push((hashed_addr, acct));
+
+            let mut slots = Vec::with_capacity(slots_per_account);
+            for j in 0..slots_per_account {
+                let mut sbuf = [0u8; 32];
+                sbuf[16..24].copy_from_slice(&(i as u64).to_be_bytes());
+                sbuf[24..32].copy_from_slice(&(j as u64).to_be_bytes());
+                let hashed_slot = keccak256(sbuf);
+                let value = U256::from((i * 1_000_000 + j) as u64 + 1);
+                slots.push((hashed_slot, value));
+            }
+            slots.sort_unstable_by_key(|(k, _)| *k);
+            storages.push((hashed_addr, slots));
+        }
+
+        // HashedAccounts must be sorted before writing.
+        accounts.sort_unstable_by_key(|(k, _)| *k);
+
+        // Write hashed plain state once.
+        {
+            let provider = factory.database_provider_rw().unwrap();
+            let tx = provider.tx_ref();
+            {
+                let mut accts_cursor = tx.cursor_write::<tables::HashedAccounts>().unwrap();
+                for (hashed_addr, acct) in &accounts {
+                    accts_cursor.append(*hashed_addr, acct).unwrap();
+                }
+            }
+            {
+                let mut storage_cursor = tx.cursor_dup_write::<tables::HashedStorages>().unwrap();
+                for (hashed_addr, slots) in &storages {
+                    if slots.is_empty() {
+                        continue;
+                    }
+                    // Reposition cursor per account.
+                    let _ = storage_cursor.seek_exact(*hashed_addr);
+                    for (hashed_slot, value) in slots {
+                        if value.is_zero() {
+                            continue;
+                        }
+                        storage_cursor
+                            .append_dup(
+                                *hashed_addr,
+                                StorageEntry { key: *hashed_slot, value: *value },
+                            )
+                            .unwrap();
+                    }
+                }
+            }
+            provider.commit().unwrap();
+        }
+
+        // Compute with chunked function.
+        let chunked_root = compute_state_root_chunked(&factory).unwrap();
+
+        // Reset trie tables.
+        {
+            let provider = factory.database_provider_rw().unwrap();
+            provider.tx_ref().clear::<tables::AccountsTrie>().unwrap();
+            provider.tx_ref().clear::<tables::StoragesTrie>().unwrap();
+            provider.commit().unwrap();
+        }
+
+        // Compute with single-transaction (looping) function.
+        let single_root = {
+            let provider = factory.database_provider_rw().unwrap();
+            let root = compute_state_root(&provider, None).unwrap();
+            provider.commit().unwrap();
+            root
+        };
+
+        (chunked_root, single_root)
+    }
+
+    #[test]
+    fn chunked_vs_single_state_root_tiny_v2() {
+        // Tiny — well under the 25_000 threshold, should never split.
+        let (chunked, single) = run_chunked_vs_single_repro(100, 0, StorageSettings::v2());
+        assert_eq!(chunked, single, "chunked vs single root mismatch on tiny v2");
+    }
+
+    #[test]
+    fn chunked_vs_single_state_root_medium_v2() {
+        // Crosses the 25_000 threshold a few times via storage slot count.
+        let (chunked, single) = run_chunked_vs_single_repro(2_000, 50, StorageSettings::v2());
+        assert_eq!(chunked, single, "chunked vs single root mismatch on medium v2 (slots)");
+    }
+
+    #[test]
+    fn chunked_vs_single_state_root_medium_accounts_v2() {
+        // Crosses the 25_000 threshold a few times via account count.
+        let (chunked, single) = run_chunked_vs_single_repro(60_000, 0, StorageSettings::v2());
+        assert_eq!(chunked, single, "chunked vs single root mismatch on 60k accounts v2");
+    }
+
+    #[test]
+    fn chunked_vs_single_state_root_medium_v1() {
+        // Same medium scale but with legacy v1 encoding.
+        let (chunked, single) = run_chunked_vs_single_repro(2_000, 50, StorageSettings::v1());
+        assert_eq!(chunked, single, "chunked vs single root mismatch on medium v1 (slots)");
+    }
+
+    #[test]
+    fn chunked_vs_single_state_root_one_big_account_v2() {
+        // One account with a huge storage trie — forces the storage-root pause/resume code path.
+        let (chunked, single) = run_chunked_vs_single_repro(1, 100_000, StorageSettings::v2());
+        assert_eq!(
+            chunked, single,
+            "chunked vs single root mismatch on single account with 100k slots v2"
+        );
+    }
+
+    /// Like `run_chunked_vs_single_repro`, but adds variation that mirrors real mainnet state:
+    /// - Some accounts have bytecode_hash set (contracts)
+    /// - Some accounts have empty storage (EOAs)
+    /// - Some accounts have many slots (contracts with state)
+    /// - A few accounts have very large storage to exercise the pause/resume mid-storage
+    fn run_chunked_vs_single_mixed(
+        num_accounts: usize,
+        storage_settings: StorageSettings,
+    ) -> (B256, B256) {
+        use reth_db_api::{cursor::DbCursorRW, transaction::DbTxMut};
+
+        let factory = create_test_provider_factory_with_chain_spec(MAINNET.clone());
+        factory.set_storage_settings_cache(storage_settings);
+
+        let mut accounts: Vec<(B256, Account)> = Vec::with_capacity(num_accounts);
+        let mut storages: Vec<(B256, Vec<(B256, U256)>)> = Vec::with_capacity(num_accounts);
+
+        for i in 0..num_accounts {
+            let mut buf = [0u8; 32];
+            buf[24..32].copy_from_slice(&(i as u64).to_be_bytes());
+            let hashed_addr = keccak256(buf);
+
+            // Vary the account shape based on index.
+            let (acct, num_slots) = match i % 8 {
+                0 => (
+                    // EOA, no storage
+                    Account {
+                        nonce: i as u64,
+                        balance: U256::from(i as u64 + 1),
+                        bytecode_hash: None,
+                    },
+                    0,
+                ),
+                1 => (
+                    // EOA with 0 balance, no storage — rare but valid
+                    Account { nonce: 0, balance: U256::ZERO, bytecode_hash: None },
+                    0,
+                ),
+                2 => (
+                    // small contract
+                    Account {
+                        nonce: 1,
+                        balance: U256::from(i as u64 + 1),
+                        bytecode_hash: Some(keccak256(b"small contract bytecode")),
+                    },
+                    5,
+                ),
+                3 => (
+                    // medium contract
+                    Account {
+                        nonce: 1,
+                        balance: U256::from(i as u64 + 1),
+                        bytecode_hash: Some(keccak256(b"medium contract bytecode")),
+                    },
+                    100,
+                ),
+                4 => (
+                    // big contract — crosses threshold during its storage trie compute
+                    Account {
+                        nonce: 1,
+                        balance: U256::from(i as u64 + 1),
+                        bytecode_hash: Some(keccak256(b"big contract bytecode")),
+                    },
+                    5_000,
+                ),
+                5 => (
+                    // contract with no storage (cleared)
+                    Account {
+                        nonce: 1,
+                        balance: U256::from(i as u64 + 1),
+                        bytecode_hash: Some(keccak256(b"empty contract bytecode")),
+                    },
+                    0,
+                ),
+                6 => (
+                    // EOA with bytecode (shouldn't happen but legal)
+                    Account {
+                        nonce: i as u64,
+                        balance: U256::from(i as u64 + 1),
+                        bytecode_hash: None,
+                    },
+                    1,
+                ),
+                _ => (
+                    // small EOA-like
+                    Account {
+                        nonce: i as u64,
+                        balance: U256::from(i as u64 * 1_000_000_000u64 + 1),
+                        bytecode_hash: None,
+                    },
+                    0,
+                ),
+            };
+            accounts.push((hashed_addr, acct));
+
+            let mut slots = Vec::with_capacity(num_slots);
+            for j in 0..num_slots {
+                let mut sbuf = [0u8; 32];
+                sbuf[16..24].copy_from_slice(&(i as u64).to_be_bytes());
+                sbuf[24..32].copy_from_slice(&(j as u64).to_be_bytes());
+                let hashed_slot = keccak256(sbuf);
+                let value = U256::from((i * 1_000_000 + j) as u64 + 1);
+                slots.push((hashed_slot, value));
+            }
+            slots.sort_unstable_by_key(|(k, _)| *k);
+            storages.push((hashed_addr, slots));
+        }
+
+        accounts.sort_unstable_by_key(|(k, _)| *k);
+
+        {
+            let provider = factory.database_provider_rw().unwrap();
+            let tx = provider.tx_ref();
+            {
+                let mut accts_cursor = tx.cursor_write::<tables::HashedAccounts>().unwrap();
+                for (hashed_addr, acct) in &accounts {
+                    accts_cursor.append(*hashed_addr, acct).unwrap();
+                }
+            }
+            {
+                let mut storage_cursor = tx.cursor_dup_write::<tables::HashedStorages>().unwrap();
+                for (hashed_addr, slots) in &storages {
+                    if slots.is_empty() {
+                        continue;
+                    }
+                    let _ = storage_cursor.seek_exact(*hashed_addr);
+                    for (hashed_slot, value) in slots {
+                        if value.is_zero() {
+                            continue;
+                        }
+                        storage_cursor
+                            .append_dup(
+                                *hashed_addr,
+                                StorageEntry { key: *hashed_slot, value: *value },
+                            )
+                            .unwrap();
+                    }
+                }
+            }
+            provider.commit().unwrap();
+        }
+
+        let chunked_root = compute_state_root_chunked(&factory).unwrap();
+
+        {
+            let provider = factory.database_provider_rw().unwrap();
+            provider.tx_ref().clear::<tables::AccountsTrie>().unwrap();
+            provider.tx_ref().clear::<tables::StoragesTrie>().unwrap();
+            provider.commit().unwrap();
+        }
+
+        let single_root = {
+            let provider = factory.database_provider_rw().unwrap();
+            let root = compute_state_root(&provider, None).unwrap();
+            provider.commit().unwrap();
+            root
+        };
+
+        (chunked_root, single_root)
+    }
+
+    #[test]
+    fn chunked_vs_single_mixed_state_v2() {
+        // 400 accounts × mix of shapes. The big-contract bucket (i%8==4) puts
+        // ~50 accounts with 5k slots each, so the storage trie pauses
+        // multiple times, with subsequent accounts continuing across the
+        // commit boundary.
+        let (chunked, single) = run_chunked_vs_single_mixed(400, StorageSettings::v2());
+        assert_eq!(chunked, single, "chunked vs single root mismatch on mixed v2");
+    }
+
+    #[test]
+    fn chunked_vs_single_mixed_state_v1() {
+        let (chunked, single) = run_chunked_vs_single_mixed(400, StorageSettings::v1());
+        assert_eq!(chunked, single, "chunked vs single root mismatch on mixed v1");
     }
 }
