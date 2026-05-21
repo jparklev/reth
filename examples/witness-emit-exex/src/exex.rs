@@ -365,8 +365,8 @@ fn write_atomic(final_path: &Path, bytes: &[u8]) -> eyre::Result<()> {
     std::fs::rename(&tmp, final_path)
         .wrap_err_with(|| format!("rename {} -> {}", tmp.display(), final_path.display()))?;
     // fsync the containing dir so the rename is durable across power loss.
-    if let Some(dir) = final_path.parent()
-        && let Ok(d) = std::fs::File::open(dir)
+    if let Some(dir) = final_path.parent() &&
+        let Ok(d) = std::fs::File::open(dir)
     {
         let _ = d.sync_all();
     }
