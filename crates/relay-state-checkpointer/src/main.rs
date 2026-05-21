@@ -190,7 +190,19 @@ async fn async_main(cli: Cli, task_runtime: reth_tasks::Runtime) -> eyre::Result
     // pinned_header pointed at block N while the dumped tables came
     // from block N+k, producing a deterministic state-root mismatch
     // on the consumer side.
-    let provider = factory.database_provider_ro()?;
+    //
+    // We also `disable_long_read_transaction_safety` so the 5-minute
+    // MDBX read-tx watchdog doesn't reset our snapshot mid-walk: the
+    // full mainnet HashedAccounts/HashedStorages walk takes ~2 hours,
+    // and without this the long-lived RO tx would be timed out and
+    // reset by MDBX's monitor thread (whose default `max_duration`
+    // is 5 minutes). Cursor operations on a reset tx return
+    // `Error::ReadTransactionTimeout`. Per the trait docs, use only
+    // when no concurrent writer is open OR you accept that the
+    // long-lived snapshot pins older MVCC pages on the writer side
+    // (extra dirty pages until our tx drops). Prod reth tolerates
+    // this for the ~2-hour duration of an emit.
+    let provider = factory.database_provider_ro()?.disable_long_read_transaction_safety();
     let info = provider.chain_info()?;
     let block_number = info.best_number;
     let block_hash = format!("0x{}", hex::encode(info.best_hash.as_slice()));
