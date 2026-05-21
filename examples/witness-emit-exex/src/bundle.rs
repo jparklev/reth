@@ -18,9 +18,9 @@ pub(crate) struct WitnessBundle {
     pub(crate) block_body: Bytes,
     /// The execution witness (state nodes, codes, keys, ancestor headers).
     pub(crate) witness: alloy_rpc_types_debug::ExecutionWitness,
-    /// Parent state root (== header.state_root of the parent block).
+    /// Parent state root (== `header.state_root` of the parent block).
     pub(crate) parent_state_root: B256,
-    /// Expected post-state root (== this block's header.state_root).
+    /// Expected post-state root (== this block's `header.state_root`).
     pub(crate) expected_state_root: B256,
     /// Block number.
     pub(crate) block_number: u64,

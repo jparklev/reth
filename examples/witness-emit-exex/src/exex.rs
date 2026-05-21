@@ -74,7 +74,7 @@ impl<Node> WitnessEmitExEx<Node>
 where
     Node: FullNodeComponents<Types: NodeTypes<Primitives = EthPrimitives>>,
 {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         ctx: ExExContext<Node>,
         out_dir: PathBuf,
         stats_path: Option<PathBuf>,
@@ -86,10 +86,10 @@ where
     pub(crate) async fn run(mut self) -> eyre::Result<()> {
         std::fs::create_dir_all(&self.out_dir)
             .wrap_err_with(|| format!("create out_dir {}", self.out_dir.display()))?;
-        if let Some(stats) = &self.stats_path {
-            if let Some(parent) = stats.parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
+        if let Some(stats) = &self.stats_path &&
+            let Some(parent) = stats.parent()
+        {
+            std::fs::create_dir_all(parent).ok();
         }
         info!(out_dir = %self.out_dir.display(), "witness-emit ExEx ready");
 
@@ -163,11 +163,11 @@ where
                 // Ack only up to the last block we durably wrote. If we had a
                 // mid-chain failure, downstream restart will re-deliver the
                 // failed block (and everything after).
-                if let Some(durable) = highest_durable {
-                    if let Err(err) = self.ctx.events.send(ExExEvent::FinishedHeight(durable)) {
-                        warn!(?err, "send FinishedHeight failed (ExEx manager gone?)");
-                        break;
-                    }
+                if let Some(durable) = highest_durable &&
+                    let Err(err) = self.ctx.events.send(ExExEvent::FinishedHeight(durable))
+                {
+                    warn!(?err, "send FinishedHeight failed (ExEx manager gone?)");
+                    break;
                 }
                 if had_failure {
                     warn!(
@@ -321,7 +321,7 @@ fn chrono_rfc3339() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
 }
 
-/// Howard Hinnant's days_from_civil inverse (public domain).
+/// Howard Hinnant's `days_from_civil` inverse (public domain).
 const fn unix_to_civil(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     let day = secs.div_euclid(86400);
     let tod = secs.rem_euclid(86400) as u32;
@@ -396,11 +396,12 @@ mod tests {
     #[test]
     fn unix_to_civil_known_dates() {
         // 2024-01-01T00:00:00Z = 1704067200
-        let (y, m, d, h, mi, s) = unix_to_civil(1704067200);
-        assert_eq!((y, m, d, h, mi, s), (2024, 1, 1, 0, 0, 0));
-        // 2026-05-21T17:35:00Z = 1779730500
-        let (y, m, d, h, mi, s) = unix_to_civil(1779730500);
-        assert_eq!((y, m, d, h, mi, s), (2026, 5, 21, 17, 35, 0));
+        assert_eq!(unix_to_civil(1704067200), (2024, 1, 1, 0, 0, 0));
+        // 2026-05-21T17:35:00Z = 1779384900
+        assert_eq!(unix_to_civil(1779384900), (2026, 5, 21, 17, 35, 0));
+        // 2026-02-29 doesn't exist (not a leap year). Check 2024-02-29 does.
+        // 2024-02-29T00:00:00Z = 1709164800
+        assert_eq!(unix_to_civil(1709164800), (2024, 2, 29, 0, 0, 0));
     }
 
     #[test]

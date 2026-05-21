@@ -45,7 +45,7 @@ struct Cli {
     /// Writer ID; matches `writer-keys/<id>.pub` in the bucket.
     #[arg(long, env = "WITNESS_WRITER_ID", default_value = "primary")]
     writer_id: String,
-    /// S3 endpoint, e.g. https://fsn1.your-objectstorage.com
+    /// S3 endpoint, e.g. `https://fsn1.your-objectstorage.com`.
     #[arg(long, env = "S3_ENDPOINT")]
     endpoint: String,
     /// Bucket name.
@@ -60,7 +60,7 @@ struct Cli {
     /// Stats log file: append-only JSONL per uploaded block.
     #[arg(long, default_value = "/var/lib/witness-emit/uploader-stats.jsonl")]
     stats: PathBuf,
-    /// Cursor file (last uploaded block_number — for restart deduplication).
+    /// Cursor file (last uploaded `block_number` — for restart deduplication).
     #[arg(long, default_value = "/var/lib/witness-emit/uploader-cursor.json")]
     cursor: PathBuf,
     /// Max retries per put.
@@ -339,13 +339,13 @@ async fn handle_stale(
             continue;
         }
         let stem = name.trim_end_matches(".witness.zst.stale");
-        if let Some((num_s, _hash_s)) = stem.split_once('-') {
-            if let Ok(num) = num_s.parse::<u64>() {
-                rewind_to = Some(match rewind_to {
-                    Some(r) => r.min(num.saturating_sub(1)),
-                    None => num.saturating_sub(1),
-                });
-            }
+        if let Some((num_s, _hash_s)) = stem.split_once('-') &&
+            let Ok(num) = num_s.parse::<u64>()
+        {
+            rewind_to = Some(match rewind_to {
+                Some(r) => r.min(num.saturating_sub(1)),
+                None => num.saturating_sub(1),
+            });
         }
         to_delete.push(path);
     }
