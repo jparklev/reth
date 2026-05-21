@@ -569,21 +569,21 @@ fn produce_witness(
             Ok(p) => return Ok(p),
             Err(e) => {
                 let chain = format!("{e:?}");
-                // All known race-condition error families when we're slightly ahead of
-                // what reth's RO snapshot can serve, plus the self-validation failures
-                // that show the produced witness is inconsistent with the actual chain.
-                let transient = chain.contains("not found")
-                    || chain.contains("not yet persisted")
-                    || chain.contains("nonce too low")
-                    || chain.contains("does not exist")
-                    || chain.contains("missing")
-                    || chain.contains("execute_with_state_closure")
-                    || chain.contains("StateRootMismatch")
-                    || chain.contains("InsufficientFunds")
-                    || chain.contains("LackOfFundForMaxFee")
-                    || chain.contains("self-validate")
-                    || chain.contains("blind node");
-                if !transient || attempt >= max_retries {
+                // Retry on raw execution errors (nonce/balance issues that look transient
+                // when state is mid-flush) and missing-block errors. Self-validation
+                // failures are deterministic for a given block + state-snapshot
+                // combination; retrying them just wastes time — skip fast instead.
+                let retriable = !chain.contains("self-validate")
+                    && (chain.contains("not found")
+                        || chain.contains("not yet persisted")
+                        || chain.contains("nonce too low")
+                        || chain.contains("does not exist")
+                        || chain.contains("missing")
+                        || chain.contains("execute_with_state_closure")
+                        || chain.contains("InsufficientFunds")
+                        || chain.contains("LackOfFundForMaxFee")
+                        || chain.contains("blind node"));
+                if !retriable || attempt >= max_retries {
                     return Err(e);
                 }
                 let delay = Duration::from_millis(500 * (1u64 << attempt.min(4)));

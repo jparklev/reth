@@ -209,3 +209,18 @@ Measured on 2026-05-21 (10 mainnet blocks at head-1, average 5.75 MiB/block zst)
 - `reth-codecs-0.3.1` panics on blocks > ~30 behind head — only validate fresh blocks.
 - After `executor.execute(input)`, must use `output.state`, NOT `db.take_bundle()`
   (the latter returns an empty bundle and gives a deterministic wrong root).
+- The publisher targets `best_block_number - target_lag` (default 1), NOT `chain_head - lag`.
+  This puts the parent-state lookup right next to `LatestStateProvider`, requiring at most
+  a single changeset rewind. Targeting blocks further back triggers cache misses in
+  reth's BalStore changeset cache; the DB fallback path sometimes returns inconsistent
+  state that produces invalid witnesses. The publisher self-validates every witness
+  (re-runs the validator pipeline against its own output) and **skips any block** whose
+  produced witness can't be replayed. Skipped blocks are recorded in `stats.jsonl` with
+  `"skipped": true` so they can be backfilled later.
+- The signing key is 32 raw ed25519 seed bytes (same format as
+  `/var/lib/reth/relay-indexer/writer.key`). The matching pubkey lives in S3 at
+  `writer-keys/<id>.pub`. Validators load the pubkey via `--pubkey`.
+- The publisher uploads with `ACL=public-read` (default) so the witnesses can be
+  fetched over plain HTTPS without S3 SigV4. The validator's `--base-url` mode uses
+  this for ~35% faster fetch vs the AWS SDK (parallelizes object + sig fetch, no
+  per-request signing).
