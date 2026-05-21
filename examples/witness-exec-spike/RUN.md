@@ -22,14 +22,18 @@ S3 bucket (witnesses/<hash>.zst)
 - `src/bundle.rs` — `WitnessBundle` envelope + JSON / bincode-zstd helpers (shared).
 - `src/validate_core.rs` — per-block pipeline (decode, reveal, execute, root) shared
   by validator and streaming binaries.
-- `src/producer.rs` — opens a reth datadir read-only, generates an `ExecutionWitness`
-  for one block, writes a `.json` or `.zst` bundle. Needs MDBX. Behind `--features producer`.
-- `src/validator.rs` — fetches one bundle from S3 (or local), validates, reports per-phase
-  wall-clock. No MDBX.
-- `src/stream.rs` — fetches a manifest of N blocks, prefetches witness N+1 while
-  validating N over a bounded tokio channel, reports per-block + aggregate stats
-  (mean / p50 / p99). Optional `--rpc URL` to cross-check `header.stateRoot` against a
-  live node. No MDBX.
+- `src/signing.rs` — ed25519 sign/verify (publisher signs, validators verify).
+- `src/live_manifest.rs` — `head.json` schema (newest-first list of live witnesses).
+- `src/producer.rs` — one-shot: opens a reth datadir read-only, writes a `.json` or `.zst`
+  bundle for a single block. Needs MDBX. Behind `--features producer`.
+- `src/publisher.rs` — **daemon**: subscribes to reth's WS `newHeads`, produces +
+  signs + uploads every canonical block, maintains a signed `head.json`. Needs MDBX.
+  Behind `--features producer`.
+- `src/validator.rs` — fetches one bundle (S3 or HTTP), optionally verifies ed25519
+  signature, validates. No MDBX.
+- `src/stream.rs` — fetches a manifest of N blocks (legacy or live `head.json`), verifies
+  signatures + state roots, reports per-block + aggregate stats. Supports `--base-url`
+  for CDN paths. No MDBX.
 
 Encoding is selected by file/key suffix:
 - `*.json`             → pretty JSON envelope (v0; ~13 MiB / block)
@@ -41,9 +45,51 @@ Encoding is selected by file/key suffix:
 # Validator + streaming binary (no MDBX)
 cargo build --release -p example-witness-exec-spike --bin witness-validator --bin witness-stream
 
-# Producer too (needs MDBX-linkable host)
+# Producer / publisher (need MDBX-linkable host)
 SDKROOT=$(xcrun --show-sdk-path) cargo build --release \
     -p example-witness-exec-spike --features producer
+```
+
+## Continuous publisher (production path)
+
+Subscribes to reth's WS, signs + uploads every canonical block, maintains a signed
+`head.json`. Run on the same box as reth.
+
+```bash
+source /etc/default/relay-l2
+AWS_ACCESS_KEY_ID=$HETZNER_ACCESS_KEY \
+AWS_SECRET_ACCESS_KEY=$HETZNER_SECRET_KEY \
+RUST_LOG=info \
+witness-publisher \
+    --datadir       /var/lib/reth \
+    --ws            ws://127.0.0.1:8547 \
+    --http          http://127.0.0.1:8545 \
+    --signing-key   /var/lib/reth/relay-indexer/writer.key \
+    --writer-id     primary \
+    --endpoint      https://fsn1.your-objectstorage.com \
+    --bucket        reth-spike-fsn1 \
+    --region        fsn1 \
+    --prefix        witnesses/live \
+    --cursor        /var/lib/witness-publisher/cursor.json \
+    --stats         /var/lib/witness-publisher/stats.jsonl \
+    --target-lag    3
+```
+
+Or via systemd (unit at `examples/witness-exec-spike/witness-publisher.service`):
+
+```bash
+sudo cp witness-publisher.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start witness-publisher
+sudo systemctl status witness-publisher
+journalctl -u witness-publisher -f
+```
+
+Each successful publish emits a JSONL line to `--stats` like:
+
+```json
+{"ts":"2026-05-21T...","block_number":25145987,"size_bytes":3712418,"e2e_ms":487,
+ "produce_ms":312,"upload_ms":174,"tx_count":214,"gas_used":18234567,...}
 ```
 
 ## Step 1 — Produce a witness from a reth datadir
@@ -100,7 +146,7 @@ Manifest format (uploaded once by the producer driver script):
 }
 ```
 
-Run:
+Run against the legacy streaming manifest (no signatures):
 
 ```bash
 ./witness-stream \
@@ -109,6 +155,29 @@ Run:
     --region   fsn1 \
     --manifest witnesses/streaming/manifest.json \
     --rpc      http://localhost:8545   # optional: cross-check header.stateRoot
+```
+
+Or against the live signed publisher manifest (recommended):
+
+```bash
+./witness-stream \
+    --endpoint https://fsn1.your-objectstorage.com \
+    --bucket   reth-spike-fsn1 \
+    --region   fsn1 \
+    --manifest witnesses/live/head.json \
+    --pubkey   ./writer-keys/primary.pub
+```
+
+To fetch through an HTTP CDN URL instead of the S3 API (faster cold connections
+since reqwest pools + parallelizes the `.zst` + `.zst.sig` fetches):
+
+```bash
+./witness-stream \
+    --base-url https://fsn1.your-objectstorage.com/reth-spike-fsn1 \
+    --bucket   reth-spike-fsn1 \
+    --region   fsn1 \
+    --manifest witnesses/live/head.json \
+    --pubkey   ./writer-keys/primary.pub
 ```
 
 Per-block "wall" is measured from when fetched bytes land in the channel until

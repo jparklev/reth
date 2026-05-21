@@ -35,7 +35,7 @@ use std::{
 
 #[path = "bundle.rs"]
 mod bundle;
-pub(crate) use bundle::{decode_bundle, Encoding, WitnessBundle};
+pub(crate) use bundle::{decode_bundle, encode_bundle, Encoding, WitnessBundle};
 
 /// Per-phase timings for one validated block. Fields are read by the
 /// single-block validator binary; the streaming binary uses `total_compute`

@@ -30,6 +30,10 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+#[path = "live_manifest.rs"]
+mod live_manifest;
+#[path = "signing.rs"]
+mod signing;
 #[path = "validate_core.rs"]
 mod validate_core;
 use validate_core::{decode_bundle, validate_bundle, Encoding, ValidationOutcome};
@@ -46,14 +50,25 @@ struct Cli {
     /// Region (Hetzner: fsn1).
     #[arg(long, env = "S3_REGION", default_value = "fsn1")]
     region: String,
-    /// Manifest object key (JSON: { "blocks": [{ "number", "hash", "key" }, ...] }).
-    #[arg(long, env = "S3_MANIFEST", default_value = "witnesses/streaming/manifest.json")]
+    /// Manifest object key. Two formats supported:
+    ///   - legacy `{"blocks": [{ "number", "hash", "key" }, ...]}`
+    ///   - live `head.json` from witness-publisher (newest-first entries)
+    #[arg(long, env = "S3_MANIFEST", default_value = "witnesses/live/head.json")]
     manifest: String,
     /// Optional Ethereum RPC URL to cross-validate state roots against
     /// (e.g. http://prod-reth:8545). When set, fetches eth_getBlockByHash
     /// and asserts header.state_root matches the computed root.
     #[arg(long, env = "ETH_RPC")]
     rpc: Option<String>,
+    /// CDN base URL. When set, fetches `<base_url>/<object_key>` over plain HTTPS
+    /// instead of the S3 API.
+    #[arg(long, env = "WITNESS_BASE_URL")]
+    base_url: Option<String>,
+    /// Path to the 32-byte ed25519 public key. When set, the validator will
+    /// fetch `<key>.sig` for each witness AND the manifest, and reject any
+    /// witness/manifest whose signature does not verify.
+    #[arg(long, env = "WITNESS_PUBKEY")]
+    pubkey: Option<std::path::PathBuf>,
     /// Prefetch queue depth (channel capacity). Default 2 keeps memory bounded.
     #[arg(long, default_value = "2")]
     prefetch: usize,
@@ -63,6 +78,10 @@ struct Cli {
     /// Stop after this many blocks (0 = all).
     #[arg(long, default_value = "0")]
     limit: usize,
+    /// If using the live manifest, process in ascending block order (oldest-first).
+    /// Default true: useful for "catch up from where I left off" semantics.
+    #[arg(long, default_value = "true")]
+    ascending: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -75,6 +94,22 @@ struct ManifestEntry {
     number: u64,
     hash: alloy_primitives::B256,
     key: String,
+}
+
+/// Parse a manifest blob — accepts either the legacy `{blocks: [...]}` shape
+/// or the publisher's `head.json` (live) shape.
+fn parse_manifest(bytes: &[u8]) -> eyre::Result<Vec<ManifestEntry>> {
+    if let Ok(legacy) = serde_json::from_slice::<Manifest>(bytes) {
+        return Ok(legacy.blocks);
+    }
+    let live: live_manifest::LiveManifest =
+        serde_json::from_slice(bytes).wrap_err("manifest is neither legacy nor live shape")?;
+    let mut entries: Vec<ManifestEntry> = live
+        .entries
+        .into_iter()
+        .map(|e| ManifestEntry { number: e.block_number, hash: e.block_hash, key: e.object_key })
+        .collect();
+    Ok(entries.split_off(0))
 }
 
 /// One item carried from fetcher to validator.
@@ -102,19 +137,52 @@ fn main() -> eyre::Result<()> {
 }
 
 async fn run(cli: Cli, spec: Arc<ChainSpec>) -> eyre::Result<()> {
-    // 1. Build S3 client + fetch manifest.
+    // 0. Optional verifying key for signature checks.
+    let verifying_key = match &cli.pubkey {
+        Some(p) => Some(signing::load_verifying_key(p)?),
+        None => None,
+    };
+
+    // 1. Build S3 client + fetch manifest (+ optional sig).
     let client = build_s3_client(&cli).await;
-    let manifest_bytes = s3_get(&client, &cli.bucket, &cli.manifest)
-        .await
-        .wrap_err_with(|| format!("fetch manifest s3://{}/{}", cli.bucket, cli.manifest))?;
-    let manifest: Manifest = serde_json::from_slice(&manifest_bytes).wrap_err("parse manifest")?;
-    let entries: Vec<ManifestEntry> = manifest
-        .blocks
+    let http_client = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let (manifest_bytes, manifest_sig) = fetch_object(
+        &client,
+        &http_client,
+        &cli.bucket,
+        cli.base_url.as_deref(),
+        &cli.manifest,
+        verifying_key.is_some(),
+    )
+    .await
+    .wrap_err_with(|| format!("fetch manifest {}", cli.manifest))?;
+
+    if let (Some(vk), Some(sig)) = (&verifying_key, &manifest_sig) {
+        signing::verify(vk, &manifest_bytes, sig).wrap_err("manifest sig verify")?;
+    }
+
+    let mut entries = parse_manifest(&manifest_bytes).wrap_err("parse manifest")?;
+    // Live manifests are newest-first; reverse if ascending requested.
+    if cli.ascending {
+        entries.sort_by_key(|e| e.number);
+    }
+    let entries: Vec<ManifestEntry> = entries
         .into_iter()
         .skip(cli.skip)
         .take(if cli.limit == 0 { usize::MAX } else { cli.limit })
         .collect();
-    println!("manifest: {} entries (skip={} limit={})", entries.len(), cli.skip, cli.limit);
+    println!(
+        "manifest: {} entries (skip={} limit={}, signed={}, base_url={})",
+        entries.len(),
+        cli.skip,
+        cli.limit,
+        manifest_sig.is_some(),
+        cli.base_url.as_deref().unwrap_or("<s3>"),
+    );
     if entries.is_empty() {
         eyre::bail!("no entries to validate");
     }
@@ -122,21 +190,53 @@ async fn run(cli: Cli, spec: Arc<ChainSpec>) -> eyre::Result<()> {
     // 2. Spawn fetcher: pushes fetched bytes into a bounded channel.
     let (tx, mut rx) = mpsc::channel::<eyre::Result<FetchedItem>>(cli.prefetch);
     let bucket = cli.bucket.clone();
+    let base_url = cli.base_url.clone();
     let fetch_entries = entries.clone();
     let client_for_fetch = client.clone();
+    let http_for_fetch = http_client.clone();
+    let need_sig = verifying_key.is_some();
+    let vk_for_fetch = verifying_key;
     let fetcher = tokio::spawn(async move {
         for entry in fetch_entries {
             let started = Instant::now();
-            let result = s3_get(&client_for_fetch, &bucket, &entry.key).await.map(|bytes| {
-                let encoding = Encoding::from_path(&entry.key);
-                FetchedItem {
-                    entry: entry.clone(),
-                    bytes,
-                    encoding,
-                    fetch_elapsed: started.elapsed(),
-                    arrived_at: Instant::now(),
+            let result = match fetch_object(
+                &client_for_fetch,
+                &http_for_fetch,
+                &bucket,
+                base_url.as_deref(),
+                &entry.key,
+                need_sig,
+            )
+            .await
+            {
+                Ok((bytes, sig)) => {
+                    // Verify-on-arrival, before validating: fail-fast on bad signature.
+                    if let (Some(vk), Some(s)) = (&vk_for_fetch, &sig) {
+                        if let Err(e) = signing::verify(vk, &bytes, s) {
+                            Err(eyre::eyre!("block {}: sig verify failed: {e}", entry.number))
+                        } else {
+                            Ok(FetchedItem {
+                                entry: entry.clone(),
+                                bytes,
+                                encoding: Encoding::from_path(&entry.key),
+                                fetch_elapsed: started.elapsed(),
+                                arrived_at: Instant::now(),
+                            })
+                        }
+                    } else if vk_for_fetch.is_some() {
+                        Err(eyre::eyre!("block {}: --pubkey set but no sig fetched", entry.number))
+                    } else {
+                        Ok(FetchedItem {
+                            entry: entry.clone(),
+                            bytes,
+                            encoding: Encoding::from_path(&entry.key),
+                            fetch_elapsed: started.elapsed(),
+                            arrived_at: Instant::now(),
+                        })
+                    }
                 }
-            });
+                Err(e) => Err(e),
+            };
             if tx.send(result).await.is_err() {
                 break;
             }
@@ -317,6 +417,44 @@ async fn s3_get(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> eyre::R
         .wrap_err_with(|| format!("GET s3://{bucket}/{key}"))?;
     let bytes = resp.body.collect().await.wrap_err("collect body")?.into_bytes().to_vec();
     Ok(bytes)
+}
+
+/// Fetch `(object, optional_sig)` using whichever transport is configured.
+/// When `base_url` is set, both fetches go over HTTP and run concurrently; this
+/// dramatically reduces wall time vs sequential S3-API GETs on cold connections.
+async fn fetch_object(
+    s3: &aws_sdk_s3::Client,
+    http: &reqwest::Client,
+    bucket: &str,
+    base_url: Option<&str>,
+    key: &str,
+    fetch_sig: bool,
+) -> eyre::Result<(Vec<u8>, Option<Vec<u8>>)> {
+    if let Some(base) = base_url {
+        let bytes_fut = http_get(http, base, key);
+        let sig_fut = async {
+            if fetch_sig {
+                Ok::<_, eyre::Report>(Some(http_get(http, base, &format!("{key}.sig")).await?))
+            } else {
+                Ok(None)
+            }
+        };
+        let (b, s) = tokio::try_join!(bytes_fut, sig_fut)?;
+        Ok((b, s))
+    } else {
+        let bytes = s3_get(s3, bucket, key).await?;
+        let sig = if fetch_sig { Some(s3_get(s3, bucket, &format!("{key}.sig")).await?) } else { None };
+        Ok((bytes, sig))
+    }
+}
+
+async fn http_get(client: &reqwest::Client, base: &str, key: &str) -> eyre::Result<Vec<u8>> {
+    let url = format!("{}/{}", base.trim_end_matches('/'), key);
+    let resp = client.get(&url).send().await.wrap_err_with(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        eyre::bail!("GET {url}: HTTP {}", resp.status());
+    }
+    Ok(resp.bytes().await?.to_vec())
 }
 
 // ============================================================================

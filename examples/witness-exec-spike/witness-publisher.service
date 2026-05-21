@@ -1,0 +1,40 @@
+[Unit]
+Description=witness-publisher — continuous canonical-head witness producer (sidecar)
+After=network-online.target reth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+# /etc/default/relay-l2 already exports HETZNER_ACCESS_KEY / HETZNER_SECRET_KEY.
+EnvironmentFile=/etc/default/relay-l2
+Environment=AWS_ACCESS_KEY_ID=%{HETZNER_ACCESS_KEY}
+Environment=AWS_SECRET_ACCESS_KEY=%{HETZNER_SECRET_KEY}
+Environment=RUST_LOG=info
+ExecStartPre=/bin/mkdir -p /var/lib/witness-publisher
+# We use a wrapping shell so that HETZNER_* env vars get re-expanded into AWS_*.
+ExecStart=/bin/bash -c '\
+    source /etc/default/relay-l2 && \
+    AWS_ACCESS_KEY_ID=$HETZNER_ACCESS_KEY \
+    AWS_SECRET_ACCESS_KEY=$HETZNER_SECRET_KEY \
+    exec /usr/local/bin/witness-publisher \
+        --datadir /var/lib/reth \
+        --ws ws://127.0.0.1:8547 \
+        --http http://127.0.0.1:8545 \
+        --signing-key /var/lib/reth/relay-indexer/writer.key \
+        --writer-id primary \
+        --endpoint https://fsn1.your-objectstorage.com \
+        --bucket reth-spike-fsn1 \
+        --region fsn1 \
+        --prefix witnesses/live \
+        --cursor /var/lib/witness-publisher/cursor.json \
+        --stats /var/lib/witness-publisher/stats.jsonl \
+        --target-lag 1'
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+StandardOutput=append:/var/log/witness-publisher.log
+StandardError=append:/var/log/witness-publisher.log
+
+[Install]
+WantedBy=multi-user.target
