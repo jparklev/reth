@@ -147,6 +147,7 @@ members = [
     "examples/precompile-cache/",
     "examples/txpool-tracing/",
     "examples/custom-beacon-withdrawals",
+    "examples/witness-exec-spike/",
     "testing/ef-tests/",
     "testing/testing-utils",
     "testing/runner",

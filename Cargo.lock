@@ -4338,6 +4338,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-witness-exec-spike"
+version = "0.0.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.4",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-debug",
+ "alloy-trie",
+ "aws-config",
+ "aws-sdk-s3",
+ "clap",
+ "eyre",
+ "itertools 0.14.0",
+ "rayon",
+ "reth-chainspec",
+ "reth-db",
+ "reth-ethereum",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-execution-errors",
+ "reth-node-ethereum",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-revm",
+ "reth-storage-api",
+ "reth-tasks",
+ "reth-trie",
+ "reth-trie-common",
+ "reth-trie-sparse",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
 name = "exex-subscription"
 version = "2.2.0"
 dependencies = [

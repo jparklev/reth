@@ -1,0 +1,74 @@
+[package]
+name = "example-witness-exec-spike"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "witness-producer"
+path = "src/producer.rs"
+required-features = ["producer"]
+
+[[bin]]
+name = "witness-validator"
+path = "src/validator.rs"
+
+[dependencies]
+# Producer-only deps (require MDBX). Validator-only build can skip these.
+reth-ethereum = { workspace = true, features = ["node", "evm"], optional = true }
+reth-provider = { workspace = true, optional = true }
+reth-db = { workspace = true, optional = true }
+reth-node-ethereum = { workspace = true, optional = true }
+reth-tasks = { workspace = true, optional = true }
+reth-storage-api = { workspace = true, optional = true }
+
+# Shared deps (no MDBX).
+reth-chainspec.workspace = true
+reth-evm.workspace = true
+reth-evm-ethereum.workspace = true
+reth-revm.workspace = true
+reth-primitives-traits = { workspace = true, features = ["serde"] }
+reth-ethereum-primitives = { workspace = true, features = ["serde"] }
+reth-trie.workspace = true
+reth-trie-common = { workspace = true, features = ["serde"] }
+reth-trie-sparse.workspace = true
+reth-execution-errors.workspace = true
+
+# alloy
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-rpc-types-debug.workspace = true
+alloy-trie.workspace = true
+
+# S3 — copied from nippy-jar pattern
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
+
+# misc
+clap = { workspace = true, features = ["derive", "env"] }
+eyre.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+rayon.workspace = true
+itertools.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+producer = [
+    "dep:reth-ethereum",
+    "dep:reth-provider",
+    "dep:reth-db",
+    "dep:reth-node-ethereum",
+    "dep:reth-tasks",
+    "dep:reth-storage-api",
+]
