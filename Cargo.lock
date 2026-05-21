@@ -4338,6 +4338,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-witness-emit-exex"
+version = "0.0.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-debug",
+ "aws-config",
+ "aws-sdk-s3",
+ "bincode",
+ "chrono",
+ "clap",
+ "ed25519-dalek",
+ "eyre",
+ "futures-util",
+ "hex",
+ "reth-ethereum",
+ "reth-evm",
+ "reth-revm",
+ "reth-storage-api",
+ "reth-trie-common",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "zstd",
+]
+
+[[package]]
 name = "example-witness-exec-spike"
 version = "0.0.0"
 dependencies = [
@@ -4360,15 +4391,12 @@ dependencies = [
  "rayon",
  "reqwest 0.13.2",
  "reth-chainspec",
- "reth-cli-util",
  "reth-db",
  "reth-ethereum",
  "reth-ethereum-primitives",
  "reth-evm",
  "reth-evm-ethereum",
  "reth-execution-errors",
- "reth-node-api",
- "reth-node-core",
  "reth-node-ethereum",
  "reth-primitives-traits",
  "reth-provider",

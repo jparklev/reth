@@ -1,0 +1,33 @@
+[Unit]
+Description=witness-uploader — picks up ExEx-produced witnesses and uploads them
+After=network-online.target reth-witness-emit-node.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/default/relay-l2
+Environment=RUST_LOG=info
+ExecStartPre=/bin/mkdir -p /var/lib/witness-emit
+ExecStart=/bin/bash -c '\
+    source /etc/default/relay-l2 && \
+    AWS_ACCESS_KEY_ID=$HETZNER_ACCESS_KEY \
+    AWS_SECRET_ACCESS_KEY=$HETZNER_SECRET_KEY \
+    exec /usr/local/bin/witness-uploader \
+        --emit-dir /var/lib/witness-emit/inbox \
+        --signing-key /var/lib/reth/relay-indexer/writer.key \
+        --writer-id primary \
+        --endpoint https://fsn1.your-objectstorage.com \
+        --bucket reth-spike-fsn1 \
+        --region fsn1 \
+        --prefix witnesses/exex \
+        --stats /var/lib/witness-emit/uploader-stats.jsonl \
+        --cursor /var/lib/witness-emit/uploader-cursor.json'
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+StandardOutput=append:/var/log/witness-uploader.log
+StandardError=append:/var/log/witness-uploader.log
+
+[Install]
+WantedBy=multi-user.target

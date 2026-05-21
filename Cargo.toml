@@ -148,6 +148,7 @@ members = [
     "examples/txpool-tracing/",
     "examples/custom-beacon-withdrawals",
     "examples/witness-exec-spike/",
+    "examples/witness-emit-exex/",
     "testing/ef-tests/",
     "testing/testing-utils",
     "testing/runner",

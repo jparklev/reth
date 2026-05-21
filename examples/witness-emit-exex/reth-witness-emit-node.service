@@ -1,0 +1,37 @@
+[Unit]
+Description=reth-witness-emit-node — reth node with witness-emitting ExEx
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+# Run on a DIFFERENT datadir and DIFFERENT ports than prod reth.
+EnvironmentFile=/etc/default/relay-l2
+Environment=RUST_LOG=info,witness_emit=info
+ExecStartPre=/bin/mkdir -p /var/lib/witness-emit
+# Ports chosen to NOT collide with prod reth (which uses 8545/8546/8547/9001).
+# Auth port for the engine API still required even though we have no CL.
+ExecStart=/usr/local/bin/reth-witness-emit-node node \
+    --datadir /var/lib/reth-witness-emit \
+    --chain mainnet \
+    --http \
+    --http.addr 127.0.0.1 \
+    --http.port 18545 \
+    --ws \
+    --ws.addr 127.0.0.1 \
+    --ws.port 18547 \
+    --authrpc.port 18551 \
+    --metrics 127.0.0.1:19001 \
+    --port 30403 \
+    --discovery.port 30403 \
+    --witness-emit-dir /var/lib/witness-emit/inbox \
+    --witness-stats /var/lib/witness-emit/exex-stats.jsonl
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+StandardOutput=append:/var/log/reth-witness-emit-node.log
+StandardError=append:/var/log/reth-witness-emit-node.log
+
+[Install]
+WantedBy=multi-user.target
