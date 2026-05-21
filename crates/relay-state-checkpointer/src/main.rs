@@ -17,8 +17,14 @@
 //!
 //! ## Operational stance
 //!
-//! - Checkpoint binds to the local node's current state — callers pause reth or run on a paused
-//!   replica.
+//! - Checkpoint binds to the local node's current state — callers MUST pause reth (or run on a
+//!   paused replica) before invoking. Live emit is unsupported: MDBX's `HashedAccounts` and the
+//!   static_files `Headers` segment advance independently in engine mode, so a snapshot taken
+//!   against a live node can hand back a `chain_info().best_number=N` paired with a header for
+//!   block N+k. The walked hashed plain state would then reflect block N while the manifest's
+//!   `state_root` belongs to N+k, which makes the importer's `compute_state_root_chunked`
+//!   verification fail by construction. The startup consistency check below catches this and aborts
+//!   with a clear error rather than emitting a corrupt checkpoint.
 //! - No trie recomputation; we trust the local node's canonical header for `state_root`.
 //! - Streaming per-shard: HashedAccounts/HashedStorages are sorted by hashed key, so we accumulate
 //!   one shard's worth of rows in memory, flush, and move on. Peak memory ≈ one shard.
@@ -44,8 +50,8 @@ use reth_db_api::{
 };
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_provider::{
-    providers::ProviderNodeTypes, BlockNumReader, DatabaseProviderFactory, HeaderProvider,
-    ProviderFactory,
+    providers::ProviderNodeTypes, BlockNumReader, DBProvider, DatabaseProviderFactory,
+    HeaderProvider, ProviderFactory,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -205,10 +211,51 @@ async fn async_main(cli: Cli, task_runtime: reth_tasks::Runtime) -> eyre::Result
     let provider = factory.database_provider_ro()?.disable_long_read_transaction_safety();
     let info = provider.chain_info()?;
     let block_number = info.best_number;
-    let block_hash = format!("0x{}", hex::encode(info.best_hash.as_slice()));
+    let block_hash_b256 = info.best_hash;
+    let block_hash = format!("0x{}", hex::encode(block_hash_b256.as_slice()));
     let header = provider
         .header_by_number(block_number)?
         .ok_or_else(|| eyre!("header for best block {block_number} not in db"))?;
+
+    // CONSISTENCY CHECK: `chain_info().best_number` reads from MDBX
+    // (`StageId::Finish`), while `chain_info().best_hash` and
+    // `header_by_number(N)` read from static_files. In engine mode these two
+    // storage layers advance independently, so a snapshot taken while prod
+    // reth is live can hand back a `best_number=N` paired with a header /
+    // hash for some other block N+k — the bucket's claimed `state_root` then
+    // belongs to N+k while the walked HashedAccounts/HashedStorages reflect
+    // block N. The importer's `compute_state_root_chunked` produces N's root
+    // and fails verification against the N+k root from the manifest.
+    //
+    // Empirically observed against a live datadir: `best_number=25138564`
+    // came back paired with a header for block 25139076 (Δ=512). Verify
+    // header.number == block_number AND header.hash == best_hash before
+    // continuing. If either drifts the emit is unrecoverable for this
+    // snapshot; the caller should pause prod reth (or run on a paused
+    // replica per the module's operational stance above) and retry.
+    let computed_header_hash = header.hash_slow();
+    if header.number != block_number {
+        return Err(eyre!(
+            "writer captured inconsistent (block_number, header) pair: \
+             chain_info().best_number={block_number} but \
+             header_by_number({block_number}).number={}. \
+             MDBX and static_files are out of sync because prod reth is live. \
+             Pause prod reth (or run on a paused replica) and retry.",
+            header.number,
+        ));
+    }
+    if computed_header_hash != block_hash_b256 {
+        return Err(eyre!(
+            "writer captured inconsistent (block_hash, header) pair at \
+             block {block_number}: chain_info().best_hash=0x{} but \
+             header.hash_slow()=0x{}. MDBX and static_files are out of sync \
+             because prod reth is live. Pause prod reth (or run on a paused \
+             replica) and retry.",
+            hex::encode(block_hash_b256.as_slice()),
+            hex::encode(computed_header_hash.as_slice()),
+        ));
+    }
+
     let state_root = Some(format!("0x{}", hex::encode(header.state_root.as_slice())));
     info!(
         block_number,

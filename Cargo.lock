@@ -8534,6 +8534,7 @@ dependencies = [
  "object_store",
  "reth-bucket-state-client",
  "reth-cli-commands",
+ "reth-db",
  "reth-db-api",
  "reth-ethereum-cli",
  "reth-node-ethereum",

@@ -11,10 +11,10 @@
 //!     --shards 0,1,512,1024,2048,4095
 //!
 //! For each shard:
-//!   * decode `shard-XXXX/accounts-part-*.vortex` from disk cache,
-//!     sort by hashed_address, sha256 over `(h_addr, nonce_be8, balance_be32, code_hash)`.
-//!   * walk MDBX `HashedAccounts` in `[shard_min, shard_max]` and hash with the
-//!     same canonical encoding.
+//!   * decode `shard-XXXX/accounts-part-*.vortex` from disk cache, sort by hashed_address, sha256
+//!     over `(h_addr, nonce_be8, balance_be32, code_hash)`.
+//!   * walk MDBX `HashedAccounts` in `[shard_min, shard_max]` and hash with the same canonical
+//!     encoding.
 //!   * same for storage: `(h_addr, h_slot, value_be32)` sorted by `(h_addr, h_slot)`.
 //!   * print the two shas + a short `OK/MISMATCH` summary.
 //!
@@ -35,9 +35,7 @@ use reth_db_api::{
     transaction::DbTx,
 };
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_provider::{
-    providers::ProviderNodeTypes, DatabaseProviderFactory, ProviderFactory,
-};
+use reth_provider::{providers::ProviderNodeTypes, DatabaseProviderFactory, ProviderFactory};
 use sha2::{Digest, Sha256};
 
 #[derive(Parser, Debug)]
@@ -108,11 +106,7 @@ async fn run(cli: Cli, task_runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn probe_shard<N>(
-    cli: &Cli,
-    factory: &ProviderFactory<N>,
-    shard: u32,
-) -> eyre::Result<()>
+async fn probe_shard<N>(cli: &Cli, factory: &ProviderFactory<N>, shard: u32) -> eyre::Result<()>
 where
     N: ProviderNodeTypes,
 {
@@ -352,10 +346,7 @@ where
                         diffs += 1;
                         b = bi.next();
                     } else {
-                        println!(
-                            "    ONLY-IN-MDBX h_addr={} h_slot={} value={}",
-                            mr.0, mr.1, mr.2
-                        );
+                        println!("    ONLY-IN-MDBX h_addr={} h_slot={} value={}", mr.0, mr.1, mr.2);
                         diffs += 1;
                         m = mi.next();
                     }
