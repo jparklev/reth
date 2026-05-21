@@ -13,7 +13,7 @@ file="${1:-/var/lib/witness-publisher/stats.jsonl}"
 jq -s '
   def percentile($p): sort | .[(length * $p) | floor];
   def summary(field; key):
-    map(select(.[field] != null) | .[field]) | (length as $n |
+    map(select(.[field] != null) | .[field]) | length as $n |
     if $n == 0 then {} else
       { ("mean_" + key): (add / $n | floor),
         ("p50_"  + key): percentile(0.50),
@@ -21,16 +21,17 @@ jq -s '
         ("min_"  + key): min,
         ("max_"  + key): max,
         ("n_"    + key): $n }
-    end);
+    end;
 
-  (map(select(.skipped != true)) as $ok) |
-  (map(select(.skipped == true)) as $skip) |
+  . as $all |
+  ($all | map(select(.skipped != true))) as $ok |
+  ($all | map(select(.skipped == true)))  as $skip |
   {
-    period: { first_block: (min_by(.block_number).block_number),
-              last_block:  (max_by(.block_number).block_number),
-              first_ts:    (min_by(.ts).ts),
-              last_ts:     (max_by(.ts).ts) },
-    successful: ($ok | length),
+    period: { first_block: ($all | min_by(.block_number).block_number),
+              last_block:  ($all | max_by(.block_number).block_number),
+              first_ts:    ($all | min_by(.ts).ts),
+              last_ts:     ($all | max_by(.ts).ts) },
+    successful: ($ok   | length),
     skipped:    ($skip | length),
     total_bytes: ($ok | map(.size_bytes // 0) | add),
     e2e_ms_stats:    ($ok | summary("e2e_ms"; "e2e_ms")),
