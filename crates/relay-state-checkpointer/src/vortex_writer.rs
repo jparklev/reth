@@ -75,6 +75,50 @@ pub(crate) async fn code_chunk(rows: &[(B256, Vec<u8>)]) -> Result<Vec<u8>> {
     write_vortex(data).await
 }
 
+/// v5 schema: raw `(key_bytes, value_bytes)` for `AccountsTrie`.
+///
+/// The writer captures the on-disk MDBX bytes verbatim — 33-byte
+/// `PackedStoredNibbles::to_compact_array()` keys and Compact-encoded
+/// `BranchNodeCompact` values. The consumer writes them back through
+/// `RawTable<PackedAccountsTrie>` without re-encoding, so the path is
+/// byte-faithful by construction.
+pub(crate) async fn accounts_trie_chunk(rows: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<u8>> {
+    let len = rows.len();
+    let data = VortexStructArray::new(
+        FieldNames::from(["key_bytes", "value_bytes"]),
+        vec![
+            binary_required(rows.iter().map(|(k, _)| k.clone()).collect()),
+            binary_required(rows.iter().map(|(_, v)| v.clone()).collect()),
+        ],
+        len,
+        Validity::NonNullable,
+    )
+    .into_array();
+    write_vortex(data).await
+}
+
+/// v5 schema: raw `(hashed_address, subkey_bytes, value_bytes)` for
+/// `StoragesTrie`. `subkey_bytes` is the 33-byte
+/// `PackedStoredNibblesSubKey::to_compact_array()` from the dup row, and
+/// `value_bytes` is the Compact-encoded `BranchNodeCompact` (the
+/// `nibbles` prefix of `PackedStorageTrieEntry` is omitted because the
+/// subkey carries it).
+pub(crate) async fn storages_trie_chunk(rows: &[(B256, Vec<u8>, Vec<u8>)]) -> Result<Vec<u8>> {
+    let len = rows.len();
+    let data = VortexStructArray::new(
+        FieldNames::from(["hashed_address", "subkey_bytes", "node_bytes"]),
+        vec![
+            binary_required(rows.iter().map(|(a, _, _)| a.as_slice().to_vec()).collect()),
+            binary_required(rows.iter().map(|(_, s, _)| s.clone()).collect()),
+            binary_required(rows.iter().map(|(_, _, v)| v.clone()).collect()),
+        ],
+        len,
+        Validity::NonNullable,
+    )
+    .into_array();
+    write_vortex(data).await
+}
+
 async fn write_vortex(data: vortex::array::ArrayRef) -> Result<Vec<u8>> {
     let session = VortexSession::default();
     let mut out = ByteBufferMut::empty();

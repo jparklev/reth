@@ -66,6 +66,29 @@ pub struct CodeRow {
     pub code: Bytes,
 }
 
+/// v5: a single `AccountsTrie` row, raw bytes from MDBX. `key_bytes` is
+/// the 33-byte `PackedStoredNibbles::to_compact_array()`; `value_bytes`
+/// is the Compact-encoded `BranchNodeCompact`. The importer writes both
+/// columns back through `RawTable<PackedAccountsTrie>` without
+/// re-encoding.
+#[derive(Debug, Clone)]
+pub struct AccountsTrieRow {
+    pub key_bytes: Vec<u8>,
+    pub value_bytes: Vec<u8>,
+}
+
+/// v5: a single `StoragesTrie` dup row. `subkey_bytes` is the 33-byte
+/// `PackedStoredNibblesSubKey::to_compact_array()`; `node_bytes` is the
+/// Compact-encoded `BranchNodeCompact`. The importer reassembles the
+/// MDBX dup value as `subkey_bytes ++ node_bytes` and writes it
+/// through `RawDupSort<PackedStoragesTrie>`.
+#[derive(Debug, Clone)]
+pub struct StoragesTrieRow {
+    pub hashed_address: B256,
+    pub subkey_bytes: Vec<u8>,
+    pub node_bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AccountDeltaRow {
     pub block_num: u64,
@@ -169,6 +192,46 @@ where
     check_len(n, codes.len(), "code")?;
     for (hash, code) in hashes.into_iter().zip(codes) {
         sink(CodeRow { code_hash: hash, code });
+    }
+    Ok(n)
+}
+
+pub async fn decode_accounts_trie_chunk<F>(
+    bytes: Vec<u8>,
+    mut sink: F,
+) -> Result<usize, BucketStateClientError>
+where
+    F: FnMut(AccountsTrieRow),
+{
+    let arr = read_struct(bytes).await?;
+    let mut ctx = VortexSession::default().create_execution_ctx();
+    let keys = varbin_owned(&mut ctx, &arr, "key_bytes")?;
+    let values = varbin_owned(&mut ctx, &arr, "value_bytes")?;
+    let n = keys.len();
+    check_len(n, values.len(), "value_bytes")?;
+    for (k, v) in keys.into_iter().zip(values) {
+        sink(AccountsTrieRow { key_bytes: k, value_bytes: v });
+    }
+    Ok(n)
+}
+
+pub async fn decode_storages_trie_chunk<F>(
+    bytes: Vec<u8>,
+    mut sink: F,
+) -> Result<usize, BucketStateClientError>
+where
+    F: FnMut(StoragesTrieRow),
+{
+    let arr = read_struct(bytes).await?;
+    let mut ctx = VortexSession::default().create_execution_ctx();
+    let addrs = varbin_b256(&mut ctx, &arr, "hashed_address")?;
+    let subkeys = varbin_owned(&mut ctx, &arr, "subkey_bytes")?;
+    let nodes = varbin_owned(&mut ctx, &arr, "node_bytes")?;
+    let n = addrs.len();
+    check_len(n, subkeys.len(), "subkey_bytes")?;
+    check_len(n, nodes.len(), "node_bytes")?;
+    for ((addr, sk), nd) in addrs.into_iter().zip(subkeys).zip(nodes) {
+        sink(StoragesTrieRow { hashed_address: addr, subkey_bytes: sk, node_bytes: nd });
     }
     Ok(n)
 }
@@ -384,6 +447,24 @@ fn varbin_u256(
         for v in iter {
             let bytes = v.unwrap_or(&[]);
             out.push(U256::from_be_slice(bytes));
+        }
+        out
+    }))
+}
+
+/// Variable-length payloads collected into owned `Vec<u8>` rows.
+/// Used by the v5 trie decoders, which hand raw bytes straight to
+/// `RawTable` / `RawDupSort` writes — no decoding, no per-row Arc.
+fn varbin_owned(
+    ctx: &mut ExecutionCtx,
+    array: &VortexStructArray,
+    name: &str,
+) -> Result<Vec<Vec<u8>>, BucketStateClientError> {
+    let values = varbin_array(ctx, array, name)?;
+    Ok(values.with_iterator(|iter| {
+        let mut out = Vec::with_capacity(iter.size_hint().0);
+        for v in iter {
+            out.push(v.unwrap_or(&[]).to_vec());
         }
         out
     }))

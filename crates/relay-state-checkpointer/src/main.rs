@@ -44,8 +44,8 @@ use object_store::{
 };
 use reth_cli_commands::common::{AccessRights, CliNodeTypes, Environment, EnvironmentArgs};
 use reth_db_api::{
-    cursor::DbCursorRO,
-    tables::{Bytecodes, HashedAccounts, HashedStorages},
+    cursor::{DbCursorRO, DbDupCursorRO},
+    tables::{Bytecodes, HashedAccounts, HashedStorages, RawDupSort, RawTable},
     transaction::DbTx,
 };
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
@@ -272,9 +272,13 @@ async fn async_main(cli: Cli, task_runtime: reth_tasks::Runtime) -> eyre::Result
         accounts = dump.total_accounts,
         storage_rows = dump.total_storage,
         code_blobs = dump.total_code,
+        accounts_trie_rows = dump.total_accounts_trie,
+        storages_trie_rows = dump.total_storages_trie,
         account_chunks = dump.account_chunks.len(),
         storage_chunks = dump.storage_chunks.len(),
         code_chunks = dump.code_chunks.len(),
+        accounts_trie_chunks = dump.accounts_trie_chunks.len(),
+        storages_trie_chunks = dump.storages_trie_chunks.len(),
         elapsed_secs = start.elapsed().as_secs(),
         "hash-keyed state dump complete"
     );
@@ -363,9 +367,21 @@ struct StateDump {
     account_chunks: Vec<ChunkEmit>,
     storage_chunks: Vec<ChunkEmit>,
     code_chunks: Vec<ChunkEmit>,
+    /// v5: raw `(PackedStoredNibbles, BranchNodeCompact)` rows from
+    /// `AccountsTrie`. Not sharded — the table is small (~9 GiB
+    /// compressed in MDBX) and trie nodes near the root have shorter
+    /// nibble paths than the hashed-key sharding assumes, so a single
+    /// global stream keeps the schema simple.
+    accounts_trie_chunks: Vec<ChunkEmit>,
+    /// v5: raw `(hashed_address, subkey, BranchNodeCompact)` rows from
+    /// `StoragesTrie`. Sharded by `hashed_address` top-bits so the
+    /// import can drain per-shard in step with the storage drain.
+    storages_trie_chunks: Vec<ChunkEmit>,
     total_accounts: u64,
     total_storage: u64,
     total_code: u64,
+    total_accounts_trie: u64,
+    total_storages_trie: u64,
 }
 
 async fn dump_state<N>(
@@ -561,6 +577,120 @@ where
         "code dump complete"
     );
 
+    // ---- accounts trie (raw bytes, unsharded, sub-chunked) ----
+    //
+    // Walk `RawTable<AccountsTrie>` so we capture the on-disk
+    // 33-byte `PackedStoredNibbles::to_compact_array()` keys and the
+    // Compact-encoded `BranchNodeCompact` values verbatim. The import
+    // writes them back through `RawTable<PackedAccountsTrie>` without
+    // re-encoding, so the v5 path is byte-faithful by construction.
+    let at_start = Instant::now();
+    let mut at_cursor = tx.cursor_read::<RawTable<reth_db_api::tables::PackedAccountsTrie>>()?;
+    let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut next_part: u32 = 0;
+    let mut walk = at_cursor.walk(None)?;
+    while let Some(row) = walk.next() {
+        let (raw_k, raw_v) = row?;
+        buf.push((raw_k.into_key(), raw_v.into_value()));
+        dump.total_accounts_trie += 1;
+        if buf.len() >= FLUSH_THRESHOLD_ROWS {
+            let chunk = flush_accounts_trie(cli, next_part, std::mem::take(&mut buf)).await?;
+            dump.accounts_trie_chunks.push(chunk);
+            next_part += 1;
+        }
+        if dump.total_accounts_trie.is_multiple_of(2_000_000) {
+            info!(
+                rows = dump.total_accounts_trie,
+                elapsed_secs = at_start.elapsed().as_secs(),
+                "accounts_trie walk progress"
+            );
+        }
+    }
+    if !buf.is_empty() {
+        let chunk = flush_accounts_trie(cli, next_part, std::mem::take(&mut buf)).await?;
+        dump.accounts_trie_chunks.push(chunk);
+    }
+    info!(
+        rows = dump.total_accounts_trie,
+        chunks = dump.accounts_trie_chunks.len(),
+        elapsed_secs = at_start.elapsed().as_secs(),
+        "accounts_trie dump complete"
+    );
+
+    // ---- storages trie (raw bytes, sharded by hashed_address) ----
+    //
+    // Dup table; for each `(hashed_address, subkey, BranchNodeCompact)`
+    // we shard by `hashed_address` top-bits matching the existing
+    // storage shard layout. Walking `RawDupSort<StoragesTrie>` gives us
+    // the raw key + the raw `PackedStorageTrieEntry` compact bytes
+    // (subkey + node). The consumer slices the first 33 bytes back off
+    // as the dup subkey and writes through `RawDupSort<PackedStoragesTrie>`.
+    let st_start = Instant::now();
+    let mut st_cursor =
+        tx.cursor_dup_read::<RawDupSort<reth_db_api::tables::PackedStoragesTrie>>()?;
+    let mut current_shard: Option<u32> = None;
+    let mut next_part: u32 = 0;
+    let mut buf: Vec<(B256, Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut walk = st_cursor.walk(None)?;
+    while let Some(row) = walk.next() {
+        let (raw_addr_key, raw_entry) = row?;
+        let raw_addr_bytes = raw_addr_key.into_key();
+        if raw_addr_bytes.len() != 32 {
+            return Err(eyre!("unexpected StoragesTrie key length: {}", raw_addr_bytes.len()));
+        }
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&raw_addr_bytes);
+        let h_addr = B256::from(addr);
+        let entry = raw_entry.into_value();
+        if entry.len() < 33 {
+            return Err(eyre!("StoragesTrie value < 33 bytes: {}", entry.len()));
+        }
+        let (subkey, node_bytes) = entry.split_at(33);
+
+        let shard = shard_for_hash(h_addr, cli.shard_bits) as u32;
+        if Some(shard) != current_shard {
+            if let Some(prev) = current_shard.take() &&
+                !buf.is_empty()
+            {
+                let chunk =
+                    flush_storages_trie(cli, prev, next_part, std::mem::take(&mut buf)).await?;
+                dump.storages_trie_chunks.push(chunk);
+            }
+            current_shard = Some(shard);
+            next_part = 0;
+        }
+
+        buf.push((h_addr, subkey.to_vec(), node_bytes.to_vec()));
+        dump.total_storages_trie += 1;
+
+        if buf.len() >= FLUSH_THRESHOLD_ROWS {
+            let chunk =
+                flush_storages_trie(cli, shard, next_part, std::mem::take(&mut buf)).await?;
+            dump.storages_trie_chunks.push(chunk);
+            next_part += 1;
+        }
+        if dump.total_storages_trie.is_multiple_of(5_000_000) {
+            info!(
+                rows = dump.total_storages_trie,
+                shard,
+                elapsed_secs = st_start.elapsed().as_secs(),
+                "storages_trie walk progress"
+            );
+        }
+    }
+    if let Some(prev) = current_shard.take() &&
+        !buf.is_empty()
+    {
+        let chunk = flush_storages_trie(cli, prev, next_part, std::mem::take(&mut buf)).await?;
+        dump.storages_trie_chunks.push(chunk);
+    }
+    info!(
+        rows = dump.total_storages_trie,
+        chunks = dump.storages_trie_chunks.len(),
+        elapsed_secs = st_start.elapsed().as_secs(),
+        "storages_trie dump complete"
+    );
+
     Ok(dump)
 }
 
@@ -646,6 +776,58 @@ async fn flush_code(
     })
 }
 
+async fn flush_accounts_trie(
+    cli: &Cli,
+    part: u32,
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+) -> eyre::Result<ChunkEmit> {
+    // Unsharded: emit under a synthetic "trie" directory rather than a
+    // per-shard one. The consumer iterates `manifest.accounts_trie`
+    // globally.
+    let dir = cli.out_dir.join("trie");
+    tokio::fs::create_dir_all(&dir).await?;
+    let bytes = vortex_writer::accounts_trie_chunk(&rows).await?;
+    let object_key = format!("trie/accounts-trie-part-{part:04}.vortex");
+    let path = cli.out_dir.join(&object_key);
+    tokio::fs::write(&path, &bytes).await?;
+    Ok(ChunkEmit {
+        shard: 0,
+        part,
+        object_key,
+        bytes_written: bytes.len() as u64,
+        sha256_hex: format!("{:x}", Sha256::digest(&bytes)),
+        key_min: None,
+        key_max: None,
+        rows: rows.len() as u64,
+    })
+}
+
+async fn flush_storages_trie(
+    cli: &Cli,
+    shard: u32,
+    part: u32,
+    rows: Vec<(B256, Vec<u8>, Vec<u8>)>,
+) -> eyre::Result<ChunkEmit> {
+    let dir = shard_dir(&cli.out_dir, shard);
+    tokio::fs::create_dir_all(&dir).await?;
+    let bytes = vortex_writer::storages_trie_chunk(&rows).await?;
+    let key_min = rows.first().map(|r| r.0);
+    let key_max = rows.last().map(|r| r.0);
+    let object_key = format!("shard-{shard:04}/storages-trie-part-{part:04}.vortex");
+    let path = cli.out_dir.join(&object_key);
+    tokio::fs::write(&path, &bytes).await?;
+    Ok(ChunkEmit {
+        shard,
+        part,
+        object_key,
+        bytes_written: bytes.len() as u64,
+        sha256_hex: format!("{:x}", Sha256::digest(&bytes)),
+        key_min,
+        key_max,
+        rows: rows.len() as u64,
+    })
+}
+
 // ============== manifest emission (v3 / hash-keyed / multi-ref) ==============
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -678,6 +860,11 @@ struct ShardManifest {
     accounts: Vec<StateArtifactRef>,
     storage: Vec<StateArtifactRef>,
     code: Vec<StateArtifactRef>,
+    /// v5: raw `StoragesTrie` rows for accounts in this shard's
+    /// `hashed_address` range. Empty when the shard contains no
+    /// contract trie nodes. Ordered by `part`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    storages_trie: Vec<StateArtifactRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -700,6 +887,13 @@ struct FinalizedStateArtifactManifest {
     /// pinned block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pinned_header: Option<alloy_consensus::Header>,
+    /// v5: raw `AccountsTrie` chunks (unsharded, sub-chunked).
+    /// Importers drain them directly into MDBX so the merkle stage's
+    /// account trie is populated without re-computing from
+    /// HashedAccounts/HashedStorages. Empty when the writer was run
+    /// before the v5 cutover.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    accounts_trie: Vec<StateArtifactRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -741,10 +935,10 @@ fn build_manifest(
     // Group sub-chunks by shard id. Each (shard, family) may have
     // zero, one, or many chunks. The v3 client iterates the Vec and
     // decodes each chunk in turn.
-    let mut by_shard: std::collections::BTreeMap<
-        u32,
-        (Vec<&ChunkEmit>, Vec<&ChunkEmit>, Vec<&ChunkEmit>),
-    > = std::collections::BTreeMap::new();
+    type ShardBuckets<'a> =
+        (Vec<&'a ChunkEmit>, Vec<&'a ChunkEmit>, Vec<&'a ChunkEmit>, Vec<&'a ChunkEmit>);
+    let mut by_shard: std::collections::BTreeMap<u32, ShardBuckets<'_>> =
+        std::collections::BTreeMap::new();
     for c in &dump.account_chunks {
         by_shard.entry(c.shard).or_default().0.push(c);
     }
@@ -754,24 +948,33 @@ fn build_manifest(
     for c in &dump.code_chunks {
         by_shard.entry(c.shard).or_default().2.push(c);
     }
+    for c in &dump.storages_trie_chunks {
+        by_shard.entry(c.shard).or_default().3.push(c);
+    }
 
     let shards = by_shard
         .into_iter()
-        .map(|(shard_id, (mut a, mut s, mut c))| {
+        .map(|(shard_id, (mut a, mut s, mut c, mut st))| {
             a.sort_by_key(|c| c.part);
             s.sort_by_key(|c| c.part);
             c.sort_by_key(|c| c.part);
+            st.sort_by_key(|c| c.part);
             ShardManifest {
                 shard: shard_id,
                 accounts: chunks_to_refs("accounts", block_number, state_root, &a),
                 storage: chunks_to_refs("storage", block_number, state_root, &s),
                 code: chunks_to_refs("code", block_number, state_root, &c),
+                storages_trie: chunks_to_refs("storages_trie", block_number, state_root, &st),
             }
         })
         .collect();
 
+    let mut at = dump.accounts_trie_chunks.iter().collect::<Vec<_>>();
+    at.sort_by_key(|c| c.part);
+    let accounts_trie = chunks_to_refs("accounts_trie", block_number, state_root, &at);
+
     FinalizedStateArtifactManifest {
-        version: 4,
+        version: 5,
         chain_id: 1,
         block_number,
         block_hash: block_hash.to_string(),
@@ -780,6 +983,7 @@ fn build_manifest(
         shard_bits: Some(cli.shard_bits),
         key_layout: Some("hashed".to_string()),
         pinned_header,
+        accounts_trie,
     }
 }
 
@@ -910,7 +1114,13 @@ async fn upload(
     };
 
     for shard in &manifest.shards {
-        for r in shard.accounts.iter().chain(&shard.storage).chain(&shard.code) {
+        for r in shard
+            .accounts
+            .iter()
+            .chain(&shard.storage)
+            .chain(&shard.code)
+            .chain(&shard.storages_trie)
+        {
             upload_one(
                 cli.out_dir.join(&r.object_key),
                 format!("{dir_prefix}/{}", r.object_key),
@@ -918,6 +1128,14 @@ async fn upload(
             )
             .await?;
         }
+    }
+    for r in &manifest.accounts_trie {
+        upload_one(
+            cli.out_dir.join(&r.object_key),
+            format!("{dir_prefix}/{}", r.object_key),
+            r.content_sha256.clone(),
+        )
+        .await?;
     }
 
     let signed = SignedCheckpointManifest {

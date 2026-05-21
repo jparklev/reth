@@ -206,6 +206,12 @@ pub struct ShardManifest {
     pub accounts: Vec<StateArtifactRef>,
     pub storage: Vec<StateArtifactRef>,
     pub code: Vec<StateArtifactRef>,
+    /// v5: raw `(hashed_address, subkey, BranchNodeCompact)` rows for
+    /// accounts in this shard. Drained into MDBX's `StoragesTrie`
+    /// table directly so the import can skip merkle recomputation.
+    /// Absent in v4 manifests.
+    #[serde(default)]
+    pub storages_trie: Vec<StateArtifactRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +236,11 @@ pub struct FinalizedStateArtifactManifest {
     pub key_layout: Option<String>,
     #[serde(default)]
     pub pinned_header: Option<Header>,
+    /// v5: raw `AccountsTrie` chunks (unsharded, sub-chunked by row
+    /// count). Drained into MDBX's `AccountsTrie` table directly.
+    /// Absent in v4 manifests.
+    #[serde(default)]
+    pub accounts_trie: Vec<StateArtifactRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +300,9 @@ pub struct HttpBucketStateClient {
     manifest_dir: String,
     shard_bits: u8,
     shards: HashMap<u32, ShardManifest>,
+    /// v5 global accounts_trie chunks (unsharded). The import drains
+    /// these directly into MDBX's `AccountsTrie` table.
+    accounts_trie: Vec<StateArtifactRef>,
     checkpoint_cache_dir: PathBuf,
     account_cache: Cache<B256, Option<Account>>,
     storage_cache: Cache<(B256, B256), Option<U256>>,
@@ -494,6 +508,86 @@ impl HttpBucketStateClient {
         Ok(())
     }
 
+    /// Stream every row of a single shard's `StoragesTrie` chunks
+    /// through the caller's closure. v5 only — shards from a v4
+    /// manifest return Ok with zero rows because `storages_trie` is
+    /// empty.
+    pub fn drain_storages_trie_for_shard<F>(
+        &self,
+        shard: u32,
+        mut on_row: F,
+    ) -> Result<usize, BucketStateClientError>
+    where
+        F: FnMut(vortex_state::StoragesTrieRow),
+    {
+        let handle = Handle::try_current().map_err(|_| {
+            BucketStateClientError::Backend(
+                "drain_storages_trie_for_shard requires a tokio runtime context".into(),
+            )
+        })?;
+        let manifest = self.shards.get(&shard).ok_or_else(|| {
+            BucketStateClientError::Decode(format!("checkpoint manifest has no shard {shard}"))
+        })?;
+        let shard_dir = self.shard_cache_dir(shard);
+        let mut total = 0usize;
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let _permit =
+                    self.shard_load_permits.clone().acquire_owned().await.map_err(|err| {
+                        BucketStateClientError::Backend(format!("drain semaphore closed: {err}"))
+                    })?;
+                for (idx, artifact) in manifest.storages_trie.iter().enumerate() {
+                    let bytes = self.fetch_chunk_bytes(&shard_dir, idx, artifact).await?;
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    total +=
+                        vortex_state::decode_storages_trie_chunk(bytes, |row| on_row(row)).await?;
+                }
+                Ok::<(), BucketStateClientError>(())
+            })
+        })?;
+        Ok(total)
+    }
+
+    /// Stream every row of the global v5 `AccountsTrie` chunks
+    /// through the caller's closure. Cached on disk under
+    /// `<checkpoint>/trie/` to mirror per-shard caching. Returns the
+    /// total number of rows yielded; 0 for v4 manifests.
+    pub fn drain_accounts_trie_streaming<F>(
+        &self,
+        mut on_row: F,
+    ) -> Result<usize, BucketStateClientError>
+    where
+        F: FnMut(vortex_state::AccountsTrieRow),
+    {
+        let handle = Handle::try_current().map_err(|_| {
+            BucketStateClientError::Backend(
+                "drain_accounts_trie_streaming requires a tokio runtime context".into(),
+            )
+        })?;
+        let trie_dir = self.checkpoint_cache_dir.join("trie");
+        let mut total = 0usize;
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let _permit =
+                    self.shard_load_permits.clone().acquire_owned().await.map_err(|err| {
+                        BucketStateClientError::Backend(format!("drain semaphore closed: {err}"))
+                    })?;
+                for (idx, artifact) in self.accounts_trie.iter().enumerate() {
+                    let bytes = self.fetch_chunk_bytes(&trie_dir, idx, artifact).await?;
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    total +=
+                        vortex_state::decode_accounts_trie_chunk(bytes, |row| on_row(row)).await?;
+                }
+                Ok::<(), BucketStateClientError>(())
+            })
+        })?;
+        Ok(total)
+    }
+
     /// Sync constructor — mirrors
     /// `HttpBucketHeaderClient::new_blocking` so it can be called
     /// from inside the reth NodeBuilder closure. Uses
@@ -614,6 +708,7 @@ impl HttpBucketStateClient {
             .cloned()
             .map(|shard| (shard.shard, shard))
             .collect::<HashMap<_, _>>();
+        let accounts_trie = manifest.accounts_trie.clone();
         let checkpoint_cache_dir =
             config.conn.cache_dir.join(format!("checkpoint-{}", manifest.block_number));
         let loaded_shards = scan_cached_shards(&checkpoint_cache_dir);
@@ -722,6 +817,7 @@ impl HttpBucketStateClient {
             manifest_dir,
             shard_bits,
             shards,
+            accounts_trie,
             checkpoint_cache_dir,
             account_cache,
             storage_cache,
@@ -1008,9 +1104,11 @@ where
 fn validate_checkpoint_manifest(
     manifest: &FinalizedStateArtifactManifest,
 ) -> Result<(), BucketStateClientError> {
-    if manifest.version != 4 {
+    if manifest.version != 5 {
         return Err(BucketStateClientError::Decode(format!(
-            "unsupported checkpoint manifest version {}; bucket-state-client requires version 4 hashed checkpoints",
+            "unsupported checkpoint manifest version {}; bucket-state-client requires version 5 \
+             hashed checkpoints (v4 lacks the AccountsTrie/StoragesTrie chunks that the importer \
+             drains to skip merkle recomputation)",
             manifest.version
         )));
     }
@@ -1396,6 +1494,142 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn drain_accounts_trie_streaming_yields_all_global_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
+        let manifest_dir = "checkpoints/100";
+
+        // Two sub-chunks worth of accounts_trie rows. The drain must
+        // yield them in order (parts 0 then 1).
+        let chunk_a: Vec<(Vec<u8>, Vec<u8>)> =
+            (0..3).map(|i| (vec![0xa0, i as u8, 33u8], vec![0x11; (i + 1) as usize])).collect();
+        let chunk_b: Vec<(Vec<u8>, Vec<u8>)> =
+            (3..7).map(|i| (vec![0xb0, i as u8, 33u8], vec![0x22; (i + 1) as usize])).collect();
+
+        let mut manifest = checkpoint_manifest(0, vec![empty_shard_manifest(0)]);
+        for (idx, rows) in [&chunk_a, &chunk_b].iter().enumerate() {
+            let bytes = accounts_trie_chunk(rows).await;
+            let key = format!("trie/accounts-trie-part-{idx:04}.vortex");
+            store
+                .put(&ObjectPath::from(format!("{manifest_dir}/{key}")), bytes.clone().into())
+                .await
+                .unwrap();
+            manifest.accounts_trie.push(StateArtifactRef {
+                chain_id: 1,
+                kind: "accounts_trie".into(),
+                from_block: 100,
+                to_block: 100,
+                state_root: None,
+                object_key: key,
+                index_key: None,
+                content_sha256: format!("{:x}", Sha256::digest(&bytes)),
+                shard: None,
+                key_min: None,
+                key_max: None,
+            });
+        }
+
+        let client = test_client(store, manifest, tmp.path().to_path_buf());
+        let mut yielded: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let total = client
+            .drain_accounts_trie_streaming(|row| yielded.push((row.key_bytes, row.value_bytes)))
+            .unwrap();
+
+        let mut expected: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        expected.extend(chunk_a);
+        expected.extend(chunk_b);
+        assert_eq!(total, expected.len());
+        assert_eq!(yielded, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drain_storages_trie_for_shard_emits_per_shard_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
+        let manifest_dir = "checkpoints/100";
+
+        let rows: Vec<(B256, Vec<u8>, Vec<u8>)> = (0..4)
+            .map(|i| {
+                let mut sk = vec![0u8; 33];
+                sk[0] = i as u8;
+                sk[32] = 4;
+                (B256::from([i as u8 + 0x70; 32]), sk, vec![0xee; (i + 1) as usize])
+            })
+            .collect();
+
+        let mut shard = empty_shard_manifest(7);
+        let bytes = storages_trie_chunk(&rows).await;
+        let key = "shard-0007/storages-trie-part-0000.vortex";
+        store
+            .put(&ObjectPath::from(format!("{manifest_dir}/{key}")), bytes.clone().into())
+            .await
+            .unwrap();
+        shard.storages_trie.push(StateArtifactRef {
+            chain_id: 1,
+            kind: "storages_trie".into(),
+            from_block: 100,
+            to_block: 100,
+            state_root: None,
+            object_key: key.into(),
+            index_key: None,
+            content_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            shard: Some(7),
+            key_min: None,
+            key_max: None,
+        });
+
+        let manifest = checkpoint_manifest(0, vec![shard]);
+        let client = test_client(store, manifest, tmp.path().to_path_buf());
+        let mut yielded: Vec<(B256, Vec<u8>, Vec<u8>)> = Vec::new();
+        let total = client
+            .drain_storages_trie_for_shard(7, |row| {
+                yielded.push((row.hashed_address, row.subkey_bytes, row.node_bytes));
+            })
+            .unwrap();
+        assert_eq!(total, rows.len());
+        assert_eq!(yielded, rows);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v5_trie_chunks_round_trip_through_drain() {
+        use vortex_state::{decode_accounts_trie_chunk, decode_storages_trie_chunk};
+
+        // AccountsTrie: 33-byte packed key + arbitrary-length node bytes.
+        let acct_rows: Vec<(Vec<u8>, Vec<u8>)> = (0..4)
+            .map(|i| {
+                let mut k = vec![0u8; 33];
+                k[0] = 0xa0 | i as u8;
+                k[32] = i as u8 + 1;
+                (k, vec![0xde, 0xad, i as u8])
+            })
+            .collect();
+        let bytes = accounts_trie_chunk(&acct_rows).await;
+        let mut decoded: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        decode_accounts_trie_chunk(bytes, |row| decoded.push((row.key_bytes, row.value_bytes)))
+            .await
+            .unwrap();
+        assert_eq!(decoded, acct_rows);
+
+        // StoragesTrie: (B256 hashed_address, 33-byte subkey, node bytes).
+        let st_rows: Vec<(B256, Vec<u8>, Vec<u8>)> = (0..3)
+            .map(|i| {
+                let mut sk = vec![0u8; 33];
+                sk[0] = i as u8;
+                sk[32] = 2;
+                (B256::from([i as u8 + 1; 32]), sk, vec![0xca, 0xfe, i as u8])
+            })
+            .collect();
+        let bytes = storages_trie_chunk(&st_rows).await;
+        let mut decoded: Vec<(B256, Vec<u8>, Vec<u8>)> = Vec::new();
+        decode_storages_trie_chunk(bytes, |row| {
+            decoded.push((row.hashed_address, row.subkey_bytes, row.node_bytes));
+        })
+        .await
+        .unwrap();
+        assert_eq!(decoded, st_rows);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn shard_load_decodes_multiple_storage_sub_chunks() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>;
@@ -1541,12 +1775,12 @@ mod tests {
     }
 
     #[test]
-    fn manifest_pre_v4_is_rejected() {
+    fn manifest_pre_v5_is_rejected() {
         let mut manifest = checkpoint_manifest(0, vec![empty_shard_manifest(0)]);
-        for version in [1, 2, 3] {
+        for version in [1, 2, 3, 4] {
             manifest.version = version;
             let err = validate_checkpoint_manifest(&manifest).unwrap_err();
-            assert!(err.to_string().contains("requires version 4 hashed checkpoints"));
+            assert!(err.to_string().contains("requires version 5 hashed checkpoints"));
         }
     }
 
@@ -1656,6 +1890,7 @@ mod tests {
             manifest_dir: "checkpoints/100".into(),
             shard_bits,
             shards,
+            accounts_trie: manifest.accounts_trie.clone(),
             checkpoint_cache_dir,
             account_cache: cache(),
             storage_cache: cache(),
@@ -1674,7 +1909,7 @@ mod tests {
     ) -> FinalizedStateArtifactManifest {
         let pinned_header = synthetic_header(100);
         FinalizedStateArtifactManifest {
-            version: 4,
+            version: 5,
             chain_id: 1,
             block_number: 100,
             block_hash: format!("0x{}", hex::encode(pinned_header.hash_slow().as_slice())),
@@ -1686,6 +1921,7 @@ mod tests {
             shard_bits: Some(shard_bits),
             key_layout: Some("hashed".into()),
             pinned_header: Some(pinned_header),
+            accounts_trie: Vec::new(),
         }
     }
 
@@ -1704,7 +1940,13 @@ mod tests {
     }
 
     fn empty_shard_manifest(shard: u32) -> ShardManifest {
-        ShardManifest { shard, accounts: Vec::new(), storage: Vec::new(), code: Vec::new() }
+        ShardManifest {
+            shard,
+            accounts: Vec::new(),
+            storage: Vec::new(),
+            code: Vec::new(),
+            storages_trie: Vec::new(),
+        }
     }
 
     fn referenced_shard_manifest(shard: u32) -> ShardManifest {
@@ -1713,6 +1955,7 @@ mod tests {
             accounts: vec![artifact_ref(shard, "accounts", 0)],
             storage: vec![artifact_ref(shard, "storage", 0)],
             code: vec![artifact_ref(shard, "code", 0)],
+            storages_trie: Vec::new(),
         }
     }
 
@@ -1808,6 +2051,47 @@ mod tests {
                 binary_required(
                     rows.iter().map(|(_, _, v)| v.to_be_bytes::<32>().to_vec()).collect(),
                 ),
+            ],
+            len,
+            Validity::NonNullable,
+        )
+        .into_array();
+        write_vortex(data).await
+    }
+
+    async fn accounts_trie_chunk(rows: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        use vortex::array::{
+            arrays::StructArray as VortexStructArray, dtype::FieldNames, validity::Validity,
+            IntoArray,
+        };
+
+        let len = rows.len();
+        let data = VortexStructArray::new(
+            FieldNames::from(["key_bytes", "value_bytes"]),
+            vec![
+                binary_required(rows.iter().map(|(k, _)| k.clone()).collect()),
+                binary_required(rows.iter().map(|(_, v)| v.clone()).collect()),
+            ],
+            len,
+            Validity::NonNullable,
+        )
+        .into_array();
+        write_vortex(data).await
+    }
+
+    async fn storages_trie_chunk(rows: &[(B256, Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        use vortex::array::{
+            arrays::StructArray as VortexStructArray, dtype::FieldNames, validity::Validity,
+            IntoArray,
+        };
+
+        let len = rows.len();
+        let data = VortexStructArray::new(
+            FieldNames::from(["hashed_address", "subkey_bytes", "node_bytes"]),
+            vec![
+                binary_required(rows.iter().map(|(a, _, _)| a.as_slice().to_vec()).collect()),
+                binary_required(rows.iter().map(|(_, s, _)| s.clone()).collect()),
+                binary_required(rows.iter().map(|(_, _, n)| n.clone()).collect()),
             ],
             len,
             Validity::NonNullable,
