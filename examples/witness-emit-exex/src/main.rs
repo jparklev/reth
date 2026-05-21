@@ -37,13 +37,17 @@ fn main() -> eyre::Result<()> {
         async move |builder, args: WitnessEmitArgs| {
             let emit_dir = args.emit_dir.clone();
             let stats = args.stats.clone();
+            // `launch_with_debug_capabilities` is identical to `.launch()` for
+            // mainnet/holesky/sepolia, but ALSO wires the local miner for
+            // `--dev` mode (auto-mining + LocalPayloadAttributesBuilder).
+            // Without it, --dev silently produces no blocks.
             let handle = builder
                 .node(EthereumNode::default())
                 .install_exex("witness-emit", async move |ctx| {
                     let exex = exex::WitnessEmitExEx::new(ctx, emit_dir, stats);
                     Ok(exex.run())
                 })
-                .launch()
+                .launch_with_debug_capabilities()
                 .await?;
 
             handle.wait_for_node_exit().await
