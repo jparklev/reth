@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "shard_probe"
 path = "src/bin/shard_probe.rs"
 
+[[bin]]
+name = "prod_probe"
+path = "src/bin/prod_probe.rs"
+
 [dependencies]
 # Reth — re-use the EnvironmentArgs/AccessRights bootstrap from the
 # existing CLI commands instead of re-deriving the 5-arg
@@ -20,6 +24,7 @@ path = "src/bin/shard_probe.rs"
 reth-cli-commands.workspace = true
 reth-ethereum-cli.workspace = true
 reth-provider.workspace = true
+reth-db = { workspace = true }
 reth-db-api.workspace = true
 reth-storage-api.workspace = true
 reth-primitives-traits.workspace = true
