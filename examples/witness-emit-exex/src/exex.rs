@@ -322,7 +322,7 @@ fn chrono_rfc3339() -> String {
 }
 
 /// Howard Hinnant's days_from_civil inverse (public domain).
-fn unix_to_civil(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+const fn unix_to_civil(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     let day = secs.div_euclid(86400);
     let tod = secs.rem_euclid(86400) as u32;
     let hour = tod / 3600;
@@ -365,10 +365,10 @@ fn write_atomic(final_path: &Path, bytes: &[u8]) -> eyre::Result<()> {
     std::fs::rename(&tmp, final_path)
         .wrap_err_with(|| format!("rename {} -> {}", tmp.display(), final_path.display()))?;
     // fsync the containing dir so the rename is durable across power loss.
-    if let Some(dir) = final_path.parent() {
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
+    if let Some(dir) = final_path.parent()
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
     }
     Ok(())
 }
