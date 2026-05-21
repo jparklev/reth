@@ -66,12 +66,16 @@ For each `ExExNotification::ChainReverted` (or `ChainReorged.old`):
 ## Build
 
 ```bash
-# Node binary (needs MDBX-linkable host)
-cargo build --release -p example-witness-emit-exex --bin reth-witness-emit-node
+# Node binary (needs MDBX-linkable host; on macOS also SDKROOT)
+SDKROOT=$(xcrun --show-sdk-path 2>/dev/null || true) \
+    cargo build --release -p example-witness-emit-exex --bin reth-witness-emit-node
 
 # Uploader
-cargo build --release -p example-witness-emit-exex --bin witness-uploader
+SDKROOT=$(xcrun --show-sdk-path 2>/dev/null || true) \
+    cargo build --release -p example-witness-emit-exex --bin witness-uploader
 ```
+
+Build takes ~10-15 min cold; rebuild after small edits is ~2 min.
 
 ## Deploy (separate from prod reth)
 

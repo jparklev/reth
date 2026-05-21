@@ -4342,6 +4342,7 @@ name = "example-witness-emit-exex"
 version = "0.0.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips 2.0.4",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-debug",

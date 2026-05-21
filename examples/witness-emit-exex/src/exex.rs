@@ -116,6 +116,8 @@ where
                 let range = committed.range();
                 debug!(?range, "ChainCommitted");
 
+                let mut highest_durable: Option<alloy_eips::BlockNumHash> = None;
+                let mut had_failure = false;
                 for block in committed.blocks_iter() {
                     let block_started = Instant::now();
                     match emit_block(
@@ -134,26 +136,53 @@ where
                                 size_kb = stats.size_bytes / 1024,
                                 "emitted"
                             );
+                            highest_durable = Some(block.num_hash());
                         }
                         Err(err) => {
-                            // We do NOT skip — log loudly. The whole point of
-                            // moving to ExEx is 0% skip. If we ever fail here,
-                            // it's a bug that needs surfacing.
-                            error!(block = block.number(), ?err, "emit FAILED");
-                            return Err(err.wrap_err(format!(
-                                "emit_block {} ({})",
-                                block.number(),
-                                block.hash(),
-                            )));
+                            // A per-block emit failure is most likely a stale
+                            // notification (e.g. parent state pruned because a
+                            // newer fork won) — that case will be cleaned up
+                            // by the ChainReverted notification that's already
+                            // queued behind us. Don't kill the ExEx; record
+                            // the failure as a stats line and keep going. The
+                            // uploader scans for `.stale` files so a missing
+                            // `.witness.zst` simply doesn't get advertised.
+                            had_failure = true;
+                            error!(block = block.number(), ?err, "emit failed; continuing");
+                            let line = serde_json::json!({
+                                "ts": chrono_rfc3339(),
+                                "block_number": block.number(),
+                                "block_hash": format!("{:?}", block.hash()),
+                                "skipped": true,
+                                "err": format!("{err:?}"),
+                            });
+                            if let Some(path) = &self.stats_path {
+                                use std::io::Write;
+                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                    .create(true).append(true).open(path)
+                                {
+                                    let _ = writeln!(f, "{line}");
+                                }
+                            }
                         }
                     }
                 }
 
-                // Ack ONLY after every block in this chain is durable.
-                let tip = committed.tip().num_hash();
-                if let Err(err) = self.ctx.events.send(ExExEvent::FinishedHeight(tip)) {
-                    warn!(?err, "send FinishedHeight failed (ExEx manager gone?)");
-                    break;
+                // Ack only up to the last block we durably wrote. If we had a
+                // mid-chain failure, downstream restart will re-deliver the
+                // failed block (and everything after).
+                if let Some(durable) = highest_durable {
+                    if let Err(err) = self.ctx.events.send(ExExEvent::FinishedHeight(durable))
+                    {
+                        warn!(?err, "send FinishedHeight failed (ExEx manager gone?)");
+                        break;
+                    }
+                }
+                if had_failure {
+                    warn!(
+                        ?range,
+                        "ChainCommitted notification had failed blocks; will re-deliver on restart"
+                    );
                 }
             }
         }
