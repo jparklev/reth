@@ -4349,10 +4349,12 @@ dependencies = [
  "alloy-trie",
  "aws-config",
  "aws-sdk-s3",
+ "bincode",
  "clap",
  "eyre",
  "itertools 0.14.0",
  "rayon",
+ "reqwest 0.13.2",
  "reth-chainspec",
  "reth-db",
  "reth-ethereum",
@@ -4375,6 +4377,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "zstd",
 ]
 
 [[package]]

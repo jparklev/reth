@@ -19,7 +19,7 @@
 //! the post-state root + header hash.
 
 use alloy_consensus::BlockHeader;
-use alloy_primitives::{Bytes, B256};
+use alloy_primitives::B256;
 use alloy_rlp::Encodable;
 use clap::Parser;
 use eyre::WrapErr;
@@ -27,14 +27,17 @@ use reth_chainspec::{ChainSpec, MAINNET};
 use reth_ethereum::{
     evm::{revm::database::StateProviderDatabase, EthEvmConfig},
     node::EthereumNode,
-    provider::providers::{ReadOnlyConfig, BlockchainProvider},
+    provider::providers::{BlockchainProvider, ReadOnlyConfig},
 };
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_revm::{db::State, witness::ExecutionWitnessRecord};
 use reth_storage_api::{BlockReader, HeaderProvider, StateProviderFactory, TransactionVariant};
 use reth_trie_common::ExecutionWitnessMode;
-use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc, time::Instant};
+
+#[path = "bundle.rs"]
+mod bundle;
+use bundle::{encode_bundle, Encoding, WitnessBundle};
 
 #[derive(Parser, Debug)]
 #[command(about = "Produce an ExecutionWitness for a block from a reth datadir (read-only)")]
@@ -51,23 +54,6 @@ struct Cli {
     /// Chain (mainnet only for now).
     #[arg(long, default_value = "mainnet")]
     chain: String,
-}
-
-/// JSON envelope written to disk / S3. Validator reads this exact shape.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct WitnessBundle {
-    /// RLP-encoded block header.
-    pub header: Bytes,
-    /// RLP-encoded block body.
-    pub block_body: Bytes,
-    /// The execution witness (state nodes, codes, keys, ancestor headers).
-    pub witness: alloy_rpc_types_debug::ExecutionWitness,
-    /// Parent state root — convenience for validator (== header.state_root of parent).
-    pub parent_state_root: B256,
-    /// Expected post-state root — convenience (== this block's header.state_root).
-    pub expected_state_root: B256,
-    /// Block number — convenience.
-    pub block_number: u64,
 }
 
 fn main() -> eyre::Result<()> {
@@ -156,12 +142,17 @@ fn main() -> eyre::Result<()> {
         block_number,
     };
 
-    let json = serde_json::to_vec_pretty(&bundle)?;
-    std::fs::write(&cli.out, &json)?;
+    let encoding = Encoding::from_path(&cli.out.to_string_lossy());
+    let t_encode = Instant::now();
+    let encoded = encode_bundle(&bundle, encoding)?;
+    let encode_elapsed = t_encode.elapsed();
+    std::fs::write(&cli.out, &encoded)?;
     println!(
-        "wrote {} ({} bytes, state nodes={}, codes={}) in {:.2}s",
+        "wrote {} ({} bytes, encoding={:?}, encode={:.2}s) state nodes={} codes={} produce={:.2}s",
         cli.out.display(),
-        json.len(),
+        encoded.len(),
+        encoding,
+        encode_elapsed.as_secs_f64(),
         bundle.witness.state.len(),
         bundle.witness.codes.len(),
         produce_elapsed.as_secs_f64()

@@ -3,32 +3,43 @@
 Stateless mainnet block validation end-to-end:
 
 ```
-S3 bucket (witnesses/<hash>.json)
+S3 bucket (witnesses/<hash>.zst)
         │
         ▼  fetch bytes
-   witness-validator                ─── compiles on any host (no MDBX needed)
+   witness-validator (single block)            ─── no MDBX needed
+   witness-stream    (many blocks, prefetch)   ─── no MDBX needed
         │
-        ├─ decode JSON + RLP header/body
+        ├─ zstd-decompress + bincode-decode  (envelope)
+        ├─ RLP-decode header + body, recover senders
         ├─ reveal SparseStateTrie from witness.state
-        ├─ execute revm against WitnessDatabase
+        ├─ execute revm against WitnessDb
         ├─ recompute post-state root from sparse trie + bundle changes
         └─ assert == header.state_root
 ```
 
 ## Layout
 
-- `src/producer.rs` — opens a reth datadir read-only, generates an
-  `ExecutionWitness` for one block, writes a JSON bundle. Needs MDBX (only
-  builds on a host where libmdbx can link — Linux fine, macOS needs
-  `SDKROOT=$(xcrun --show-sdk-path)`). Behind `--features producer`.
-- `src/validator.rs` — fetches from S3 (or local file), executes, verifies.
-  No MDBX needed.
+- `src/bundle.rs` — `WitnessBundle` envelope + JSON / bincode-zstd helpers (shared).
+- `src/validate_core.rs` — per-block pipeline (decode, reveal, execute, root) shared
+  by validator and streaming binaries.
+- `src/producer.rs` — opens a reth datadir read-only, generates an `ExecutionWitness`
+  for one block, writes a `.json` or `.zst` bundle. Needs MDBX. Behind `--features producer`.
+- `src/validator.rs` — fetches one bundle from S3 (or local), validates, reports per-phase
+  wall-clock. No MDBX.
+- `src/stream.rs` — fetches a manifest of N blocks, prefetches witness N+1 while
+  validating N over a bounded tokio channel, reports per-block + aggregate stats
+  (mean / p50 / p99). Optional `--rpc URL` to cross-check `header.stateRoot` against a
+  live node. No MDBX.
+
+Encoding is selected by file/key suffix:
+- `*.json`             → pretty JSON envelope (v0; ~13 MiB / block)
+- `*.zst` / `*.bin.zst` → bincode + zstd level 3 (v1; ~3.5 MiB / block)
 
 ## Compile
 
 ```bash
-# Validator only (no MDBX)
-cargo build --release -p example-witness-exec-spike --bin witness-validator
+# Validator + streaming binary (no MDBX)
+cargo build --release -p example-witness-exec-spike --bin witness-validator --bin witness-stream
 
 # Producer too (needs MDBX-linkable host)
 SDKROOT=$(xcrun --show-sdk-path) cargo build --release \
@@ -37,17 +48,19 @@ SDKROOT=$(xcrun --show-sdk-path) cargo build --release \
 
 ## Step 1 — Produce a witness from a reth datadir
 
-Run on a host where the datadir lives (Hetzner box for us):
-
 ```bash
-./witness-producer \
-    --datadir /var/lib/reth \
-    --block 0xa8cfd050a211a1b6286ce9c636bf325e238be5ea1e67f25525b86c11854e4439 \
+# Binary + zstd (recommended)
+./witness-producer --datadir /var/lib/reth \
+    --block 0xabc...def \
+    --out /tmp/witness.zst
+
+# Or JSON (debuggable with jq)
+./witness-producer --datadir /var/lib/reth \
+    --block 0xabc...def \
     --out /tmp/witness.json
 ```
 
-Note: opening a datadir read-only while a live writer is running works via
-MDBX `MDBX_RDONLY`. The validator-side path is not affected by writer load.
+Opening a live datadir read-only works via MDBX `MDBX_RDONLY` while a writer runs.
 
 ## Step 2 — Upload to S3 (Hetzner Object Storage)
 
@@ -56,11 +69,10 @@ source /etc/default/relay-l2
 AWS_ACCESS_KEY_ID=$HETZNER_ACCESS_KEY \
 AWS_SECRET_ACCESS_KEY=$HETZNER_SECRET_KEY \
   aws --endpoint-url https://fsn1.your-objectstorage.com s3 cp \
-  /tmp/witness.json \
-  s3://reth-spike-fsn1/witnesses/<block_hash>.json
+    /tmp/witness.zst s3://reth-spike-fsn1/witnesses/<block_hash>.witness.zst
 ```
 
-## Step 3 — Validate from S3
+## Step 3a — Validate ONE block from S3
 
 ```bash
 export AWS_ACCESS_KEY_ID=$HETZNER_ACCESS_KEY
@@ -69,39 +81,62 @@ export AWS_SECRET_ACCESS_KEY=$HETZNER_SECRET_KEY
     --endpoint https://fsn1.your-objectstorage.com \
     --bucket  reth-spike-fsn1 \
     --region  fsn1 \
-    --key     witnesses/<block_hash>.json
+    --key     witnesses/<block_hash>.witness.zst
 ```
 
-Expected output:
+## Step 3b — Stream-validate N blocks with prefetch
 
-```
-[1/6] fetch:      0.xxs  (NN.NN MiB)
-[2/6] decode:     0.xxs  (block #NNNNN, state nodes=NNNN, codes=NN, ancestors=N)
-[3/6] reveal:     0.xxs
-[5/6] execute:    0.xxs  (txs=NNN, gas_used=NNNNNNNN)
-[6/6] root:       0.xxs
-OK: state root 0x... matches header
-OK: header hash 0x...
+The streaming binary reads a manifest JSON from S3, prefetches one witness ahead
+while validating the current one, and reports per-block + aggregate stats.
 
-==================================================
-TOTAL fetch→verify:           N.NNNs
-  fetch (S3 GET):             N.NNNs
-  decode (JSON+RLP):          N.NNNs
-  reveal sparse trie:         N.NNNs
-  execute (revm):             N.NNNs
-  state root recompute:       N.NNNs
-==================================================
+Manifest format (uploaded once by the producer driver script):
+
+```json
+{
+  "blocks": [
+    { "number": 25145626, "hash": "0x74b1...", "key": "witnesses/streaming/25145626-0x74b1...witness.zst" },
+    { "number": 25145627, "hash": "0xbf60...", "key": "witnesses/streaming/25145627-0xbf60...witness.zst" }
+  ]
+}
 ```
 
-## Quick local-file path (no S3 round-trip)
+Run:
 
 ```bash
-./witness-validator --local /tmp/witness.json
+./witness-stream \
+    --endpoint https://fsn1.your-objectstorage.com \
+    --bucket   reth-spike-fsn1 \
+    --region   fsn1 \
+    --manifest witnesses/streaming/manifest.json \
+    --rpc      http://localhost:8545   # optional: cross-check header.stateRoot
 ```
 
-## Why a JSON envelope instead of bincode/RLP?
+Per-block "wall" is measured from when fetched bytes land in the channel until
+validation finishes — so it is roughly `max(prefetched_fetch_time, compute_time)`
+once the pipeline fills. Steady-state throughput converges to
+`1 / max(fetch, compute)`.
 
-It's the v0 dump. Easy to inspect with `jq`. The validator's decode cost
-is dominated by the (large) hex-decoded `Bytes` lists — `serde_json` is
-not bottleneck-grade but works. v1 would use length-prefixed binary
-encoding to skip ~50ms on a typical block.
+Measured on 2026-05-21 (10 mainnet blocks at head-1, average 5.75 MiB/block zst):
+
+| run                                | mean compute | p50 compute | p99 compute | notes                              |
+|------------------------------------|-------------:|------------:|------------:|------------------------------------|
+| cross-DC (mac → fsn1), no RPC      |   172 ms     |   136 ms    |   337 ms    | wall ≈ compute (prefetch absorbed) |
+| cross-DC (mac → fsn1), with RPC    |   172 ms     |   146 ms    |   325 ms    | all 10 roots matched prod header   |
+| intra-DC (box → fsn1), with RPC    | varied       |   149 ms    | 3325 ms     | one block had per-tx hot path that |
+|                                    |              |             |             | took 3.3s under writer/RPC load    |
+
+## Quick local-file path (single block)
+
+```bash
+./witness-validator --local /tmp/witness.zst
+```
+
+## Notes / sharp edges
+
+- `debug_executionWitness` RPC on this reth build returns `BlindedNode` — the producer
+  bypasses it by reading MDBX directly.
+- `ChainSpecBuilder::mainnet().build()` drops the BPO blob schedule; producer + validator
+  must use `MAINNET` static instead.
+- `reth-codecs-0.3.1` panics on blocks > ~30 behind head — only validate fresh blocks.
+- After `executor.execute(input)`, must use `output.state`, NOT `db.take_bundle()`
+  (the latter returns an empty bundle and gives a deterministic wrong root).
