@@ -372,3 +372,61 @@ fn write_atomic(final_path: &Path, bytes: &[u8]) -> eyre::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn witness_path_format_matches_uploader_parser() {
+        // The uploader parses filenames back as `<num>-<hex_no_prefix>.witness.zst`.
+        let hash = B256::repeat_byte(0xab);
+        let p = witness_path(Path::new("/tmp"), 25145987, hash);
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("25145987-"));
+        assert!(name.ends_with(".witness.zst"));
+        // Hash should be lowercase hex with NO 0x prefix.
+        let stem = name.trim_end_matches(".witness.zst");
+        let (num_s, hash_s) = stem.split_once('-').unwrap();
+        assert_eq!(num_s.parse::<u64>().unwrap(), 25145987);
+        assert_eq!(hash_s.len(), 64);
+        assert!(!hash_s.starts_with("0x"));
+    }
+
+    #[test]
+    fn unix_to_civil_known_dates() {
+        // 2024-01-01T00:00:00Z = 1704067200
+        let (y, m, d, h, mi, s) = unix_to_civil(1704067200);
+        assert_eq!((y, m, d, h, mi, s), (2024, 1, 1, 0, 0, 0));
+        // 2026-05-21T17:35:00Z = 1779730500
+        let (y, m, d, h, mi, s) = unix_to_civil(1779730500);
+        assert_eq!((y, m, d, h, mi, s), (2026, 5, 21, 17, 35, 0));
+    }
+
+    #[test]
+    fn write_atomic_durable_no_tmp_left() {
+        let dir = std::env::temp_dir().join(format!("witness-emit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let final_path = dir.join("99-abc.witness.zst");
+        write_atomic(&final_path, b"hello").unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"hello");
+        // .tmp must not be left behind.
+        assert!(!final_path.with_extension("zst.tmp").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mark_stale_renames_when_present_and_noops_when_absent() {
+        let dir = std::env::temp_dir().join(format!("witness-emit-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("100-x.witness.zst");
+        // No-op when absent.
+        mark_stale(&p).unwrap();
+        // Rename when present.
+        std::fs::write(&p, b"x").unwrap();
+        mark_stale(&p).unwrap();
+        assert!(!p.exists());
+        assert!(p.with_extension("zst.stale").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
