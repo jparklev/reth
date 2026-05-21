@@ -1842,6 +1842,121 @@ mod tests {
         );
     }
 
+    /// Variant of `run_chunked_vs_single_repro` with a larger MDBX geometry so the test can
+    /// scale up without hitting the default 64MB test cap. Use this for the ignored
+    /// large-scale repros.
+    fn run_chunked_vs_single_repro_big(
+        num_accounts: usize,
+        slots_per_account: usize,
+        storage_settings: StorageSettings,
+    ) -> (B256, B256) {
+        use reth_db::mdbx::DatabaseArguments;
+        use reth_db_api::{cursor::DbCursorRW, transaction::DbTxMut};
+        use reth_provider::test_utils::create_test_provider_factory_with_chain_spec_and_db_args;
+
+        // 16 GB MDBX cap should hold a few million accounts + storage.
+        let db_args =
+            DatabaseArguments::test().with_geometry_max_size(Some(16 * 1024 * 1024 * 1024));
+        let factory =
+            create_test_provider_factory_with_chain_spec_and_db_args(MAINNET.clone(), db_args);
+        factory.set_storage_settings_cache(storage_settings);
+
+        let mut accounts: Vec<(B256, Account)> = Vec::with_capacity(num_accounts);
+        let mut storages: Vec<(B256, Vec<(B256, U256)>)> = Vec::with_capacity(num_accounts);
+        for i in 0..num_accounts {
+            let mut buf = [0u8; 32];
+            buf[24..32].copy_from_slice(&(i as u64).to_be_bytes());
+            let hashed_addr = keccak256(buf);
+            let acct = Account {
+                nonce: i as u64,
+                balance: U256::from(i as u64 * 1_000_000_000u64 + 1),
+                bytecode_hash: None,
+            };
+            accounts.push((hashed_addr, acct));
+
+            let mut slots = Vec::with_capacity(slots_per_account);
+            for j in 0..slots_per_account {
+                let mut sbuf = [0u8; 32];
+                sbuf[16..24].copy_from_slice(&(i as u64).to_be_bytes());
+                sbuf[24..32].copy_from_slice(&(j as u64).to_be_bytes());
+                let hashed_slot = keccak256(sbuf);
+                let value = U256::from((i * 1_000_000 + j) as u64 + 1);
+                slots.push((hashed_slot, value));
+            }
+            slots.sort_unstable_by_key(|(k, _)| *k);
+            storages.push((hashed_addr, slots));
+        }
+
+        accounts.sort_unstable_by_key(|(k, _)| *k);
+
+        {
+            let provider = factory.database_provider_rw().unwrap();
+            let tx = provider.tx_ref();
+            {
+                let mut accts_cursor = tx.cursor_write::<tables::HashedAccounts>().unwrap();
+                for (hashed_addr, acct) in &accounts {
+                    accts_cursor.append(*hashed_addr, acct).unwrap();
+                }
+            }
+            {
+                let mut storage_cursor = tx.cursor_dup_write::<tables::HashedStorages>().unwrap();
+                for (hashed_addr, slots) in &storages {
+                    if slots.is_empty() {
+                        continue;
+                    }
+                    let _ = storage_cursor.seek_exact(*hashed_addr);
+                    for (hashed_slot, value) in slots {
+                        if value.is_zero() {
+                            continue;
+                        }
+                        storage_cursor
+                            .append_dup(
+                                *hashed_addr,
+                                StorageEntry { key: *hashed_slot, value: *value },
+                            )
+                            .unwrap();
+                    }
+                }
+            }
+            provider.commit().unwrap();
+        }
+
+        let chunked_root = compute_state_root_chunked(&factory).unwrap();
+
+        {
+            let provider = factory.database_provider_rw().unwrap();
+            provider.tx_ref().clear::<tables::AccountsTrie>().unwrap();
+            provider.tx_ref().clear::<tables::StoragesTrie>().unwrap();
+            provider.commit().unwrap();
+        }
+
+        let single_root = {
+            let provider = factory.database_provider_rw().unwrap();
+            let root = compute_state_root(&provider, None).unwrap();
+            provider.commit().unwrap();
+            root
+        };
+
+        (chunked_root, single_root)
+    }
+
+    #[test]
+    #[ignore]
+    fn chunked_vs_single_state_root_million_accounts_v2() {
+        // 1M accounts, 0 slots. Pushes a deep account trie and many commits.
+        let (chunked, single) =
+            run_chunked_vs_single_repro_big(1_000_000, 0, StorageSettings::v2());
+        assert_eq!(chunked, single, "chunked vs single root mismatch on 1M accounts v2");
+    }
+
+    #[test]
+    #[ignore]
+    fn chunked_vs_single_state_root_many_with_slots_v2() {
+        // 200k accounts × 5 slots = 1M units. Many account+storage transitions.
+        let (chunked, single) = run_chunked_vs_single_repro_big(200_000, 5, StorageSettings::v2());
+        assert_eq!(chunked, single, "chunked vs single root mismatch on 200k×5 v2");
+    }
+
     /// Like `run_chunked_vs_single_repro`, but adds variation that mirrors real mainnet state:
     /// - Some accounts have bytecode_hash set (contracts)
     /// - Some accounts have empty storage (EOAs)
@@ -2017,5 +2132,30 @@ mod tests {
     fn chunked_vs_single_mixed_state_v1() {
         let (chunked, single) = run_chunked_vs_single_mixed(400, StorageSettings::v1());
         assert_eq!(chunked, single, "chunked vs single root mismatch on mixed v1");
+    }
+
+    /// Bigger scale that pushes the chunked function through many commits.
+    /// Use --ignored to opt in.
+    ///
+    /// Requires `RUST_MIN_STACK=8388608` and ~4 GB heap because we hold
+    /// the synthetic state in memory before writing.
+    #[test]
+    #[ignore]
+    fn chunked_vs_single_state_root_large_v2() {
+        // ~150k accounts × ~3 slots each = ~600k trie units → ~24 chunks
+        // at threshold 25_000. Crosses many commit boundaries.
+        let (chunked, single) = run_chunked_vs_single_repro(150_000, 3, StorageSettings::v2());
+        assert_eq!(chunked, single, "chunked vs single root mismatch on large v2");
+    }
+
+    /// Wider scale with mixed-shape accounts. Use --ignored to opt in.
+    #[test]
+    #[ignore]
+    fn chunked_vs_single_mixed_large_v2() {
+        // 4_000 accounts mixed; the 500 big-contract accounts (i%8==4) with
+        // 5_000 slots each = ~2.5M storage units → many storage-trie pauses
+        // mid-account across commits.
+        let (chunked, single) = run_chunked_vs_single_mixed(4_000, StorageSettings::v2());
+        assert_eq!(chunked, single, "chunked vs single root mismatch on mixed large v2");
     }
 }
