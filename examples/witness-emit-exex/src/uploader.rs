@@ -101,10 +101,7 @@ fn main() -> eyre::Result<()> {
         "uploader starting"
     );
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(4)
-        .build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(4).build()?;
     rt.block_on(run(cli, signing_key))
 }
 
@@ -145,7 +142,17 @@ async fn run(cli: Cli, signing_key: ed25519_dalek::SigningKey) -> eyre::Result<(
             if seen_uploaded.contains(&path) {
                 continue;
             }
-            match upload_one(&cli, &s3, &signing_key, manifest.clone(), block_number, block_hash, &path).await {
+            match upload_one(
+                &cli,
+                &s3,
+                &signing_key,
+                manifest.clone(),
+                block_number,
+                block_hash,
+                &path,
+            )
+            .await
+            {
                 Ok(()) => {
                     seen_uploaded.insert(path.clone());
                     if cli.delete_after_upload {
@@ -224,11 +231,10 @@ async fn upload_one(
     // The on-disk filename uses `{block_hash:x}` (no 0x), but the manifest
     // wants a real B256. Parse it back.
     let block_hash = parse_b256_hex(&block_hash_hex)?;
-    let parent_hash =
-        peek_parent_hash(path).unwrap_or_else(|err| {
-            warn!(?err, ?path, "could not peek parent hash; recording 0x0");
-            alloy_primitives::B256::ZERO
-        });
+    let parent_hash = peek_parent_hash(path).unwrap_or_else(|err| {
+        warn!(?err, ?path, "could not peek parent hash; recording 0x0");
+        alloy_primitives::B256::ZERO
+    });
 
     let entry = ManifestEntry {
         block_number,
@@ -257,8 +263,15 @@ async fn upload_one(
         cli.public_read,
     )
     .await?;
-    s3_put_with_retry(s3, &cli.bucket, &head_key, manifest_bytes, cli.upload_retries, cli.public_read)
-        .await?;
+    s3_put_with_retry(
+        s3,
+        &cli.bucket,
+        &head_key,
+        manifest_bytes,
+        cli.upload_retries,
+        cli.public_read,
+    )
+    .await?;
 
     let total = started.elapsed();
     let stats_line = serde_json::json!({
@@ -272,7 +285,12 @@ async fn upload_one(
         "sha256": sha,
     });
     append_stats(&cli.stats, &stats_line);
-    info!(block = block_number, size_kb = size_bytes / 1024, upload_ms = upload_elapsed.as_millis(), "uploaded");
+    info!(
+        block = block_number,
+        size_kb = size_bytes / 1024,
+        upload_ms = upload_elapsed.as_millis(),
+        "uploaded"
+    );
     Ok(())
 }
 

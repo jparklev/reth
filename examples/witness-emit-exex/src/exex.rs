@@ -25,9 +25,7 @@ use reth_ethereum::{
     EthPrimitives,
 };
 use reth_evm::{execute::Executor, ConfigureEvm};
-use reth_revm::{
-    database::StateProviderDatabase, db::State, witness::ExecutionWitnessRecord,
-};
+use reth_revm::{database::StateProviderDatabase, db::State, witness::ExecutionWitnessRecord};
 use reth_storage_api::StateProviderFactory;
 use reth_trie_common::ExecutionWitnessMode;
 use std::{
@@ -102,8 +100,7 @@ where
             // listing the dir during a reorg sees a consistent state.
             if let Some(old) = notification.reverted_chain() {
                 for block in old.blocks_iter() {
-                    let path =
-                        witness_path(&self.out_dir, block.number(), block.hash());
+                    let path = witness_path(&self.out_dir, block.number(), block.hash());
                     if let Err(err) = mark_stale(&path) {
                         warn!(?err, block = block.number(), "mark stale failed");
                     } else {
@@ -120,12 +117,7 @@ where
                 let mut had_failure = false;
                 for block in committed.blocks_iter() {
                     let block_started = Instant::now();
-                    match emit_block(
-                        &self.ctx,
-                        &self.out_dir,
-                        block,
-                        block_started,
-                    ) {
+                    match emit_block(&self.ctx, &self.out_dir, block, block_started) {
                         Ok(stats) => {
                             self.write_stats(&stats);
                             info!(
@@ -158,8 +150,8 @@ where
                             });
                             if let Some(path) = &self.stats_path {
                                 use std::io::Write;
-                                if let Ok(mut f) = std::fs::OpenOptions::new()
-                                    .create(true).append(true).open(path)
+                                if let Ok(mut f) =
+                                    std::fs::OpenOptions::new().create(true).append(true).open(path)
                                 {
                                     let _ = writeln!(f, "{line}");
                                 }
@@ -172,8 +164,7 @@ where
                 // mid-chain failure, downstream restart will re-deliver the
                 // failed block (and everything after).
                 if let Some(durable) = highest_durable {
-                    if let Err(err) = self.ctx.events.send(ExExEvent::FinishedHeight(durable))
-                    {
+                    if let Err(err) = self.ctx.events.send(ExExEvent::FinishedHeight(durable)) {
                         warn!(?err, "send FinishedHeight failed (ExEx manager gone?)");
                         break;
                     }
@@ -235,9 +226,8 @@ where
         .wrap_err_with(|| format!("state_by_block_hash({parent_hash})"))?;
     let state_open_ms = t_state.elapsed().as_millis();
 
-    // 2) Re-execute. This populates the `State<DB>` cache with EVERY touched
-    //    account/slot — including reads that returned the original value, which
-    //    are what we need a witness for.
+    // 2) Re-execute. This populates the `State<DB>` cache with EVERY touched account/slot —
+    //    including reads that returned the original value, which are what we need a witness for.
     let t_exec = Instant::now();
     let evm_config = ctx.evm_config().clone();
     let mut db = State::builder()
@@ -367,14 +357,13 @@ fn write_atomic(final_path: &Path, bytes: &[u8]) -> eyre::Result<()> {
     use std::io::Write;
     let tmp = final_path.with_extension("zst.tmp");
     {
-        let mut f = std::fs::File::create(&tmp)
-            .wrap_err_with(|| format!("create {}", tmp.display()))?;
+        let mut f =
+            std::fs::File::create(&tmp).wrap_err_with(|| format!("create {}", tmp.display()))?;
         f.write_all(bytes).wrap_err_with(|| format!("write {}", tmp.display()))?;
         f.sync_all().wrap_err_with(|| format!("fsync {}", tmp.display()))?;
     }
-    std::fs::rename(&tmp, final_path).wrap_err_with(|| {
-        format!("rename {} -> {}", tmp.display(), final_path.display())
-    })?;
+    std::fs::rename(&tmp, final_path)
+        .wrap_err_with(|| format!("rename {} -> {}", tmp.display(), final_path.display()))?;
     // fsync the containing dir so the rename is durable across power loss.
     if let Some(dir) = final_path.parent() {
         if let Ok(d) = std::fs::File::open(dir) {
@@ -383,4 +372,3 @@ fn write_atomic(final_path: &Path, bytes: &[u8]) -> eyre::Result<()> {
     }
     Ok(())
 }
-
