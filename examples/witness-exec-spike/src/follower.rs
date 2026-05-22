@@ -238,6 +238,12 @@ async fn run(cli: Cli, spec: Arc<ChainSpec>) -> eyre::Result<()> {
         info!(reader = %cli.name, ?err, "no cursor; starting fresh");
         Cursor::fresh()
     });
+    // Surface the loaded cursor so dashboards don't show validated_block=0 on
+    // every reader restart. The gauge would otherwise be silent until the
+    // next successful validation lands.
+    if cursor.last_block_number > 0 {
+        metrics::gauge!(FOLLOW_VALIDATED_BLOCK).set(cursor.last_block_number as f64);
+    }
     info!(
         reader = %cli.name,
         last_block = cursor.last_block_number,
