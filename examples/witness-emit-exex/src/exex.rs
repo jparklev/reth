@@ -15,7 +15,8 @@
 //! witness files to `<...>.witness.zst.stale` so the uploader can skip them.
 
 use alloy_consensus::BlockHeader;
-use alloy_primitives::B256;
+use alloy_eips::{eip2935, eip4788, eip7002, eip7251};
+use alloy_primitives::{keccak256, B256};
 use alloy_rlp::Encodable;
 use eyre::WrapErr;
 use futures_util::StreamExt;
@@ -292,6 +293,26 @@ where
     let execute_ms = t_exec.elapsed().as_millis();
 
     // 3) Build the witness (proofs + ancestor headers).
+    //
+    // Defense in depth: `ExecutionWitnessMode::Canonical` collects bytecode
+    // from `statedb.cache.contracts.values()`, which is whatever revm
+    // happened to load via `code_by_hash` during execution. That cache is
+    // populated as a side effect of evaluation and varies depending on the
+    // path that drove the block (live engine vs staged-sync replay vs
+    // post-`stage unwind`). Predeployed system contracts called by the
+    // block prologue (EIP-2935 BLOCKHASH, EIP-4788 BeaconRoots, EIP-7002
+    // WithdrawalRequest, EIP-7251 ConsolidationRequest) sometimes execute
+    // without ever triggering a `code_by_hash` miss — which means the
+    // emitted witness omits their bytecode, and the stateless validator
+    // fails with `missing code for hash 0x6e49...`.
+    //
+    // We inject the known system-contract bytecodes unconditionally. The
+    // network's post-Prague invariant is that these accounts are
+    // pre-deployed with these exact bytecodes; including them is correct
+    // for every Prague-active block (the validator just needs them to
+    // exist in `bundle.witness.codes`, not to be the most recent value).
+    inject_system_contracts(&mut witness_record);
+
     let t_proof = Instant::now();
     let codes_count = witness_record.codes.len();
     let keys_count = witness_record.keys.len();
@@ -390,6 +411,35 @@ const fn unix_to_civil(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
 
 fn witness_path(dir: &Path, block_number: u64, block_hash: B256) -> PathBuf {
     dir.join(format!("{block_number}-{block_hash:x}.witness.zst"))
+}
+
+/// Inject the post-Prague system-contract bytecodes into the witness record.
+///
+/// `ExecutionWitnessRecord` collects bytecode by walking
+/// `statedb.cache.contracts`, which is populated only as a side effect of
+/// `code_by_hash` misses inside revm. The block prologue executes these
+/// system contracts via `transact_system_call`, which can succeed against
+/// preloaded account state without ever triggering a code miss — leaving
+/// the emitted witness missing the contract bytecode and unvalidatable.
+///
+/// These are constants per the EIPs (the producer cannot get them wrong)
+/// so we always inject them. Duplicate entries are deduped by
+/// `into_execution_witness` later, so there's no over-counting harm.
+fn inject_system_contracts(record: &mut ExecutionWitnessRecord) {
+    for code in [
+        eip2935::HISTORY_STORAGE_CODE.clone(),
+        eip4788::BEACON_ROOTS_CODE.clone(),
+        eip7002::WITHDRAWAL_REQUEST_PREDEPLOY_CODE.clone(),
+        eip7251::CONSOLIDATION_REQUEST_PREDEPLOY_CODE.clone(),
+    ] {
+        // record.codes is a Vec<Bytes>. Skip if the producer already has it
+        // — saves a few hundred bytes on the wire.
+        if record.codes.iter().any(|c| c == &code) {
+            continue;
+        }
+        let _ = keccak256(&code); // assert hashable (zero-cost paranoia).
+        record.codes.push(code);
+    }
 }
 
 fn describe_metrics() {
