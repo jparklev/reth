@@ -1,0 +1,66 @@
+[Unit]
+Description=reth-witness-emit-node — reth node with witness-emitting ExEx
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=15min
+StartLimitBurst=4
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Two env files:
+#   - relay-l2: shared cluster secrets (HETZNER_* etc.)
+#   - witness-emit: producer-specific overrides (datadir, ports, trusted-peers)
+EnvironmentFile=/etc/default/relay-l2
+EnvironmentFile=/etc/default/witness-emit-node
+
+# `start-reth-witness-emit-node` enforces required env vars (PROD_ENODE,
+# DATADIR, AUTHRPC_PORT etc.) before exec()-ing the binary. Keeping the
+# CLI assembly out of the unit file makes it MUCH easier to evolve the
+# arguments without sudo-editing systemd units.
+ExecStartPre=/bin/mkdir -p /var/lib/witness-emit/inbox
+ExecStartPre=/bin/mkdir -p /var/log/reth-witness-emit
+ExecStartPre=/usr/local/libexec/reth-witness-emit-preflight
+ExecStart=/usr/local/libexec/start-reth-witness-emit-node
+
+Restart=on-failure
+RestartSec=30s
+LimitNOFILE=1048576
+
+# The producer was observed at 11 GB peak RSS in the 30-min benchmark.
+# `MemoryHigh` triggers pressure-driven reclaim well before the kernel OOM
+# pushes ahead. `MemoryMax` is the hard ceiling. `MemorySwapMax=0` keeps the
+# producer from being silently swapped out — swap on this box is already
+# exhausted and any extra swapping kills latency.
+MemoryHigh=14G
+MemoryMax=18G
+MemorySwapMax=0
+
+# Prefer to kill us over prod reth under memory pressure. Prod reth runs as
+# user `reth` with the default OOMScoreAdjust=0; +500 here heavily biases the
+# OOM killer toward us.
+OOMScoreAdjust=500
+OOMPolicy=stop
+
+# Standard hardening profile, scoped to the paths we actually need to write.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/reth/reth-bucket-import-test-v6 /var/lib/witness-emit /var/log/reth-witness-emit
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=reth-witness-emit
+
+[Install]
+WantedBy=multi-user.target

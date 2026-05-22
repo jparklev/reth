@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Pre-start checks for witness-uploader.service.
+#
+# Verifies the writer key exists, has the correct mode/ownership/size, and
+# that the S3 endpoint is reachable. Pure environment hygiene — we do NOT
+# attempt an actual S3 PUT here because credential errors are better
+# surfaced by the uploader's first real upload attempt with retries.
+
+set -euo pipefail
+
+: "${SIGNING_KEY:?SIGNING_KEY required}"
+: "${S3_ENDPOINT:?S3_ENDPOINT required}"
+: "${S3_BUCKET:?S3_BUCKET required}"
+: "${WITNESS_EMIT_DIR:?WITNESS_EMIT_DIR required}"
+: "${HETZNER_ACCESS_KEY:?HETZNER_ACCESS_KEY required}"
+: "${HETZNER_SECRET_KEY:?HETZNER_SECRET_KEY required}"
+
+if [[ ! -f "${SIGNING_KEY}" ]]; then
+    echo "signing key missing: ${SIGNING_KEY}" >&2
+    exit 1
+fi
+
+key_size="$(stat -c '%s' "${SIGNING_KEY}")"
+if [[ "${key_size}" != "32" ]]; then
+    echo "signing key must be exactly 32 bytes, got ${key_size}" >&2
+    exit 1
+fi
+
+key_mode="$(stat -c '%a' "${SIGNING_KEY}")"
+if [[ "${key_mode}" != "600" && "${key_mode}" != "400" ]]; then
+    echo "signing key must be 400 or 600, got ${key_mode}: ${SIGNING_KEY}" >&2
+    exit 1
+fi
+
+mkdir -p "${WITNESS_EMIT_DIR}"
+if [[ ! -w "${WITNESS_EMIT_DIR}" ]]; then
+    echo "WITNESS_EMIT_DIR not writable: ${WITNESS_EMIT_DIR}" >&2
+    exit 1
+fi
+
+# Resolve S3 endpoint host.
+endpoint="${S3_ENDPOINT}"
+endpoint="${endpoint#http://}"
+endpoint="${endpoint#https://}"
+endpoint_host="${endpoint%%/*}"
+endpoint_host="${endpoint_host%%:*}"
+if ! getent hosts "${endpoint_host}" >/dev/null 2>&1; then
+    echo "S3 endpoint does not resolve: ${endpoint_host}" >&2
+    exit 1
+fi
+
+echo "preflight OK: key=${SIGNING_KEY} bucket=${S3_BUCKET}"

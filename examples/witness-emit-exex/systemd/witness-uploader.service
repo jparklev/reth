@@ -1,0 +1,53 @@
+[Unit]
+Description=witness-uploader — picks up ExEx-produced witnesses and uploads them
+After=network-online.target reth-witness-emit-node.service
+Wants=network-online.target
+StartLimitIntervalSec=15min
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+EnvironmentFile=/etc/default/relay-l2
+EnvironmentFile=/etc/default/witness-emit-uploader
+
+ExecStartPre=/bin/mkdir -p /var/lib/witness-emit/inbox
+ExecStartPre=/usr/local/libexec/witness-uploader-preflight
+ExecStart=/usr/local/libexec/start-witness-uploader
+
+Restart=on-failure
+RestartSec=20s
+LimitNOFILE=65536
+
+# The uploader is small — only the in-memory manifest plus the bytes of the
+# current witness being put. Leave plenty of headroom for occasional larger
+# witnesses without making the cap so high that an upload backlog can balloon
+# unnoticed.
+MemoryHigh=512M
+MemoryMax=1G
+MemorySwapMax=0
+
+OOMScoreAdjust=400
+OOMPolicy=stop
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/witness-emit
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=witness-uploader
+
+[Install]
+WantedBy=multi-user.target

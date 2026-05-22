@@ -42,6 +42,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 tracing.workspace = true
 bincode.workspace = true
 zstd.workspace = true
+metrics.workspace = true
 
 # Uploader-only deps.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"], optional = true }
@@ -49,6 +50,11 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-ve
 chrono = { workspace = true, features = ["serde"], optional = true }
 ed25519-dalek = { version = "2.2", optional = true }
 hex = { version = "0.4", optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+metrics-util = { version = "0.20.0", optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 sha2 = { workspace = true, features = ["std"], optional = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"], optional = true }
 
@@ -60,6 +66,11 @@ uploader = [
     "dep:chrono",
     "dep:ed25519-dalek",
     "dep:hex",
+    "dep:metrics-exporter-prometheus",
+    "dep:metrics-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
     "dep:sha2",
     "dep:tracing-subscriber",
 ]

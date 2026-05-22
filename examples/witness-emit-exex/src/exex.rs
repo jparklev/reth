@@ -36,6 +36,33 @@ use tracing::{debug, error, info, warn};
 
 use crate::bundle::{encode_bundle, Encoding, WitnessBundle};
 
+// ---------------------------------------------------------------------------
+// Prometheus metrics
+//
+// We piggyback on reth's process-wide Prometheus recorder (installed by
+// `reth_node_metrics::recorder::install_prometheus_recorder`) so all metric
+// names land on the same `--metrics` scrape endpoint.
+// ---------------------------------------------------------------------------
+
+/// Counter: total per-block emit attempts, labelled `result=ok|err|stale_reorg`.
+const EMIT_TOTAL: &str = "witness_emit_total";
+/// Histogram: end-to-end notification -> file-durable latency, seconds.
+const EMIT_E2E_SECONDS: &str = "witness_emit_e2e_seconds";
+/// Histogram: re-execution time, seconds.
+const EMIT_EXECUTE_SECONDS: &str = "witness_emit_execute_seconds";
+/// Histogram: witness build (proof generation) time, seconds.
+const EMIT_BUILD_SECONDS: &str = "witness_emit_build_seconds";
+/// Histogram: bincode+zstd encode time, seconds.
+const EMIT_ENCODE_SECONDS: &str = "witness_emit_encode_seconds";
+/// Histogram: encoded witness size, bytes.
+const EMIT_SIZE_BYTES: &str = "witness_emit_size_bytes";
+/// Gauge: latest block number for which a witness file was durably written.
+const EMIT_HIGHEST_BLOCK: &str = "witness_emit_highest_block";
+/// Counter: re-org events handled.
+const EMIT_REORG_TOTAL: &str = "witness_emit_reorg_total";
+/// Counter: blocks marked `.stale` due to a re-org.
+const EMIT_STALE_MARKED_TOTAL: &str = "witness_emit_stale_marked_total";
+
 /// Per-block stats line appended to the `--stats` JSONL file (or stdout if no
 /// stats file is configured).
 #[derive(serde::Serialize)]
@@ -93,18 +120,22 @@ where
         }
         info!(out_dir = %self.out_dir.display(), "witness-emit ExEx ready");
 
+        describe_metrics();
+
         while let Some(result) = self.ctx.notifications.next().await {
             let notification = result.wrap_err("recv ExEx notification")?;
 
             // Mark reverted blocks stale BEFORE we emit new ones — so a reader
             // listing the dir during a reorg sees a consistent state.
             if let Some(old) = notification.reverted_chain() {
+                metrics::counter!(EMIT_REORG_TOTAL).increment(1);
                 for block in old.blocks_iter() {
                     let path = witness_path(&self.out_dir, block.number(), block.hash());
                     if let Err(err) = mark_stale(&path) {
                         warn!(?err, block = block.number(), "mark stale failed");
                     } else {
                         info!(block = block.number(), hash = %block.hash(), "marked stale (reorg)");
+                        metrics::counter!(EMIT_STALE_MARKED_TOTAL).increment(1);
                     }
                 }
             }
@@ -120,6 +151,21 @@ where
                     match emit_block(&self.ctx, &self.out_dir, block, block_started) {
                         Ok(stats) => {
                             self.write_stats(&stats);
+                            // Histograms accept f64 seconds; the recorder maps
+                            // them onto its bucket layout. We feed seconds so a
+                            // single dashboard expression works regardless of
+                            // whether we ever switch to summary types.
+                            metrics::counter!(EMIT_TOTAL, "result" => "ok").increment(1);
+                            metrics::histogram!(EMIT_E2E_SECONDS)
+                                .record(stats.e2e_ms as f64 / 1000.0);
+                            metrics::histogram!(EMIT_EXECUTE_SECONDS)
+                                .record(stats.execute_ms as f64 / 1000.0);
+                            metrics::histogram!(EMIT_BUILD_SECONDS)
+                                .record(stats.witness_build_ms as f64 / 1000.0);
+                            metrics::histogram!(EMIT_ENCODE_SECONDS)
+                                .record(stats.encode_ms as f64 / 1000.0);
+                            metrics::histogram!(EMIT_SIZE_BYTES).record(stats.size_bytes as f64);
+                            metrics::gauge!(EMIT_HIGHEST_BLOCK).set(stats.block_number as f64);
                             info!(
                                 block = stats.block_number,
                                 e2e_ms = stats.e2e_ms,
@@ -140,6 +186,7 @@ where
                             // uploader scans for `.stale` files so a missing
                             // `.witness.zst` simply doesn't get advertised.
                             had_failure = true;
+                            metrics::counter!(EMIT_TOTAL, "result" => "err").increment(1);
                             error!(block = block.number(), ?err, "emit failed; continuing");
                             let line = serde_json::json!({
                                 "ts": chrono_rfc3339(),
@@ -343,6 +390,23 @@ const fn unix_to_civil(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
 
 fn witness_path(dir: &Path, block_number: u64, block_hash: B256) -> PathBuf {
     dir.join(format!("{block_number}-{block_hash:x}.witness.zst"))
+}
+
+fn describe_metrics() {
+    use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+    describe_counter!(EMIT_TOTAL, "ExEx per-block emit attempts");
+    describe_counter!(EMIT_REORG_TOTAL, "ChainReverted notifications observed");
+    describe_counter!(EMIT_STALE_MARKED_TOTAL, "Witness files renamed to .stale due to a reorg");
+    describe_histogram!(
+        EMIT_E2E_SECONDS,
+        Unit::Seconds,
+        "ChainCommitted -> file-durable wall clock per block"
+    );
+    describe_histogram!(EMIT_EXECUTE_SECONDS, Unit::Seconds, "Re-execution time per block");
+    describe_histogram!(EMIT_BUILD_SECONDS, Unit::Seconds, "Witness proof-build time per block");
+    describe_histogram!(EMIT_ENCODE_SECONDS, Unit::Seconds, "bincode+zstd encode time per block");
+    describe_histogram!(EMIT_SIZE_BYTES, Unit::Bytes, "Encoded witness size per block");
+    describe_gauge!(EMIT_HIGHEST_BLOCK, "Highest block number durably written by the ExEx");
 }
 
 fn mark_stale(path: &Path) -> std::io::Result<()> {

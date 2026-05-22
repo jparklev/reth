@@ -14,6 +14,7 @@ use eyre::{eyre, Context};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -23,6 +24,8 @@ use tracing::{error, info, warn};
 
 #[path = "bundle.rs"]
 mod bundle;
+#[path = "metrics_server.rs"]
+mod metrics_server;
 #[path = "uploader_live_manifest.rs"]
 mod live_manifest;
 #[path = "uploader_signing.rs"]
@@ -72,6 +75,34 @@ struct Cli {
     /// Make uploaded objects publicly readable (so a CDN can serve them).
     #[arg(long, default_value = "true")]
     public_read: bool,
+    /// Bind a Prometheus `/metrics` endpoint here. `0.0.0.0:0` disables.
+    #[arg(long, default_value = "127.0.0.1:19003")]
+    metrics_addr: SocketAddr,
+}
+
+const UPLOAD_TOTAL: &str = "witness_uploader_upload_total";
+const UPLOAD_LATENCY_SECONDS: &str = "witness_uploader_upload_latency_seconds";
+const UPLOAD_TOTAL_LATENCY_SECONDS: &str = "witness_uploader_total_latency_seconds";
+const UPLOAD_SIZE_BYTES: &str = "witness_uploader_size_bytes";
+const UPLOAD_RETRIES_TOTAL: &str = "witness_uploader_retries_total";
+const UPLOAD_HIGHEST_BLOCK: &str = "witness_uploader_highest_block";
+const UPLOAD_INBOX_DEPTH: &str = "witness_uploader_inbox_depth";
+const UPLOAD_STALE_HANDLED_TOTAL: &str = "witness_uploader_stale_handled_total";
+
+fn describe_metrics() {
+    use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+    describe_counter!(UPLOAD_TOTAL, "Witness uploads, labelled result=ok|err");
+    describe_counter!(UPLOAD_RETRIES_TOTAL, "S3 put retry attempts");
+    describe_counter!(UPLOAD_STALE_HANDLED_TOTAL, "Stale files processed (manifest rewinds)");
+    describe_histogram!(UPLOAD_LATENCY_SECONDS, Unit::Seconds, "S3 PUT latency per witness");
+    describe_histogram!(
+        UPLOAD_TOTAL_LATENCY_SECONDS,
+        Unit::Seconds,
+        "Total file-pickup -> manifest-published latency"
+    );
+    describe_histogram!(UPLOAD_SIZE_BYTES, Unit::Bytes, "Encoded witness size per upload");
+    describe_gauge!(UPLOAD_HIGHEST_BLOCK, "Highest block number whose witness has been published");
+    describe_gauge!(UPLOAD_INBOX_DEPTH, "Number of witness files waiting to be uploaded");
 }
 
 fn main() -> eyre::Result<()> {
@@ -106,6 +137,12 @@ fn main() -> eyre::Result<()> {
 }
 
 async fn run(cli: Cli, signing_key: ed25519_dalek::SigningKey) -> eyre::Result<()> {
+    if let Err(err) = metrics_server::install_and_serve(cli.metrics_addr).await {
+        warn!(?err, addr = %cli.metrics_addr, "metrics server failed to start");
+    } else {
+        describe_metrics();
+    }
+
     let s3 = build_s3_client(&cli).await;
 
     // Load the existing manifest from S3, or start empty.
@@ -137,6 +174,10 @@ async fn run(cli: Cli, signing_key: ed25519_dalek::SigningKey) -> eyre::Result<(
             }
         };
 
+        // Inbox depth is observed AFTER the stale-pickup pass so it reflects
+        // the next pass's work, not the previous pass.
+        metrics::gauge!(UPLOAD_INBOX_DEPTH).set(entries.len() as f64);
+
         let mut uploaded_this_pass = 0usize;
         for (block_number, block_hash, path) in entries {
             if seen_uploaded.contains(&path) {
@@ -154,6 +195,8 @@ async fn run(cli: Cli, signing_key: ed25519_dalek::SigningKey) -> eyre::Result<(
             .await
             {
                 Ok(()) => {
+                    metrics::counter!(UPLOAD_TOTAL, "result" => "ok").increment(1);
+                    metrics::gauge!(UPLOAD_HIGHEST_BLOCK).set(block_number as f64);
                     seen_uploaded.insert(path.clone());
                     if cli.delete_after_upload {
                         if let Err(err) = std::fs::remove_file(&path) {
@@ -166,6 +209,7 @@ async fn run(cli: Cli, signing_key: ed25519_dalek::SigningKey) -> eyre::Result<(
                     uploaded_this_pass += 1;
                 }
                 Err(err) => {
+                    metrics::counter!(UPLOAD_TOTAL, "result" => "err").increment(1);
                     error!(block = block_number, ?err, "upload failed");
                     break; // back off; try again next tick
                 }
@@ -274,6 +318,9 @@ async fn upload_one(
     .await?;
 
     let total = started.elapsed();
+    metrics::histogram!(UPLOAD_LATENCY_SECONDS).record(upload_elapsed.as_secs_f64());
+    metrics::histogram!(UPLOAD_TOTAL_LATENCY_SECONDS).record(total.as_secs_f64());
+    metrics::histogram!(UPLOAD_SIZE_BYTES).record(size_bytes as f64);
     let stats_line = serde_json::json!({
         "ts": signed_at,
         "block_number": block_number,
@@ -354,10 +401,14 @@ async fn handle_stale(
         m.rewind_above(rw);
         warn!(rewound_above = rw, "rewound manifest due to stale files");
     }
+    let stale_count = to_delete.len();
     for p in to_delete {
         if let Err(err) = std::fs::remove_file(&p) {
             warn!(?err, ?p, "delete stale failed");
         }
+    }
+    if stale_count > 0 {
+        metrics::counter!(UPLOAD_STALE_HANDLED_TOTAL).increment(stale_count as u64);
     }
     Ok(())
 }
@@ -403,12 +454,14 @@ async fn s3_put_with_retry(
         match res {
             Ok(Ok(_)) => return Ok(()),
             Ok(Err(e)) => {
+                metrics::counter!(UPLOAD_RETRIES_TOTAL, "kind" => "error").increment(1);
                 if attempt >= max_retries {
                     return Err(eyre!("s3 put {key}: {e}"));
                 }
                 warn!(key, attempt, err = %e, "s3 put failed; retrying");
             }
             Err(_) => {
+                metrics::counter!(UPLOAD_RETRIES_TOTAL, "kind" => "timeout").increment(1);
                 if attempt >= max_retries {
                     return Err(eyre!("s3 put {key}: timeout"));
                 }

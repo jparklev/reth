@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Pre-start checks for reth-witness-emit-node.service.
+#
+# Verifies the env file is sane and the box has enough free space before reth
+# tries to open MDBX (which would otherwise produce a much less obvious error
+# if the disk is full).
+
+set -euo pipefail
+
+: "${DATADIR:?DATADIR is required}"
+: "${WITNESS_EMIT_DIR:?WITNESS_EMIT_DIR is required}"
+: "${PROD_ENODE:?PROD_ENODE is required}"
+: "${JWT_PATH:?JWT_PATH is required}"
+
+# Sanity-check the enode shape: enode://<128-hex-pubkey>@<addr>:<port>
+if ! [[ "${PROD_ENODE}" =~ ^enode://[0-9a-fA-F]{128}@[^:]+:[0-9]+$ ]]; then
+    echo "PROD_ENODE has unexpected shape: ${PROD_ENODE}" >&2
+    exit 1
+fi
+
+if [[ ! -d "${DATADIR}" ]]; then
+    echo "DATADIR does not exist: ${DATADIR}" >&2
+    exit 1
+fi
+
+if [[ ! -r "${JWT_PATH}" ]]; then
+    echo "JWT_PATH not readable: ${JWT_PATH}" >&2
+    exit 1
+fi
+
+mkdir -p "${WITNESS_EMIT_DIR}"
+if [[ ! -w "${WITNESS_EMIT_DIR}" ]]; then
+    echo "WITNESS_EMIT_DIR not writable: ${WITNESS_EMIT_DIR}" >&2
+    exit 1
+fi
+
+# Refuse to start if the datadir partition has less than MIN_FREE_GB free.
+# Reth needs headroom for compaction + log rotation; running it on a full
+# disk corrupts MDBX in subtle ways.
+MIN_FREE_GB="${MIN_FREE_GB:-30}"
+free_kb="$(df --output=avail -k "${DATADIR}" | tail -n1 | tr -d ' ')"
+free_gb=$(( free_kb / 1024 / 1024 ))
+if (( free_gb < MIN_FREE_GB )); then
+    echo "refusing to start: only ${free_gb}G free at ${DATADIR}, need ${MIN_FREE_GB}G" >&2
+    exit 1
+fi
+
+# Likewise for the inbox volume — full inbox blocks the ExEx's write_atomic.
+inbox_free_kb="$(df --output=avail -k "${WITNESS_EMIT_DIR}" | tail -n1 | tr -d ' ')"
+inbox_free_gb=$(( inbox_free_kb / 1024 / 1024 ))
+MIN_INBOX_FREE_GB="${MIN_INBOX_FREE_GB:-5}"
+if (( inbox_free_gb < MIN_INBOX_FREE_GB )); then
+    echo "refusing to start: only ${inbox_free_gb}G free at ${WITNESS_EMIT_DIR}, need ${MIN_INBOX_FREE_GB}G" >&2
+    exit 1
+fi
+
+echo "preflight OK: datadir=${DATADIR} free=${free_gb}G inbox_free=${inbox_free_gb}G"

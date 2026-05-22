@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Launcher for reth-witness-emit-node.service.
+#
+# All node configuration comes from /etc/default/witness-emit-node so that
+# operators can change ports, datadir, or the trusted-peer enode without
+# touching the systemd unit (which would require a daemon-reload). The
+# launcher validates required vars up front so a misconfiguration is loud
+# and immediate instead of a confusing reth crash three layers in.
+
+set -euo pipefail
+
+: "${DATADIR:?DATADIR is required (e.g. /var/lib/reth/reth-bucket-import-test-v6)}"
+: "${PROD_ENODE:?PROD_ENODE is required (e.g. enode://abc@127.0.0.1:30303)}"
+: "${AUTHRPC_PORT:?AUTHRPC_PORT is required}"
+: "${HTTP_PORT:?HTTP_PORT is required}"
+: "${WS_PORT:?WS_PORT is required}"
+: "${P2P_PORT:?P2P_PORT is required}"
+: "${METRICS_PORT:?METRICS_PORT is required}"
+: "${WITNESS_EMIT_DIR:?WITNESS_EMIT_DIR is required}"
+: "${WITNESS_STATS:?WITNESS_STATS is required}"
+: "${JWT_PATH:?JWT_PATH is required (engine API JWT secret)}"
+
+CHAIN="${CHAIN:-mainnet}"
+RUST_LOG="${RUST_LOG:-info,witness_emit=info}"
+LOG_DIR="${LOG_DIR:-/var/log/reth-witness-emit}"
+export RUST_LOG
+
+mkdir -p "${LOG_DIR}"
+
+# `--log.file.directory` overrides reth's default `${XDG_CACHE_HOME}/reth/logs/`
+# location. Required when `ProtectSystem=strict` makes the default path
+# read-only.
+exec /usr/local/bin/reth-witness-emit-node node \
+    --datadir "${DATADIR}" \
+    --chain "${CHAIN}" \
+    --log.file.directory "${LOG_DIR}" \
+    --http --http.addr 127.0.0.1 --http.port "${HTTP_PORT}" \
+    --ws --ws.addr 127.0.0.1 --ws.port "${WS_PORT}" \
+    --authrpc.addr 127.0.0.1 --authrpc.port "${AUTHRPC_PORT}" \
+    --authrpc.jwtsecret "${JWT_PATH}" \
+    --metrics "127.0.0.1:${METRICS_PORT}" \
+    --port "${P2P_PORT}" --discovery.port "${P2P_PORT}" \
+    --no-persist-peers \
+    --trusted-peers "${PROD_ENODE}" \
+    --witness-emit-dir "${WITNESS_EMIT_DIR}" \
+    --witness-stats "${WITNESS_STATS}"
