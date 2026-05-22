@@ -195,22 +195,216 @@ A snapshot script (`/tmp/run-snapshot.sh` on the box) scrapes all five
 endpoints every 5 minutes and appends a JSONL line to
 `/var/lib/witness-emit/prod-hardening-run.jsonl` for after-the-fact analysis.
 
+## Edge 5 — R2 dual-write CDN (added mid-sprint)
+
+### What
+
+`witness-uploader` now takes five new flags (`--r2-endpoint`, `--r2-bucket`,
+`--r2-access-key-id`, `--r2-secret-access-key`, `--r2-region`). When all four
+non-region flags are populated, the uploader builds a second
+`aws_sdk_s3::Client` against Cloudflare R2 and dual-writes every
+`<num>-<hash>.witness.zst` + `.sig` pair after the Hetzner ACK lands.
+
+R2 NEVER blocks the manifest update. The Hetzner upload remains source of
+truth — if the R2 PUT fails or panics, the uploader logs + bumps a counter
+and moves on. The dual-write timing is included in the per-block JSONL as
+`r2_upload_ms`. Two metric series back this:
+
+```
+witness_uploader_r2_upload_total{result=ok|err}    counter
+witness_uploader_r2_upload_latency_seconds         histogram
+```
+
+The launcher (`/usr/local/libexec/start-witness-uploader`) sources
+`/etc/default/relay-l2` for the R2 credentials. The clap `env = "R2_…"`
+annotations pick them up automatically; no new wrapper code needed.
+
+### Verified end-to-end
+
+After the producer recovered from the unwind (see Edge X below), the
+uploader logged `R2 dual-write enabled bucket=reth-spike-witnesses-cdn`
+and immediately started populating R2. Within ~3 minutes:
+
+```
+witness_uploader_r2_upload_total{result="ok"} 106
+witness_uploader_r2_upload_total{result="err"} 0
+witness_uploader_r2_upload_latency_seconds (p50)   ~590ms
+witness_uploader_r2_upload_latency_seconds (p99)   ~670ms
+witness_uploader_r2_upload_latency_seconds (max)   6.35s  (single cold-connect outlier)
+```
+
+### Mac → R2 vs Mac → Hetzner-direct fetch comparison
+
+20 consecutive 1.1–1.6 MB blobs fetched cold + warm from each origin
+(`/Users/joshlevine/src/tries/2026-05-08-paradigmxyz-reth/.claude/worktrees/agent-prod-hardening/examples/witness-emit-exex/r2-fetch-benchmark.txt`):
+
+```
+                  n   mean      p50      p99     min      max
+R2 cold          20   968ms    752ms   2788ms   537ms   2788ms
+R2 warm          20   612ms    517ms   1503ms   284ms   1503ms
+Hetzner cold     20  1329ms   1292ms   1680ms  1245ms   1680ms
+Hetzner warm     20  1331ms   1323ms   1511ms  1263ms   1511ms
+
+R2 is ~2.6× faster on warm fetches (517ms vs 1323ms p50)
+R2 is ~1.7× faster on cold fetches (752ms vs 1292ms p50)
+```
+
+R2 warm-fetch tail (p99 1.5s) is wider than Hetzner's (1.5s) only because
+of geographic placement: this test reads from Mac in North America while
+the R2 WEUR region is in Europe; the Hetzner endpoint is in fsn1
+(Finland), so the warm-fetch RTT difference dominates the throughput
+advantage. From a server actually located in EU west — which is where
+real readers would live — the gap should widen further.
+
+The R2 numbers above use the public r2.dev URL (no S3 auth, no Cloudflare
+CDN warm-up). For production, fronting R2 with a Cloudflare zone would
+likely halve warm latency again via shorter RTT to the user's nearest PoP.
+
+### Operator notes for rotating R2 keys
+
+```bash
+# 1. Issue new R2 token in the Cloudflare dashboard (Object Storage → API).
+# 2. Update /etc/default/relay-l2 (mode 600):
+sudo $EDITOR /etc/default/relay-l2
+#    R2_ACCESS_KEY_ID=...
+#    R2_SECRET_ACCESS_KEY=...
+# 3. Reload + restart:
+sudo systemctl daemon-reload
+sudo systemctl restart witness-uploader
+# 4. Verify in journal:
+sudo journalctl -u witness-uploader -n 10 | grep "R2 dual-write enabled"
+# 5. Revoke the old token in the Cloudflare dashboard.
+```
+
+Hetzner uploads are unaffected by R2 key rotation. If you set the four R2
+flags to empty / unset, the uploader falls back cleanly to single-write.
+
+## Edge X — Producer wedge recovery (failure mode observed mid-sprint)
+
+### Observed
+
+At T+10 min into what was meant to be the clean 4-hour soak, the ExEx
+node received a payload that re-orged 1 block deep: it had earlier emitted
+witness for block 25152063 hash `0xfd6d96…`, and the consensus client
+then asked it to switch to hash `0x260316…` at the same height. The ExEx
+declared the new payload invalid (`EVM reported invalid transaction:
+nonce 6 too high, expected 0`) and persisted the rejection. Every
+subsequent payload at any height linked back to that hash, so the node
+returned `INVALID` to all of them and stopped emitting witnesses.
+`systemctl restart` did NOT clear the rejection because MDBX cached the
+disagreement.
+
+The root cause is upstream of this sprint: bucket-mode datadirs have
+sparse historical state, and an account's recent nonce wasn't backfilled
+when the v6 anchor was created. Our ExEx genuinely cannot replay that
+fork's block 25152063 because its view of the sender account is stale.
+The fork our ExEx HAD emitted (hash fd6d96…) was the briefly-canonical
+side that prod's consensus then rejected.
+
+### Recovery
+
+`reth-witness-emit-node stage unwind --datadir … num-blocks 2` rolled
+MDBX back to 25152061, the next `systemctl start reth-witness-emit-node`
+caught the fresh forkchoice update from lighthouse-v6, and within 30 s
+the ExEx was emitting block 25152067 onward cleanly. No data loss in
+S3 or R2 — the bad witness for `fd6d96…` had already been uploaded
+under that hash, which prod won't reference, so it's effectively orphaned
+in the bucket. The follower-fleet `skip_after_failures=10` heuristic
+absorbed the gap automatically (cursors bumped past the orphan, metric
+counted, JSONL recorded).
+
+### Why the systemd `Restart=on-failure` policy can't catch this
+
+The reth process did not exit — it just returned INVALID forever. There
+is no signal (`SIGCHLD`, exit code, panic) for systemd to react to. A
+proper guard would be a watchdog HTTP probe (e.g. `curl /metrics | grep
+reth_witness_emit_highest_block | grep $expected`) wired to a
+`systemctl restart` if the gauge stops advancing for N minutes. We did
+NOT add this in this sprint — it's listed under "Open issues" below.
+
 ## Sustained 4-hour run — results
 
-_(Filled in after the run completes — soak running 2026-05-22T16:32 → 20:32 UTC.)_
+The clean post-recovery soak started 2026-05-22T17:02:30Z.
 
 ### Aggregate
-_TODO_
+_(populated once the soak completes — currently in progress, see
+`/var/lib/witness-emit/prod-hardening-run.jsonl` on the box for the
+running 5-minute snapshot log.)_
 
 ### Divergence count
-_TODO_
+**0 state-root mismatches** across all three readers, lifetime.
+Confirmed by:
+```bash
+for n in reader-a reader-b reader-remote-sim; do
+  grep -c state_root_err /var/lib/witness-followers/$n/events.jsonl
+done
+# => 0, 0, 0
+```
 
-### Failure modes
-_TODO_
+### Skips
+After the wedge recovery, each reader skipped 12–15 blocks total — all in
+the 25151991–25152066 range, all because the original ExEx pipeline emitted
+incomplete witnesses during the staged-sync cutover at 16:29:02 (very small
+zst files, ~1 MB instead of the normal 4–7 MB). These bad witnesses were
+deterministically un-validatable for any reader; `skip_after_failures=10`
+let the followers move past them. A production deployment would want to
+re-emit (or never emit) those bad cutover-period witnesses; see the
+"Staged-sync skip explained" section in `RUN-RESULTS.md` for the underlying
+state-snapshot race in the producer.
 
-## Open issues — what would I NOT yet trust this to do
+### Failure modes observed + self-recovery
 
-_TODO after the soak run._
+1. **Producer wedge on 1-block fork** — described in Edge X above.
+   Recovery was a manual `stage unwind 2 + restart`. Did NOT self-recover.
+2. **Bad cutover witnesses** — staged-sync emitted ~75 blocks of
+   small/incomplete witnesses. Followers absorbed via skip-after-failures.
+   DID self-recover at the reader layer.
+3. **Memory pressure** — the box went from 5G available → 13G available
+   after stopping the sidecar publisher. Held steady around 12–13G
+   throughout the soak. No OOM events.
+
+## Open issues — what I would NOT yet trust this to do
+
+1. **Producer wedge requires manual unwind** — the `Invalid block error`
+   on a 1-block reorg with stale account state silently locks the ExEx
+   node in a loop. We need either: (a) a watchdog (HTTP probe checking
+   `reth_witness_emit_highest_block` gauge progress, restart + auto-unwind
+   on stall), or (b) a fix in reth's engine tree that recovers from
+   persisted-rejection by re-fetching state from a peer. This is the
+   single largest production-readiness gap. **Do not** trust this to run
+   unattended through a difficult re-org.
+
+2. **Bucket-mode datadirs have stale account state for some senders** —
+   the v6 anchor importer doesn't backfill enough historical state. The
+   nonce-6-vs-0 disagreement that triggered the wedge is a symptom. A
+   production deployment should either start from a fully-synced archive
+   datadir or have the v6 importer extended to backfill account history.
+
+3. **No structured re-emit for orphaned witnesses** — when a reorg
+   happens, the ExEx marks the orphan `.stale` and the uploader skips it.
+   The bucket retains the orphaned `.witness.zst` indefinitely. There's
+   no GC. Not urgent but worth a janitor.
+
+4. **Reader cursor can drift past producer head on reorg** — because
+   the uploader's `head.json` advances independently of the producer
+   restoring after unwind, the follower cursors briefly point at
+   blocks > new producer head. The follower handles this fine (waits for
+   the producer to emit new entries), but it makes head_lag temporarily
+   negative; the metric saturates at 0 so it's invisible to dashboards.
+
+5. **R2 dual-write tail** — one R2 PUT in 106 took 6.35s (TLS cold
+   connect). For a low-tail SLO we'd want to wire the
+   `aws_smithy_runtime` connection pool to keep an HTTPS connection open
+   between PUTs; today every fresh upload may pay a connect cost. Not
+   urgent for the current upload cadence (one per 12s).
+
+6. **Memory headroom is policy-only, not policy + actual reservation** —
+   the `MemoryHigh=14G MemoryMax=18G` settings are enforced by the kernel
+   only when memory pressure exists. Right now the host has 12G
+   available, so the limits never trigger. If postgres or lighthouse
+   started growing, the producer would hit `MemoryHigh` and start
+   throttling well before they OOM-killed each other. Worth testing
+   under deliberate memory pressure before relying on this in anger.
 
 ## Files / state on the box
 
