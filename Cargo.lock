@@ -8959,6 +8959,7 @@ dependencies = [
  "alloy-eips 2.0.5",
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-rpc-types-eth",
  "arbitrary",
  "backon",
  "blake3",

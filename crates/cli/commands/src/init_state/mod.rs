@@ -102,6 +102,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> InitStateC
                         header.set_number(number);
                         header
                     },
+                    Vec::new(),
                 )?;
 
                 // SAFETY: it's safe to commit static files, since in the event of a crash, they

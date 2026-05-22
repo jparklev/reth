@@ -49,6 +49,23 @@ pub struct ImportBucketCheckpointCommand<C: ChainSpecParser> {
 
     #[command(flatten)]
     pub bucket: BucketArgs,
+
+    /// JSON-RPC URL of an Ethereum execution client (typically a prod reth at
+    /// `http://127.0.0.1:8545`) used to fetch the 256 real headers immediately
+    /// before the anchor. Without this, those pre-anchor blocks are written as
+    /// zero-hash dummies, and post-anchor blocks that execute `BLOCKHASH(N)` for
+    /// `anchor - 256 <= N < anchor` would resolve to `B256::ZERO`, causing
+    /// silent consensus divergence (see `docs/PATH-B-DIAGNOSIS-25143845.md`).
+    /// When this flag is omitted, the import proceeds with zero-hash dummies —
+    /// only safe if no post-anchor block in the catch-up range reads BLOCKHASH
+    /// for a pre-anchor number.
+    #[arg(long, value_name = "URL", help_heading = "Header backfill")]
+    pub header_backfill_rpc_url: Option<String>,
+
+    /// How many real headers to backfill (default 256, matching the EVM
+    /// `BLOCKHASH` history window). Capped to `min(pinned, 256)`.
+    #[arg(long, value_name = "N", default_value_t = 256u64, help_heading = "Header backfill")]
+    pub header_backfill_count: u64,
 }
 
 impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>>
@@ -199,6 +216,38 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>>
             ));
         }
 
+        // Optionally fetch real pre-anchor headers from a live execution client
+        // so `BLOCKHASH(N)` for `pinned-256 <= N < pinned` resolves to the real
+        // chain hash instead of `B256::ZERO`. See the field doc above.
+        let pre_anchor_headers: Vec<(
+            <N::Primitives as NodePrimitives>::BlockHeader,
+            alloy_primitives::B256,
+        )> = if let Some(url) = self.header_backfill_rpc_url.as_deref() {
+            let count = self.header_backfill_count.min(pinned_block).min(256);
+            if count == 0 {
+                Vec::new()
+            } else {
+                let start = pinned_block - count;
+                let end = pinned_block - 1;
+                info!(
+                    target: "reth::cli",
+                    url,
+                    start,
+                    end,
+                    "Fetching real pre-anchor headers for BLOCKHASH backfill"
+                );
+                fetch_pre_anchor_headers::<N>(url, start, end, pinned_header.parent_hash)?
+            }
+        } else {
+            warn!(
+                target: "reth::cli",
+                "--header-backfill-rpc-url not set; pre-anchor headers will be zero-hash dummies. \
+                 Post-anchor blocks that call BLOCKHASH on the last 256 pre-anchor blocks may \
+                 diverge from consensus. See docs/PATH-B-DIAGNOSIS-25143845.md."
+            );
+            Vec::new()
+        };
+
         setup_without_evm(
             &provider_rw,
             SealedHeader::new(header_for_setup, pinned_hash),
@@ -207,6 +256,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>>
                 header.set_number(number);
                 header
             },
+            pre_anchor_headers,
         )?;
 
         // Pad the v2 changeset static-file segments up to pinned-1 with
@@ -579,6 +629,120 @@ impl<C: ChainSpecParser> ImportBucketCheckpointCommand<C> {
     pub fn chain_spec(&self) -> Option<&Arc<C::ChainSpec>> {
         Some(&self.env.chain)
     }
+}
+
+/// Fetch real headers for blocks `start..=end` from a JSON-RPC endpoint and validate
+/// that they form a contiguous chain whose final block's hash equals `expected_tail_hash`
+/// (which the caller passes as `anchor.parent_hash`). On success returns a Vec of
+/// `(node_header, hash)` pairs in ascending block order, ready to feed into
+/// `setup_without_evm`.
+///
+/// Uses blocking `reqwest` (the importer is single-threaded and the request count is
+/// bounded at 256) with a per-request timeout to avoid hanging on a flaky endpoint.
+fn fetch_pre_anchor_headers<N>(
+    url: &str,
+    start: u64,
+    end: u64,
+    expected_tail_hash: alloy_primitives::B256,
+) -> eyre::Result<Vec<(<N::Primitives as NodePrimitives>::BlockHeader, alloy_primitives::B256)>>
+where
+    N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: HeaderMut>>,
+{
+    use alloy_primitives::B256;
+
+    let client =
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15)).build()?;
+
+    // Collect alloy headers + hashes first; validate the chain on the alloy side
+    // (so we don't depend on the node header type implementing `Sealable` /
+    // `BlockHeader` for the chain check). Then convert at the end.
+    let len = (end - start + 1) as usize;
+    let mut alloy_chain: Vec<(alloy_consensus::Header, B256)> = Vec::with_capacity(len);
+
+    for (idx, number) in (start..=end).enumerate() {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getBlockByNumber",
+            "params": [format!("0x{number:x}"), false],
+            "id": 1,
+        });
+        let resp: serde_json::Value = client
+            .post(url)
+            .json(&body)
+            .send()
+            .map_err(|e| eyre::eyre!("RPC POST failed for block {number}: {e}"))?
+            .json()
+            .map_err(|e| eyre::eyre!("RPC JSON parse failed for block {number}: {e}"))?;
+
+        if let Some(err) = resp.get("error") {
+            return Err(eyre::eyre!("RPC error for block {number}: {err}"));
+        }
+        let result = resp
+            .get("result")
+            .ok_or_else(|| eyre::eyre!("RPC response for block {number} missing `result`"))?;
+        if result.is_null() {
+            return Err(eyre::eyre!(
+                "RPC returned null for block {number}; the backfill source is missing this block"
+            ));
+        }
+        let rpc_block: alloy_rpc_types_eth::Block = serde_json::from_value(result.clone())
+            .map_err(|e| eyre::eyre!("failed to deserialize Block for {number}: {e}"))?;
+        let claimed_hash = rpc_block.header.hash;
+        let alloy_header: alloy_consensus::Header = rpc_block.header.inner;
+
+        // Self-consistency: the hash claimed by the RPC must equal the RLP hash.
+        let computed_hash = alloy_header.hash_slow();
+        if computed_hash != claimed_hash {
+            return Err(eyre::eyre!(
+                "RPC block {number} hash mismatch: claimed {claimed_hash:?} computed {computed_hash:?}"
+            ));
+        }
+        if alloy_header.number != number {
+            return Err(eyre::eyre!(
+                "RPC returned block {} when {number} was requested",
+                alloy_header.number,
+            ));
+        }
+        if let Some((prev_header, prev_hash)) = alloy_chain.last() {
+            if alloy_header.parent_hash != *prev_hash {
+                return Err(eyre::eyre!(
+                    "parent_hash chain broken between blocks {} and {number}",
+                    prev_header.number,
+                ));
+            }
+        }
+
+        alloy_chain.push((alloy_header, claimed_hash));
+
+        if idx % 32 == 0 || number == end {
+            info!(
+                target: "reth::cli",
+                fetched = idx + 1,
+                of = len,
+                "Header backfill progress"
+            );
+        }
+    }
+
+    let last_hash = alloy_chain.last().expect("non-empty by construction").1;
+    if last_hash != expected_tail_hash {
+        return Err(eyre::eyre!(
+            "tail hash {last_hash:?} does not match anchor.parent_hash {expected_tail_hash:?} \
+             — the backfill source is on a different chain than the manifest"
+        ));
+    }
+
+    // Convert to node header type. The hash we pass through is the alloy-computed
+    // hash; for chains where the node header type is identical to the alloy header
+    // (mainnet/sepolia) the round-trip preserves it exactly.
+    let mut out: Vec<(<N::Primitives as NodePrimitives>::BlockHeader, B256)> =
+        Vec::with_capacity(len);
+    for (alloy_header, hash) in alloy_chain {
+        let node_header = alloy_to_node_header::<N>(&alloy_header)?;
+        out.push((node_header, hash));
+    }
+
+    Ok(out)
 }
 
 /// Convert an `alloy_consensus::Header` (which the bucket manifest exposes)
