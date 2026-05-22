@@ -1,0 +1,55 @@
+[Unit]
+Description=witness-follower %i — continuous validator
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=15min
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Per-instance env file: /etc/default/witness-follower-<NAME>
+# Required: S3_ENDPOINT, S3_BUCKET, FOLLOWER_CURSOR, FOLLOWER_JSONL.
+# Optional: WITNESS_PUBKEY, WITNESS_BASE_URL, FOLLOWER_METRICS_ADDR,
+#           FETCH_DELAY_MS, READER_NAME (defaults to %i).
+#
+# /etc/default/relay-l2 supplies the HETZNER_* credentials remapped to AWS_*
+# by the launcher.
+EnvironmentFile=/etc/default/relay-l2
+EnvironmentFile=/etc/default/witness-follower-%i
+
+ExecStartPre=/bin/mkdir -p /var/lib/witness-followers/%i
+ExecStart=/usr/local/libexec/start-witness-follower %i
+
+Restart=on-failure
+RestartSec=20s
+LimitNOFILE=32768
+
+MemoryHigh=512M
+MemoryMax=1G
+MemorySwapMax=0
+
+OOMScoreAdjust=300
+OOMPolicy=stop
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/witness-followers
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=witness-follower-%i
+
+[Install]
+WantedBy=multi-user.target

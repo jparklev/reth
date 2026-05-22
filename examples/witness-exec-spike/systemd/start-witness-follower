@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Launcher for witness-follower@<NAME>.service.
+#
+# Argv[1] is the instance name (matches systemd %i). All other configuration
+# comes from /etc/default/witness-follower-<NAME>, sourced via the unit's
+# EnvironmentFile.
+
+set -euo pipefail
+
+NAME="${1:?usage: $0 <instance-name>}"
+
+: "${HETZNER_ACCESS_KEY:?HETZNER_ACCESS_KEY required}"
+: "${HETZNER_SECRET_KEY:?HETZNER_SECRET_KEY required}"
+: "${S3_ENDPOINT:?S3_ENDPOINT required}"
+: "${S3_BUCKET:?S3_BUCKET required}"
+: "${FOLLOWER_CURSOR:?FOLLOWER_CURSOR required}"
+: "${FOLLOWER_JSONL:?FOLLOWER_JSONL required}"
+: "${FOLLOWER_METRICS_ADDR:?FOLLOWER_METRICS_ADDR required}"
+
+S3_MANIFEST="${S3_MANIFEST:-witnesses/exex/head.json}"
+FETCH_DELAY_MS="${FETCH_DELAY_MS:-0}"
+POLL_MS="${POLL_MS:-1500}"
+JITTER_MS="${JITTER_MS:-500}"
+READER_NAME="${READER_NAME:-$NAME}"
+
+export AWS_ACCESS_KEY_ID="${HETZNER_ACCESS_KEY}"
+export AWS_SECRET_ACCESS_KEY="${HETZNER_SECRET_KEY}"
+export RUST_LOG="${RUST_LOG:-info}"
+
+# Build optional flags conditionally.
+extra=()
+if [[ -n "${WITNESS_PUBKEY:-}" ]]; then
+    extra+=(--pubkey "${WITNESS_PUBKEY}")
+fi
+if [[ -n "${WITNESS_BASE_URL:-}" ]]; then
+    extra+=(--base-url "${WITNESS_BASE_URL}")
+fi
+
+exec /usr/local/bin/witness-follower \
+    --name "${READER_NAME}" \
+    --endpoint "${S3_ENDPOINT}" \
+    --bucket "${S3_BUCKET}" \
+    --manifest "${S3_MANIFEST}" \
+    --cursor "${FOLLOWER_CURSOR}" \
+    --jsonl "${FOLLOWER_JSONL}" \
+    --metrics-addr "${FOLLOWER_METRICS_ADDR}" \
+    --poll-ms "${POLL_MS}" \
+    --jitter-ms "${JITTER_MS}" \
+    --fetch-delay-ms "${FETCH_DELAY_MS}" \
+    "${extra[@]}"

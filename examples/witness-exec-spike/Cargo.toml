@@ -26,6 +26,10 @@ name = "witness-publisher"
 path = "src/publisher.rs"
 required-features = ["producer"]
 
+[[bin]]
+name = "witness-follower"
+path = "src/follower.rs"
+
 [dependencies]
 # Producer-only deps (require MDBX). Validator-only build can skip these.
 reth-ethereum = { workspace = true, features = ["node", "evm"], optional = true }
@@ -79,6 +83,12 @@ ed25519-dalek = "2.2"
 sha2 = { workspace = true, features = ["std"] }
 chrono = { workspace = true, features = ["serde"] }
 hex = "0.4"
+metrics.workspace = true
+metrics-exporter-prometheus = { workspace = true }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+rand = { workspace = true }
 
 [features]
 default = []
