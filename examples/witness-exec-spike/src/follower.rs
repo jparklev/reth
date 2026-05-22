@@ -92,6 +92,13 @@ struct Cli {
     /// Skip the first N manifest entries on a cold start (no cursor).
     #[arg(long, default_value = "0")]
     cold_start_skip: usize,
+    /// If a block fails validation this many consecutive times, bump the
+    /// cursor past it and continue. A bad witness in S3 (producer bug,
+    /// missing bytecode, etc.) would otherwise wedge the follower forever;
+    /// in production we'd rather log + advance than stop. Set to 0 to disable
+    /// — useful in test runs where every divergence must be investigated.
+    #[arg(long, default_value = "10")]
+    skip_after_failures: u32,
 }
 
 const FOLLOW_TICK_TOTAL: &str = "witness_follower_tick_total";
@@ -104,6 +111,7 @@ const FOLLOW_VALIDATE_LATENCY_SECONDS: &str = "witness_follower_validate_latency
 const FOLLOW_E2E_LATENCY_SECONDS: &str = "witness_follower_e2e_latency_seconds";
 const FOLLOW_LAST_SUCCESS_TS: &str = "witness_follower_last_success_timestamp";
 const FOLLOW_BYTES_TOTAL: &str = "witness_follower_bytes_total";
+const FOLLOW_SKIPPED_BLOCK_TOTAL: &str = "witness_follower_skipped_block_total";
 
 fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
@@ -113,6 +121,10 @@ fn describe_metrics() {
         "Block validation attempts (labelled result=ok|sig_err|state_root_err|fetch_err)"
     );
     describe_counter!(FOLLOW_BYTES_TOTAL, "Total bytes fetched from S3/CDN");
+    describe_counter!(
+        FOLLOW_SKIPPED_BLOCK_TOTAL,
+        "Blocks the follower had to skip after N consecutive failures (producer bug, missing code, etc.)"
+    );
     describe_gauge!(FOLLOW_HEAD_BLOCK, "Highest block number visible in head.json");
     describe_gauge!(FOLLOW_VALIDATED_BLOCK, "Highest block this reader has validated");
     describe_gauge!(FOLLOW_LAG_BLOCKS, "head_block - validated_block");
@@ -235,6 +247,9 @@ async fn run(cli: Cli, spec: Arc<ChainSpec>) -> eyre::Result<()> {
 
     let mut cold_start = cursor.last_block_number == 0;
     let mut rng = rand::rng();
+    // `(block_number, consecutive_failures)` for the block we're currently
+    // stuck on. Reset on success or when the block number changes.
+    let mut stuck: Option<(u64, u32)> = None;
 
     loop {
         let tick_started = Instant::now();
@@ -271,7 +286,7 @@ async fn run(cli: Cli, spec: Arc<ChainSpec>) -> eyre::Result<()> {
                 }
 
                 for entry in to_process {
-                    if let Err(err) = process_one(
+                    match process_one(
                         &cli,
                         spec.clone(),
                         &s3,
@@ -282,19 +297,75 @@ async fn run(cli: Cli, spec: Arc<ChainSpec>) -> eyre::Result<()> {
                     )
                     .await
                     {
-                        // The follower never crashes on a per-block error. We
-                        // log, count, and back off — the producer or network
-                        // glitch will resolve itself, and the next manifest
-                        // tick will retry this block (because cursor has not
-                        // advanced past it).
-                        error!(
-                            reader = %cli.name,
-                            block = entry.block_number,
-                            ?err,
-                            "process_one failed; backing off"
-                        );
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        break;
+                        Ok(()) => {
+                            stuck = None;
+                        }
+                        Err(err) => {
+                            // The follower never crashes on a per-block
+                            // error: we log, count, and back off. The
+                            // producer-or-network glitch usually resolves
+                            // itself, and the next manifest tick retries
+                            // (cursor hasn't advanced).
+                            //
+                            // BUT: a witness that's structurally broken
+                            // (producer bug, missing bytecode, corrupted
+                            // upload) wedges the follower forever. After
+                            // `skip_after_failures` consecutive attempts on
+                            // the same block, bump the cursor past it,
+                            // record the metric, and continue. The operator
+                            // can later inspect events.jsonl + s3 to decide
+                            // whether to re-upload.
+                            let failures = match stuck {
+                                Some((b, n)) if b == entry.block_number => n + 1,
+                                _ => 1,
+                            };
+                            stuck = Some((entry.block_number, failures));
+                            error!(
+                                reader = %cli.name,
+                                block = entry.block_number,
+                                failures,
+                                ?err,
+                                "process_one failed"
+                            );
+                            if cli.skip_after_failures > 0 &&
+                                failures >= cli.skip_after_failures
+                            {
+                                warn!(
+                                    reader = %cli.name,
+                                    block = entry.block_number,
+                                    failures,
+                                    "skipping block after persistent failures; advancing cursor"
+                                );
+                                metrics::counter!(
+                                    FOLLOW_SKIPPED_BLOCK_TOTAL,
+                                    "reader" => cli.name.clone()
+                                )
+                                .increment(1);
+                                write_jsonl(
+                                    &cli.jsonl,
+                                    &serde_json::json!({
+                                        "ts": rfc3339_now(),
+                                        "reader": cli.name,
+                                        "block_number": entry.block_number,
+                                        "block_hash": format!("{:?}", entry.block_hash),
+                                        "object_key": entry.object_key,
+                                        "result": "skipped_after_failures",
+                                        "failures": failures,
+                                        "error": format!("{err}"),
+                                    }),
+                                );
+                                cursor.last_block_number = entry.block_number;
+                                cursor.last_block_hash = entry.block_hash;
+                                cursor.updated_at = rfc3339_now();
+                                if let Err(err) = cursor.save(&cli.cursor) {
+                                    warn!(reader = %cli.name, ?err, "cursor save failed");
+                                }
+                                stuck = None;
+                                continue;
+                            }
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            break;
+                        }
                     }
                 }
             }
