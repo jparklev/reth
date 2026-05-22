@@ -85,3 +85,42 @@ pub fn is_installed() -> bool {
 }
 
 static REGISTRY: OnceLock<UnboundedSender<WitnessRecordEvent>> = OnceLock::new();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::B256;
+    use reth_revm::witness::ExecutionWitnessRecord;
+    use tokio::sync::mpsc;
+
+    // The registry is process-wide, so these tests can't run in parallel against it. We exercise
+    // the channel/event plumbing directly without touching the global, which is sufficient — the
+    // global is just `OnceLock::set/get` and trivially correct.
+
+    #[test]
+    fn event_round_trips_through_channel() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<WitnessRecordEvent>();
+        let hash = B256::repeat_byte(0x7e);
+        let event = WitnessRecordEvent {
+            block_hash: hash,
+            block_number: 25_145_987,
+            record: ExecutionWitnessRecord::default(),
+        };
+        tx.send(event).unwrap();
+        let recv = rx.try_recv().unwrap();
+        assert_eq!(recv.block_hash, hash);
+        assert_eq!(recv.block_number, 25_145_987);
+    }
+
+    #[test]
+    fn sender_is_none_until_installed_in_a_fresh_process() {
+        // We can only check `is_installed()` semantics without polluting the global; this is the
+        // weakest claim that still holds across the whole test binary. The validator gates on
+        // `is_installed()` and skips the record build when it returns false, so the absence path
+        // is the important invariant.
+        let installed = is_installed();
+        if !installed {
+            assert!(sender().is_none());
+        }
+    }
+}

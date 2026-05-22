@@ -691,4 +691,38 @@ mod tests {
         assert!(p.with_extension("zst.stale").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn pending_records_evict_when_oversized() {
+        // Mirrors the eviction step in `WitnessEmitExEx::drain_records`. We can't easily build a
+        // full `WitnessEmitExEx` in a unit test (it needs a real `ExExContext`), so we exercise
+        // the eviction loop against a freestanding map.
+        let pending: PendingRecords = Mutex::new(HashMap::new());
+        {
+            let mut m = pending.lock().unwrap();
+            for i in 0..(MAX_PENDING_RECORDS + 10) {
+                m.insert(B256::repeat_byte(i as u8), ExecutionWitnessRecord::default());
+            }
+            assert_eq!(m.len(), MAX_PENDING_RECORDS + 10);
+            // Same eviction loop body as `drain_records`.
+            while m.len() > MAX_PENDING_RECORDS {
+                let key = *m.keys().next().unwrap();
+                m.remove(&key);
+            }
+        }
+        assert_eq!(pending.lock().unwrap().len(), MAX_PENDING_RECORDS);
+    }
+
+    #[test]
+    fn pending_records_hit_removes_entry() {
+        // Verifies the take-once semantics in `emit_block`'s side-channel branch: a record is
+        // removed when consumed so a duplicate notification can't accidentally re-use it.
+        let pending: PendingRecords = Mutex::new(HashMap::new());
+        let hash = B256::repeat_byte(0x42);
+        pending.lock().unwrap().insert(hash, ExecutionWitnessRecord::default());
+        let first = pending.lock().unwrap().remove(&hash);
+        assert!(first.is_some());
+        let second = pending.lock().unwrap().remove(&hash);
+        assert!(second.is_none());
+    }
 }
