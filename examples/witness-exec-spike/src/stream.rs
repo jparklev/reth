@@ -443,7 +443,8 @@ async fn fetch_object(
         Ok((b, s))
     } else {
         let bytes = s3_get(s3, bucket, key).await?;
-        let sig = if fetch_sig { Some(s3_get(s3, bucket, &format!("{key}.sig")).await?) } else { None };
+        let sig =
+            if fetch_sig { Some(s3_get(s3, bucket, &format!("{key}.sig")).await?) } else { None };
         Ok((bytes, sig))
     }
 }

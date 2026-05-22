@@ -40,6 +40,10 @@ prod reth ─┐
 
 ## Install
 
+> The `ReadWritePaths=` directives in the unit files require the paths to
+> exist BEFORE the unit starts (systemd mount-namespace setup happens before
+> `ExecStartPre=`). Create them first or use `install.sh`, which does.
+
 ```bash
 # 0. Build the binaries (Linux host with build deps installed):
 cd /root/witness-spike

@@ -267,10 +267,7 @@ async fn run(cli: Cli, spec: Arc<ChainSpec>) -> eyre::Result<()> {
                     // i64 because the lag can transiently go negative right
                     // after a reorg / manifest rewind. Saturate at 0 for
                     // monotonic scraping clients.
-                    let lag = head
-                        .block_number
-                        .saturating_sub(cursor.last_block_number)
-                        as f64;
+                    let lag = head.block_number.saturating_sub(cursor.last_block_number) as f64;
                     metrics::gauge!(FOLLOW_LAG_BLOCKS).set(lag);
                 }
 
@@ -333,9 +330,7 @@ async fn run(cli: Cli, spec: Arc<ChainSpec>) -> eyre::Result<()> {
                                 ?err,
                                 "process_one failed"
                             );
-                            if cli.skip_after_failures > 0 &&
-                                failures >= cli.skip_after_failures
-                            {
+                            if cli.skip_after_failures > 0 && failures >= cli.skip_after_failures {
                                 warn!(
                                     reader = %cli.name,
                                     block = entry.block_number,
@@ -620,9 +615,8 @@ fn write_jsonl(path: &Path, value: &serde_json::Value) {
 
 async fn spawn_metrics(addr: SocketAddr) -> eyre::Result<SocketAddr> {
     let handle = PrometheusBuilder::new().install_recorder().wrap_err("install recorder")?;
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .wrap_err_with(|| format!("bind {addr}"))?;
+    let listener =
+        tokio::net::TcpListener::bind(addr).await.wrap_err_with(|| format!("bind {addr}"))?;
     let bound = listener.local_addr()?;
     tokio::spawn(async move {
         loop {
@@ -651,7 +645,8 @@ async fn spawn_metrics(addr: SocketAddr) -> eyre::Result<SocketAddr> {
                         )
                     }
                 });
-                let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+                let _ =
+                    hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
             });
         }
     });
@@ -690,4 +685,3 @@ async fn http_get(client: &reqwest::Client, base: &str, key: &str) -> eyre::Resu
     }
     Ok(resp.bytes().await?.to_vec())
 }
-

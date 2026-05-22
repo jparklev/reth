@@ -79,9 +79,15 @@ fn main() -> eyre::Result<()> {
         let bytes = std::fs::read(local).wrap_err_with(|| format!("read {}", local.display()))?;
         let sig = if verifying_key.is_some() {
             let sig_path = local.with_extension(
-                local.extension().map(|e| format!("{}.sig", e.to_string_lossy())).unwrap_or_default(),
+                local
+                    .extension()
+                    .map(|e| format!("{}.sig", e.to_string_lossy()))
+                    .unwrap_or_default(),
             );
-            Some(std::fs::read(&sig_path).wrap_err_with(|| format!("read {}", sig_path.display()))?)
+            Some(
+                std::fs::read(&sig_path)
+                    .wrap_err_with(|| format!("read {}", sig_path.display()))?,
+            )
         } else {
             None
         };
@@ -185,13 +191,23 @@ fn fetch_from_s3(cli: &Cli, fetch_sig: bool) -> eyre::Result<(Vec<u8>, Option<Ve
         let client = aws_sdk_s3::Client::from_conf(s3_config);
 
         let bytes = {
-            let resp = client.get_object().bucket(&bucket).key(&key).send().await
+            let resp = client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
                 .wrap_err_with(|| format!("GET s3://{bucket}/{key}"))?;
             resp.body.collect().await.wrap_err("collect body")?.into_bytes().to_vec()
         };
         let sig = if fetch_sig {
             let sk = format!("{key}.sig");
-            let resp = client.get_object().bucket(&bucket).key(&sk).send().await
+            let resp = client
+                .get_object()
+                .bucket(&bucket)
+                .key(&sk)
+                .send()
+                .await
                 .wrap_err_with(|| format!("GET s3://{bucket}/{sk}"))?;
             Some(resp.body.collect().await.wrap_err("collect sig")?.into_bytes().to_vec())
         } else {

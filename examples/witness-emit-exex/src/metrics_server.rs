@@ -36,9 +36,8 @@ pub(crate) async fn install_and_serve(addr: SocketAddr) -> eyre::Result<Option<S
         }
     };
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .wrap_err_with(|| format!("bind {addr}"))?;
+    let listener =
+        tokio::net::TcpListener::bind(addr).await.wrap_err_with(|| format!("bind {addr}"))?;
     let bound = listener.local_addr()?;
     info!(%bound, "metrics endpoint listening");
 

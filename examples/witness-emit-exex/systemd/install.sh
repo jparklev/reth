@@ -55,8 +55,12 @@ for src in /etc/default/witness-emit-node.example /etc/default/witness-emit-uplo
 done
 
 # 5. State directories.
+#
+# These MUST exist before systemd evaluates `ReadWritePaths=` — namespace
+# setup happens before any ExecStartPre runs.
 mkdir -p /var/lib/witness-emit/inbox
 mkdir -p /var/lib/witness-followers
+mkdir -p /var/log/reth-witness-emit
 
 # 6. Reload systemd.
 systemctl daemon-reload

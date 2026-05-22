@@ -24,10 +24,10 @@ use tracing::{error, info, warn};
 
 #[path = "bundle.rs"]
 mod bundle;
-#[path = "metrics_server.rs"]
-mod metrics_server;
 #[path = "uploader_live_manifest.rs"]
 mod live_manifest;
+#[path = "metrics_server.rs"]
+mod metrics_server;
 #[path = "uploader_signing.rs"]
 mod signing;
 

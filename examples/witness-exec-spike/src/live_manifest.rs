@@ -59,8 +59,7 @@ impl LiveManifest {
         Self {
             version: 1,
             writer_id: writer_id.into(),
-            updated_at: chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            updated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             head: None,
             entries: Vec::new(),
         }
@@ -75,8 +74,7 @@ impl LiveManifest {
         self.entries.insert(0, entry.clone());
         self.entries.truncate(MAX_ENTRIES);
         self.head = Some(entry);
-        self.updated_at =
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        self.updated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     }
 
     /// On a deeper reorg, drop every entry strictly above `block_number`. Used

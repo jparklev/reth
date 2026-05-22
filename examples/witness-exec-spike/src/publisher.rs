@@ -1,20 +1,19 @@
 //! Continuous canonical-head witness publisher.
 //!
 //! Architecture (the "C" path):
-//!   - Subscribe to `newHeads` over the local reth WS endpoint (best-effort; falls back
-//!     to HTTP polling on disconnect).
-//!   - On every observed head, target `head_num - target_lag` (default 3 — well past
-//!     reth's engine persistence threshold of 2 so the block is readable from a
-//!     read-only MDBX snapshot).
+//!   - Subscribe to `newHeads` over the local reth WS endpoint (best-effort; falls back to HTTP
+//!     polling on disconnect).
+//!   - On every observed head, target `head_num - target_lag` (default 3 — well past reth's engine
+//!     persistence threshold of 2 so the block is readable from a read-only MDBX snapshot).
 //!   - Maintain a per-block cursor, backfilling any gaps (missed WS events, restart).
-//!   - For each target: open one fresh `factory.provider()` (one MDBX RO txn), resolve
-//!     block + parent + state from that same txn — so we never mix views across reorgs.
-//!     Retry on transient "not yet persisted" errors with bounded backoff.
-//!   - Execute, capture witness, bincode+zstd encode, ed25519-sign, upload `.zst` +
-//!     `.zst.sig` to `witnesses/live/<num>-<hash>.witness.zst`, then atomically PUT
-//!     `head.json` + `head.json.sig` advertising the new head.
-//!   - Reorg detection: if a target block's parent_hash doesn't match the previously
-//!     published entry at `(num-1)`, rewind the manifest above that depth and republish.
+//!   - For each target: open one fresh `factory.provider()` (one MDBX RO txn), resolve block +
+//!     parent + state from that same txn — so we never mix views across reorgs. Retry on transient
+//!     "not yet persisted" errors with bounded backoff.
+//!   - Execute, capture witness, bincode+zstd encode, ed25519-sign, upload `.zst` + `.zst.sig` to
+//!     `witnesses/live/<num>-<hash>.witness.zst`, then atomically PUT `head.json` + `head.json.sig`
+//!     advertising the new head.
+//!   - Reorg detection: if a target block's parent_hash doesn't match the previously published
+//!     entry at `(num-1)`, rewind the manifest above that depth and republish.
 //!
 //! Why not approach A (ExEx inside producer-mode reth):
 //!   ExEx would be cleaner upstream-wise, but per project constraints we cannot touch
@@ -32,11 +31,10 @@ use reth_chainspec::{ChainSpec, MAINNET};
 use reth_db::DatabaseEnv;
 use reth_ethereum::{
     evm::{revm::database::StateProviderDatabase, EthEvmConfig},
-    node::EthereumNode,
+    node::{api::NodeTypesWithDBAdapter, EthereumNode},
     provider::providers::{BlockchainProvider, ReadOnlyConfig},
 };
 use reth_evm::{execute::Executor, ConfigureEvm};
-use reth_ethereum::node::api::NodeTypesWithDBAdapter;
 use reth_provider::ProviderFactory;
 use reth_revm::{db::State, witness::ExecutionWitnessRecord};
 use reth_storage_api::{
@@ -175,10 +173,7 @@ fn main() -> eyre::Result<()> {
         runtime_handle,
     )?;
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(4)
-        .build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(4).build()?;
 
     rt.block_on(run(cli, spec, factory, signing_key))
 }
@@ -248,16 +243,8 @@ async fn run(
         }
         while cursor < target {
             let next = cursor + 1;
-            match publish_block(
-                &spec,
-                &factory,
-                &s3,
-                &cli,
-                &signing_key,
-                manifest.clone(),
-                next,
-            )
-            .await
+            match publish_block(&spec, &factory, &s3, &cli, &signing_key, manifest.clone(), next)
+                .await
             {
                 Ok(()) => {
                     cursor = next;
@@ -431,8 +418,8 @@ async fn publish_block(
     let sig = signing::sign(signing_key, &encoded);
     let signed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    // 4. Detect reorg vs last-published. If parent_hash doesn't match the manifest's
-    //    entry at (block_number-1), rewind the manifest above (block_number-1).
+    // 4. Detect reorg vs last-published. If parent_hash doesn't match the manifest's entry at
+    //    (block_number-1), rewind the manifest above (block_number-1).
     {
         let mut m = manifest.lock().await;
         if let Some(prev) = m.entries.iter().find(|e| e.block_number == block_number - 1) {
@@ -563,8 +550,8 @@ fn produce_witness(
 ) -> eyre::Result<Produced> {
     let mut attempt = 0u32;
     loop {
-        let outcome = try_produce_witness(spec, factory, block_number)
-            .and_then(|p| self_validate(spec, p));
+        let outcome =
+            try_produce_witness(spec, factory, block_number).and_then(|p| self_validate(spec, p));
         match outcome {
             Ok(p) => return Ok(p),
             Err(e) => {
@@ -573,16 +560,16 @@ fn produce_witness(
                 // when state is mid-flush) and missing-block errors. Self-validation
                 // failures are deterministic for a given block + state-snapshot
                 // combination; retrying them just wastes time — skip fast instead.
-                let retriable = !chain.contains("self-validate")
-                    && (chain.contains("not found")
-                        || chain.contains("not yet persisted")
-                        || chain.contains("nonce too low")
-                        || chain.contains("does not exist")
-                        || chain.contains("missing")
-                        || chain.contains("execute_with_state_closure")
-                        || chain.contains("InsufficientFunds")
-                        || chain.contains("LackOfFundForMaxFee")
-                        || chain.contains("blind node"));
+                let retriable = !chain.contains("self-validate") &&
+                    (chain.contains("not found") ||
+                        chain.contains("not yet persisted") ||
+                        chain.contains("nonce too low") ||
+                        chain.contains("does not exist") ||
+                        chain.contains("missing") ||
+                        chain.contains("execute_with_state_closure") ||
+                        chain.contains("InsufficientFunds") ||
+                        chain.contains("LackOfFundForMaxFee") ||
+                        chain.contains("blind node"));
                 if !retriable || attempt >= max_retries {
                     return Err(e);
                 }
@@ -759,14 +746,13 @@ fn persist_cursor(path: &PathBuf, cursor: u64) {
 
 fn append_stats(path: &PathBuf, line: &serde_json::Value) {
     use std::io::Write;
-    let mut f =
-        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!(err = %e, "stats open failed");
-                return;
-            }
-        };
+    let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(err = %e, "stats open failed");
+            return;
+        }
+    };
     let mut s = line.to_string();
     s.push('\n');
     let _ = f.write_all(s.as_bytes());
