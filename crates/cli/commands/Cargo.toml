@@ -86,7 +86,7 @@ tracing.workspace = true
 backon.workspace = true
 secp256k1 = { workspace = true, features = ["global-context", "std", "recovery"] }
 tokio-stream.workspace = true
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true, features = ["blocking", "json"] }
 url.workspace = true
 metrics.workspace = true
 blake3.workspace = true
