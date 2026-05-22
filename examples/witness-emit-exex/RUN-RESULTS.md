@@ -276,3 +276,228 @@ jq -s '
 3. **Memory baseline** — measured on the v5 deployment under the
    unwind/replay loop. Healthy-execution RSS hasn't been measured.
    Expect lower steady-state RSS (no continuous re-execution of stages).
+
+---
+
+## 2026-05-22 v6 datadir run
+
+The v6 patched-importer datadir (anchor 25143755, with 256 real
+pre-anchor headers backfilled by the importer fix in
+`c9245745d`) was used to run the full pipeline against mainnet.
+
+### Phase 1 — anchor verification
+
+Default reth (`/opt/reth-fork/target/release/reth node`) on the v6
+datadir with a fresh `lighthouse-v6`. After ~7 minutes of zero
+connected EL peers — verified to be the new node bouncing off
+saturated public mainnet peers, not a fork-id issue — the node was
+restarted with prod reth as a `--trusted-peers` loopback enode:
+
+```
+--trusted-peers enode://e5e1d53d…@127.0.0.1:30303
+```
+
+Within ~40 s, staged sync engaged. The Execution stage ran cleanly
+across the previous v5 killer:
+
+```
+03:43:08 Executed block range start=25143756 end=25143791 throughput=118.86 Mgas/s
+03:43:18 Executed block range start=25143792 end=25143859 throughput=193.46 Mgas/s
+03:43:29 Executed block range start=25143860 end=25143925 throughput=194.46 Mgas/s
+03:43:39 Executed block range start=25143926 end=25143989 throughput=204.39 Mgas/s
+```
+
+Block 25143845 (the v5 `block gas used mismatch`) executed inside the
+`25143792..25143859` batch with no error. **Phase 1: PASS** — the
+header-backfill fix in v6 unblocks staged sync past the anchor.
+
+Verify reth was then stopped. Total run length: ~40 s after first
+trusted-peer handshake; 144 blocks executed past the killer.
+
+### Phase 2/3 — ExEx cutover
+
+The pre-existing `reth-witness-emit-node.service` unit had already been
+re-pointed at the v6 datadir (same datadir + same JWT + same authrpc
+port `18557` as Phase 1). One edit was required: add `--no-persist-peers
+--trusted-peers <prod-enode>` (the v6 node otherwise has the same
+public-discovery peer-starvation issue as the Phase 1 verify run).
+
+```
+--port 30404 --discovery.port 30404 --no-persist-peers \
+--trusted-peers enode://e5e1d53d…@127.0.0.1:30303
+```
+
+After `daemon-reload` + `restart reth-witness-emit-node`:
+- staged-sync ran 25143756..25148236 over ~25 min (one full pass through
+  Headers / Bodies / SenderRecovery / Execution / Hashing / MerkleExecute
+  / TransactionLookup / IndexHistory / Finish stages).
+- During staged sync, the ExEx received bulk `ChainCommitted`
+  notifications for the whole range and tried to emit a witness per
+  block. **All 4481 staged-sync blocks were skipped.** See
+  "Staged-sync skip explained" below.
+- At `04:11:42 UTC` reth transitioned to live engine sync. Block
+  25148237 was the first OK witness; the pipeline has been clean since.
+
+`witness-uploader.service` ran continuously throughout — it just sleeps
+when the inbox is empty.
+
+### Phase 4 — 30-min live benchmark (2026-05-22 04:11:42..04:42:42 UTC)
+
+```
+window:          25148237..25148553  (317 blocks)
+ok:              316
+skipped:         1                            (lack-of-funds EVM error, single tx)
+skip rate:       0.32 %
+re-orgs:         0                            (head, safe, finalized all 0)
+invalid blocks:  0
+
+ExEx per-block (notification -> file_durable):
+  e2e         p50=788ms   p90=2127ms  p99=5187ms
+  execute     p50=139ms              p99=1119ms
+  witness_build p50=580ms            p99=4340ms
+  encode      p50=45ms
+  write       p50=6ms
+
+Uploader per-block (file_picked_up -> S3 acked):
+  upload      p50=287ms              p99=4890ms
+  total       p50=345ms              p99=5227ms
+
+Combined chain (ExEx e2e + uploader total):
+  sum         p50=1384ms  p90=3880ms p99=8590ms  mean=1921ms
+
+Witness size:
+  p50=4230 KB  p99=11898 KB
+  tx_count p50=257
+```
+
+### Baseline comparison (publisher sidecar, same workload, prior windows)
+
+```
+publisher 950-sample lifetime window (covers 03:13..03:50 UTC):
+  skip rate:  27.79 %
+  e2e p50:    5981 ms
+  e2e p99:    37493 ms
+
+publisher last-200 sample window (right before our run):
+  skip rate:  30 %
+  e2e p50:    16968 ms
+  e2e p99:    60458 ms
+  skip reasons:  41 × execute_with_state_closure failed
+                 12 × self-validate: state root mismatch
+                  7 × self-validate: validate_bundle
+```
+
+ExEx beats the publisher by **~88× on skip rate** (0.32 % vs ~28 %)
+and **~4–13× on p50 e2e** depending on which publisher window you
+compare to. The lone ExEx skip was a single transaction with `lack of
+funds (0)` — a state-race during the catch-up second when the node
+had just switched from staged to live sync. That single error
+re-deliverable on restart.
+
+### Memory / CPU footprint
+
+Snapshots taken at ~30 min into the live run:
+
+| Process                | RSS     | VmHWM  | CPU% | etime |
+| ---------------------- | ------- | ------ | ---- | ----- |
+| reth-witness-emit-node | 11.0 GB | 11.8 GB | 32.5 | 1h14m |
+| prod reth (reference)  | 8.4 GB  | n/a    | 62.8 | 12h03m|
+| witness-publisher      | 4.0 GB  | n/a    | n/a  | 33m (post-restart) |
+| witness-uploader       | 78 MB   | n/a    | 0.5  | 1h14m |
+
+ExEx reth at 11 GB is ~30 % heavier than prod reth at 8.4 GB. Prod
+runs with `--engine.enable-arena-sparse-trie` and other tuning; ExEx
+reth runs vanilla. The extra ~2.6 GB includes the ExEx's per-block
+`ExecutionWitnessRecord` plus the witness builder's proof-cursor
+working set. Server-wide memory got tight (62 GB total, ~700 MB free,
+full 8 GB swap engaged) but no OOM.
+
+### Validator catch-up
+
+S3 prefix `witnesses/exex/`:
+- 664 objects total (332 `.witness.zst` + 332 `.sig` files)
+- `head.json` last update: 2026-05-22 07:00:43 CEST → block 25148567
+- `head.json.sig` present (64 bytes) — manifest is signed
+
+A cross-validation run from the Mac (`cargo run -p
+example-witness-exec-spike --bin witness-stream`) was NOT executed
+this session — leaving that as the next step for the validator-side
+audit. The on-S3 layout matches what the existing `witnesses/live/`
+prefix uses, so the same stream/validate tooling should work
+unchanged.
+
+### Staged-sync skip explained
+
+All 4481 blocks emitted during the staged-sync catch-up phase failed
+with one of two errors:
+
+1. Block 25143756 (first past anchor): `execute_with_state_closure` →
+   `EVM reported invalid transaction: nonce 34057 too low, expected
+   34145` (diff 88).
+2. Blocks 25143757..25148236 (the rest): `state_by_block_hash(<parent>)`
+   → `no state found for block X`.
+
+Root cause (confirmed by Codex review of `BlockchainProvider`,
+`ConsistentProvider`, `DatabaseProvider::try_into_history_at_block`,
+and the Execution stage post-commit hook):
+
+- The Execution stage commits MDBX state in batches before its
+  post-commit hook fires the `ChainCommitted` notification. By the
+  time the ExEx receives the notification, hashed/plain state has
+  advanced N blocks past the block being asked about.
+- For the anchor hash (25143755), `try_into_history_at_block` sees
+  `25143755 == Finish_stage_checkpoint` and returns
+  `LatestStateProvider`. But "latest" reads the just-advanced state
+  tables → the EVM sees nonces from ~88 blocks later. Hence the
+  off-by-88 nonce error on the first re-execution attempt.
+- For any later in-MDBX historical block hash, `block_number >
+  best_block (=Finish_checkpoint)` returns `BlockNotExecuted`, which
+  `BlockchainProvider::state_by_block_hash` reports as
+  `StateForHashNotFound`. Without account/storage history pruning
+  disabled, bucket-mode datadirs cannot supply per-block historical
+  state for the staged catch-up range.
+
+This is **not** a bug in the witness-emit ExEx; it's a fundamental
+limitation of in-process state lookup for already-committed staged
+blocks on an archive-pruned datadir. The ExEx is a near-tip consumer.
+
+Two follow-ups would harden this:
+
+a. Have the ExEx detect staged-sync notifications (e.g. when
+   `notification.range().len() > N` or when `node.is_syncing()`) and
+   short-circuit them to "ack without emit" so we don't log 4 k
+   spurious error stats lines per restart.
+b. Have the ExEx warn the operator at startup that the first N
+   ChainCommitted notifications will be unprocessable on a freshly-
+   anchored bucket datadir.
+
+### Blockers / open issues
+
+1. **None for the pipeline itself** — clean live run, sub-1 % skip,
+   ~1.4 s end-to-end p50. v6 anchor unblocked everything.
+2. **Memory headroom on relay-archive** is tight; ExEx reth + prod
+   reth + publisher together use ~50 GB of 62 GB. A larger box or
+   trimming the publisher sidecar would give headroom.
+3. **Validator cross-check** still pending — run `witness-stream`
+   from the Mac against `s3://reth-spike-fsn1/witnesses/exex/` to
+   independently verify the produced witnesses are sufficient to
+   re-execute and match expected state roots.
+4. **Staged-sync skip noise** (cosmetic) — 4481 lines of
+   `state_by_block_hash` errors on every fresh node start. Would be
+   nice to suppress (see follow-ups above).
+
+### Files / state on the box
+
+| Path                                                              | Purpose                                       |
+| ----------------------------------------------------------------- | --------------------------------------------- |
+| `/var/lib/reth/reth-bucket-import-test-v6/`                        | the v6 datadir (186 GB)                       |
+| `/var/lib/reth/lighthouse-v6/`                                     | LH-v6 (drives engine API)                     |
+| `/var/log/reth-witness-emit-node.log`                              | ExEx node log                                 |
+| `/var/log/witness-uploader.log`                                    | uploader log                                  |
+| `/var/lib/witness-emit/exex-stats.jsonl`                           | per-block ExEx timing JSONL                   |
+| `/var/lib/witness-emit/uploader-stats.jsonl`                       | per-block upload timing JSONL                 |
+| `/var/lib/witness-emit/inbox/`                                     | files waiting for upload (usually empty)      |
+| `/etc/systemd/system/reth-witness-emit-node.service`               | active, datadir=v6, includes `--trusted-peers`|
+| `/etc/systemd/system/witness-uploader.service`                     | active, prefix=`witnesses/exex/`              |
+| `/tmp/exex-analyze.sh`                                             | one-shot benchmark analysis (jq + python3)    |
+| `s3://reth-spike-fsn1/witnesses/exex/`                             | 664 objects, head.json + .sig at top          |
