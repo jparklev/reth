@@ -56,6 +56,32 @@ prod reth, so loopback discovery is functionally optimal; (b) sharing
 `peers.json` between two reth instances on the same host introduces a write
 race during peer eviction that neither node was designed for.
 
+## Sidecar `witness-publisher.service` — STOPPED + DISABLED
+
+Per task allowance, the sidecar `witness-publisher.service` was stopped
+and disabled. It was the previous-generation publisher running the
+WS+RPC pipeline against prod reth and writing to
+`s3://reth-spike-fsn1/witnesses/live/`.
+
+**Consequences operators should know:**
+
+- `s3://reth-spike-fsn1/witnesses/live/head.json` no longer updates.
+  The most recent entry is from before the disable.
+- The Path D comparison metric "ExEx vs publisher skip rate" is no longer
+  computable in real-time. The numbers from the prior 30-min run
+  (`RUN-RESULTS.md`) remain valid as the canonical comparison.
+- `/var/lib/witness-publisher/` is preserved but stale. The directory can
+  be wiped if disk pressure returns.
+
+To restart the baseline for future comparisons:
+
+```bash
+sudo systemctl enable --now witness-publisher.service
+```
+
+(But note: it had been OOM-killed once before being stopped, so make sure
+the box has enough headroom first.)
+
 ## Edge 2 — Memory headroom, controlled
 
 ### Before (snapshot at session start, 2026-05-22T16:14Z)
