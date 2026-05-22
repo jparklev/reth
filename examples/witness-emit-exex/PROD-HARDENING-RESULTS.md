@@ -389,6 +389,70 @@ state-snapshot race in the producer.
    after stopping the sidecar publisher. Held steady around 12–13G
    throughout the soak. No OOM events.
 
+## Edge Y — Producer-side witness-completeness bug (hotfix shipped)
+
+### Observed
+
+Once the producer recovered from the wedge unwind, ALL three followers
+started failing every block with:
+
+```
+failed to apply blockhash contract call: database error:
+  Database error: missing code for hash
+  0x6e49e66782037c0555897870e29fa5e552daf4719552131a0abce779daec0a5d
+```
+
+That hash is the EIP-2935 `HISTORY_STORAGE_CODE` keccak. Every post-Prague
+mainnet block calls this contract in its prologue (`apply_blockhashes_contract_call`),
+so a witness that omits the bytecode is structurally invalid.
+
+The bug is in reth's `ExecutionWitnessRecord` in `Canonical` mode: it
+populates `record.codes` from `statedb.cache.contracts.values()`, which is
+revm's incidental code-lookup cache. The EIP-2935 system call goes through
+`evm.transact_system_call`, which can complete execution against preloaded
+account state without ever triggering a `code_by_hash` miss — leaving
+`cache.contracts` (and thus the witness) without the system contract code.
+
+We confirmed this independently by running `witness-stream` from the box
+against the same S3 prefix:
+
+```
+block #25151990 ... compute=211ms  size=4.74MiB  ok
+Error: execute block
+Caused by: failed to apply blockhash contract call: database error:
+  missing code for hash 0x6e49e66782037c0555897870e29fa5e552daf4719552131a0abce779daec0a5d
+```
+
+So it's not a follower bug — it's a producer bug that the
+follower-fleet was just first to surface in our soak. The prior
+benchmark (`RUN-RESULTS.md`) happened to land on blocks where revm
+HAD pre-warmed `cache.contracts` for the BLOCKHASH code via earlier
+misses, so the witnesses happened to be valid. The wedge-recovery
+unwind reset the cache topology and exposed the bug.
+
+### Hotfix shipped
+
+`examples/witness-emit-exex/src/exex.rs` — `inject_system_contracts()`
+unconditionally appends the four post-Prague system-contract bytecodes
+(EIP-2935 HISTORY_STORAGE, EIP-4788 BEACON_ROOTS, EIP-7002
+WITHDRAWAL_REQUEST, EIP-7251 CONSOLIDATION_REQUEST) to
+`record.codes` before calling `into_execution_witness`. These are
+constants pinned by the EIPs (the producer cannot get them wrong), so
+including them unconditionally is correct for every Prague-active
+mainnet block. Code size cost: ~3 KB per witness for the four
+bytecodes, dwarfed by the typical 4–7 MB witness.
+
+This patches the symptom in the consumer of `ExecutionWitnessRecord`,
+not the underlying reth-core bug. The proper upstream fix is to change
+`record_executed_state(Canonical)` to walk a more durable set of
+bytecodes — likely all `AccountInfo.code` from touched accounts —
+rather than relying on the lookup cache. That's a real upstream PR
+worth filing.
+
+After the hotfix was deployed at 17:22:52 UTC, the producer started
+emitting fresh witnesses (block 25152256+) that `witness-stream`
+validates cleanly.
+
 ## Open issues — what I would NOT yet trust this to do
 
 1. **Producer wedge requires manual unwind** — the `Invalid block error`
@@ -400,37 +464,54 @@ state-snapshot race in the producer.
    single largest production-readiness gap. **Do not** trust this to run
    unattended through a difficult re-org.
 
-2. **Bucket-mode datadirs have stale account state for some senders** —
+2. **System-contract bytecode injection is a hotfix, not the upstream fix** —
+   the `inject_system_contracts()` workaround is correct for current
+   mainnet but only because we know the four contract bytecodes are
+   pinned. The real bug is `record_executed_state(Canonical)` relying on
+   `statedb.cache.contracts`, which is fragile. A new EIP that adds
+   another system contract requires updating `inject_system_contracts`.
+   File a reth-core issue.
+
+3. **Bucket-mode datadirs have stale account state for some senders** —
    the v6 anchor importer doesn't backfill enough historical state. The
    nonce-6-vs-0 disagreement that triggered the wedge is a symptom. A
    production deployment should either start from a fully-synced archive
    datadir or have the v6 importer extended to backfill account history.
 
-3. **No structured re-emit for orphaned witnesses** — when a reorg
+4. **No structured re-emit for orphaned witnesses** — when a reorg
    happens, the ExEx marks the orphan `.stale` and the uploader skips it.
    The bucket retains the orphaned `.witness.zst` indefinitely. There's
    no GC. Not urgent but worth a janitor.
 
-4. **Reader cursor can drift past producer head on reorg** — because
+5. **Reader cursor can drift past producer head on reorg** — because
    the uploader's `head.json` advances independently of the producer
    restoring after unwind, the follower cursors briefly point at
    blocks > new producer head. The follower handles this fine (waits for
    the producer to emit new entries), but it makes head_lag temporarily
    negative; the metric saturates at 0 so it's invisible to dashboards.
 
-5. **R2 dual-write tail** — one R2 PUT in 106 took 6.35s (TLS cold
+6. **R2 dual-write tail** — one R2 PUT in 106 took 6.35s (TLS cold
    connect). For a low-tail SLO we'd want to wire the
    `aws_smithy_runtime` connection pool to keep an HTTPS connection open
    between PUTs; today every fresh upload may pay a connect cost. Not
    urgent for the current upload cadence (one per 12s).
 
-6. **Memory headroom is policy-only, not policy + actual reservation** —
+7. **Memory headroom is policy-only, not policy + actual reservation** —
    the `MemoryHigh=14G MemoryMax=18G` settings are enforced by the kernel
    only when memory pressure exists. Right now the host has 12G
    available, so the limits never trigger. If postgres or lighthouse
    started growing, the producer would hit `MemoryHigh` and start
    throttling well before they OOM-killed each other. Worth testing
    under deliberate memory pressure before relying on this in anger.
+
+8. **Followers carry the skip-after-failures bandage** — for the
+   pre-hotfix range (25151991–25152255), the only way the followers
+   make progress is to skip every block after 10 retries. That's the
+   right production posture, but it means the historic record has a
+   1-block-resolution gap right around the wedge. If you replay
+   history from `head.json` looking for state divergences, expect
+   `skipped_after_failures` entries in `events.jsonl`; they are
+   producer artifacts, not validator failures.
 
 ## Files / state on the box
 
