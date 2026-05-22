@@ -16,7 +16,7 @@
 
 use alloy_consensus::BlockHeader;
 use alloy_eips::{eip2935, eip4788, eip7002, eip7251};
-use alloy_primitives::{keccak256, B256};
+use alloy_primitives::B256;
 use alloy_rlp::Encodable;
 use eyre::WrapErr;
 use futures_util::StreamExt;
@@ -433,11 +433,12 @@ fn inject_system_contracts(record: &mut ExecutionWitnessRecord) {
         eip7251::CONSOLIDATION_REQUEST_PREDEPLOY_CODE.clone(),
     ] {
         // record.codes is a Vec<Bytes>. Skip if the producer already has it
-        // — saves a few hundred bytes on the wire.
+        // — `into_execution_witness` dedupes too but skipping here keeps
+        // the linear scan O(1) per dedup hit instead of O(n) per dedup
+        // miss inside the witness builder.
         if record.codes.iter().any(|c| c == &code) {
             continue;
         }
-        let _ = keccak256(&code); // assert hashable (zero-cost paranoia).
         record.codes.push(code);
     }
 }
