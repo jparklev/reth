@@ -78,6 +78,25 @@ struct Cli {
     /// Bind a Prometheus `/metrics` endpoint here. `0.0.0.0:0` disables.
     #[arg(long, default_value = "127.0.0.1:19003")]
     metrics_addr: SocketAddr,
+    /// Cloudflare R2 endpoint. When all four R2 flags are set, every witness
+    /// + signature is dual-uploaded to R2 as a CDN-fronted edge cache. R2
+    /// failures NEVER block the Hetzner write or the manifest update;
+    /// Hetzner remains source of truth. Leave unset to disable dual-write.
+    #[arg(long, env = "R2_ENDPOINT")]
+    r2_endpoint: Option<String>,
+    /// Cloudflare R2 bucket name.
+    #[arg(long, env = "R2_BUCKET")]
+    r2_bucket: Option<String>,
+    /// R2 access key id (NOT the global AWS_ACCESS_KEY_ID — R2 uses its
+    /// own credentials).
+    #[arg(long, env = "R2_ACCESS_KEY_ID")]
+    r2_access_key_id: Option<String>,
+    /// R2 secret access key.
+    #[arg(long, env = "R2_SECRET_ACCESS_KEY")]
+    r2_secret_access_key: Option<String>,
+    /// R2 region — always `auto`. Exposed as a flag for parity.
+    #[arg(long, env = "R2_REGION", default_value = "auto")]
+    r2_region: String,
 }
 
 const UPLOAD_TOTAL: &str = "witness_uploader_upload_total";
@@ -88,6 +107,8 @@ const UPLOAD_RETRIES_TOTAL: &str = "witness_uploader_retries_total";
 const UPLOAD_HIGHEST_BLOCK: &str = "witness_uploader_highest_block";
 const UPLOAD_INBOX_DEPTH: &str = "witness_uploader_inbox_depth";
 const UPLOAD_STALE_HANDLED_TOTAL: &str = "witness_uploader_stale_handled_total";
+const R2_UPLOAD_TOTAL: &str = "witness_uploader_r2_upload_total";
+const R2_UPLOAD_LATENCY_SECONDS: &str = "witness_uploader_r2_upload_latency_seconds";
 
 fn describe_metrics() {
     use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
@@ -103,6 +124,15 @@ fn describe_metrics() {
     describe_histogram!(UPLOAD_SIZE_BYTES, Unit::Bytes, "Encoded witness size per upload");
     describe_gauge!(UPLOAD_HIGHEST_BLOCK, "Highest block number whose witness has been published");
     describe_gauge!(UPLOAD_INBOX_DEPTH, "Number of witness files waiting to be uploaded");
+    describe_counter!(
+        R2_UPLOAD_TOTAL,
+        "R2 dual-write outcomes (labelled result=ok|err). Hetzner stays source of truth regardless."
+    );
+    describe_histogram!(
+        R2_UPLOAD_LATENCY_SECONDS,
+        Unit::Seconds,
+        "R2 dual-write latency per witness+sig pair"
+    );
 }
 
 fn main() -> eyre::Result<()> {
@@ -145,6 +175,20 @@ async fn run(cli: Cli, signing_key: ed25519_dalek::SigningKey) -> eyre::Result<(
 
     let s3 = build_s3_client(&cli).await;
 
+    // R2 dual-write is opt-in: enabled only when all four R2 flags are set.
+    // We construct the client up front so per-block uploads don't pay the
+    // credential-resolution cost each tick.
+    let r2 = match maybe_build_r2_client(&cli).await {
+        Some(client) => {
+            info!(bucket = %cli.r2_bucket.as_deref().unwrap_or(""), "R2 dual-write enabled");
+            Some(Arc::new(client))
+        }
+        None => {
+            info!("R2 dual-write disabled (set R2_ENDPOINT/R2_BUCKET/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY to enable)");
+            None
+        }
+    };
+
     // Load the existing manifest from S3, or start empty.
     let manifest = match s3_get(&s3, &cli.bucket, &format!("{}/head.json", cli.prefix)).await {
         Ok(bytes) => serde_json::from_slice::<LiveManifest>(&bytes)
@@ -186,6 +230,7 @@ async fn run(cli: Cli, signing_key: ed25519_dalek::SigningKey) -> eyre::Result<(
             match upload_one(
                 &cli,
                 &s3,
+                r2.as_ref(),
                 &signing_key,
                 manifest.clone(),
                 block_number,
@@ -250,6 +295,7 @@ fn list_witnesses(dir: &Path) -> eyre::Result<Vec<(u64, String, PathBuf)>> {
 async fn upload_one(
     cli: &Cli,
     s3: &aws_sdk_s3::Client,
+    r2: Option<&Arc<aws_sdk_s3::Client>>,
     signing_key: &ed25519_dalek::SigningKey,
     manifest: Arc<Mutex<LiveManifest>>,
     block_number: u64,
@@ -266,11 +312,66 @@ async fn upload_one(
     let witness_key = format!("{}/{}-{}.witness.zst", cli.prefix, block_number, block_hash_hex);
     let sig_key = format!("{witness_key}.sig");
 
-    s3_put_with_retry(s3, &cli.bucket, &witness_key, bytes, cli.upload_retries, cli.public_read)
-        .await?;
+    s3_put_with_retry(
+        s3,
+        &cli.bucket,
+        &witness_key,
+        bytes.clone(),
+        cli.upload_retries,
+        cli.public_read,
+    )
+    .await?;
     s3_put_with_retry(s3, &cli.bucket, &sig_key, sig.to_vec(), cli.upload_retries, cli.public_read)
         .await?;
     let upload_elapsed = started.elapsed();
+
+    // R2 dual-write: fire-and-forget. Hetzner is source of truth; the manifest
+    // update below races nothing against R2. If R2 fails we log + count, but
+    // the head.json still publishes against the Hetzner copy.
+    let r2_upload_ms = if let (Some(client), Some(bucket)) = (r2, cli.r2_bucket.as_deref()) {
+        let r2_started = Instant::now();
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        let wk = witness_key.clone();
+        let sk = sig_key.clone();
+        let wb = bytes.clone();
+        let sb = sig.to_vec();
+        let retries = cli.upload_retries;
+        // We DO `await` here so the per-block stats line includes r2 timing.
+        // Hetzner has already ACKed so the only loss-of-ordering risk is that
+        // R2 lands after the manifest publishes, which is fine: readers
+        // hitting R2 before it's warm just fall back to Hetzner.
+        let res = tokio::spawn(async move {
+            // R2 buckets created via the Cloudflare dashboard generally have
+            // the `r2.dev` public hostname turned on, so we don't set
+            // `public_read=true` here (R2 doesn't honour the AWS ACL header
+            // anyway — it returns InvalidArgument). Visibility is bucket-wide.
+            s3_put_with_retry(&client, &bucket, &wk, wb, retries, false).await?;
+            s3_put_with_retry(&client, &bucket, &sk, sb, retries, false).await?;
+            eyre::Ok(())
+        })
+        .await;
+        let elapsed = r2_started.elapsed();
+        match res {
+            Ok(Ok(())) => {
+                metrics::counter!(R2_UPLOAD_TOTAL, "result" => "ok").increment(1);
+                metrics::histogram!(R2_UPLOAD_LATENCY_SECONDS).record(elapsed.as_secs_f64());
+                Some(elapsed.as_millis())
+            }
+            Ok(Err(err)) => {
+                metrics::counter!(R2_UPLOAD_TOTAL, "result" => "err").increment(1);
+                warn!(block = block_number, ?err, "R2 dual-write failed (Hetzner unaffected)");
+                None
+            }
+            Err(err) => {
+                metrics::counter!(R2_UPLOAD_TOTAL, "result" => "err").increment(1);
+                warn!(block = block_number, ?err, "R2 dual-write task panicked");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // The on-disk filename uses `{block_hash:x}` (no 0x), but the manifest
     // wants a real B256. Parse it back.
@@ -330,6 +431,7 @@ async fn upload_one(
         "upload_ms": upload_elapsed.as_millis(),
         "total_ms": total.as_millis(),
         "sha256": sha,
+        "r2_upload_ms": r2_upload_ms,
     });
     append_stats(&cli.stats, &stats_line);
     info!(
@@ -424,6 +526,37 @@ async fn build_s3_client(cli: &Cli) -> aws_sdk_s3::Client {
     let shared = loader.load().await;
     let s3_config = aws_sdk_s3::config::Builder::from(&shared).force_path_style(true).build();
     aws_sdk_s3::Client::from_conf(s3_config)
+}
+
+/// Build an R2 client only if all four R2 flags are populated. R2 uses its
+/// own credentials (not AWS env vars) so we feed them explicitly via
+/// `Credentials::new`.
+async fn maybe_build_r2_client(cli: &Cli) -> Option<aws_sdk_s3::Client> {
+    let (endpoint, bucket, akid, sak) = match (
+        cli.r2_endpoint.as_deref(),
+        cli.r2_bucket.as_deref(),
+        cli.r2_access_key_id.as_deref(),
+        cli.r2_secret_access_key.as_deref(),
+    ) {
+        (Some(e), Some(b), Some(a), Some(s)) => (e, b, a, s),
+        _ => return None,
+    };
+    let _ = bucket; // bucket is used inside upload_one, not the client.
+
+    let creds = aws_credential_types::Credentials::new(
+        akid.to_string(),
+        sak.to_string(),
+        None,
+        None,
+        "uploader-r2",
+    );
+    let loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(cli.r2_region.clone()))
+        .endpoint_url(endpoint)
+        .credentials_provider(creds);
+    let shared = loader.load().await;
+    let s3_config = aws_sdk_s3::config::Builder::from(&shared).force_path_style(true).build();
+    Some(aws_sdk_s3::Client::from_conf(s3_config))
 }
 
 async fn s3_get(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> eyre::Result<Vec<u8>> {

@@ -24,6 +24,10 @@ export AWS_ACCESS_KEY_ID="${HETZNER_ACCESS_KEY}"
 export AWS_SECRET_ACCESS_KEY="${HETZNER_SECRET_KEY}"
 export RUST_LOG="${RUST_LOG:-info}"
 
+# R2 dual-write is opt-in: the binary checks all four R2_* env vars and
+# enables only if all four are set. Optional vars are passed as empty so the
+# clap `env = "…"` reader sees an empty string (which then fails the
+# Option<String> consume) and the feature stays off.
 exec /usr/local/bin/witness-uploader \
     --emit-dir "${WITNESS_EMIT_DIR}" \
     --signing-key "${SIGNING_KEY}" \
@@ -35,3 +39,6 @@ exec /usr/local/bin/witness-uploader \
     --stats "${UPLOADER_STATS}" \
     --cursor "${UPLOADER_CURSOR}" \
     --metrics-addr "${METRICS_ADDR}"
+    # R2_ENDPOINT / R2_BUCKET / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY /
+    # R2_REGION are picked up automatically from the EnvironmentFile via
+    # clap's `env = "..."` annotations on each flag. Nothing more needed.

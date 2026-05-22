@@ -46,6 +46,7 @@ metrics.workspace = true
 
 # Uploader-only deps.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"], optional = true }
+aws-credential-types = { version = "1", optional = true }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"], optional = true }
 chrono = { workspace = true, features = ["serde"], optional = true }
 ed25519-dalek = { version = "2.2", optional = true }
@@ -62,6 +63,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"], optio
 default = ["uploader"]
 uploader = [
     "dep:aws-config",
+    "dep:aws-credential-types",
     "dep:aws-sdk-s3",
     "dep:chrono",
     "dep:ed25519-dalek",
