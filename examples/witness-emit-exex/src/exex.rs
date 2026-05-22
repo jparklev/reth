@@ -20,6 +20,7 @@ use alloy_primitives::B256;
 use alloy_rlp::Encodable;
 use eyre::WrapErr;
 use futures_util::StreamExt;
+use reth_engine_tree::tree::witness_sink::{self, WitnessRecordEvent};
 use reth_ethereum::{
     exex::{ExExContext, ExExEvent},
     node::api::{FullNodeComponents, NodePrimitives, NodeTypes},
@@ -30,12 +31,23 @@ use reth_revm::{database::StateProviderDatabase, db::State, witness::ExecutionWi
 use reth_storage_api::StateProviderFactory;
 use reth_trie_common::ExecutionWitnessMode;
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Instant,
 };
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::bundle::{encode_bundle, Encoding, WitnessBundle};
+
+/// Max number of side-channel witness records to retain in memory at once.
+///
+/// Each record costs ~tens of MB (codes + keys + hashed state for a full block). We size the cap
+/// to comfortably cover the FCU lag window — typically 1-2 blocks but occasionally larger during
+/// CL sync — plus headroom for short-lived fork blocks. Records evicted past this cap fall back to
+/// re-execution in `emit_block`.
+const MAX_PENDING_RECORDS: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Prometheus metrics
@@ -63,6 +75,14 @@ const EMIT_HIGHEST_BLOCK: &str = "witness_emit_highest_block";
 const EMIT_REORG_TOTAL: &str = "witness_emit_reorg_total";
 /// Counter: blocks marked `.stale` due to a re-org.
 const EMIT_STALE_MARKED_TOTAL: &str = "witness_emit_stale_marked_total";
+/// Counter: per-block sources, labelled `source=sidechannel|reexec`. A 100% `sidechannel` rate is
+/// the V2 target; the `reexec` fallback exists for pipeline-sourced notifications, ring-buffer
+/// evictions under FCU backpressure, and any future BAL-fast-path blocks.
+const EMIT_SOURCE_TOTAL: &str = "witness_emit_source_total";
+/// Gauge: current size of the side-channel pending-records map.
+const EMIT_PENDING_RECORDS: &str = "witness_emit_pending_records";
+/// Counter: side-channel records evicted because the map exceeded `MAX_PENDING_RECORDS`.
+const EMIT_RECORDS_EVICTED: &str = "witness_emit_records_evicted_total";
 
 /// Per-block stats line appended to the `--stats` JSONL file (or stdout if no
 /// stats file is configured).
@@ -77,9 +97,14 @@ struct BlockStats {
     state_nodes: usize,
     codes: usize,
     keys: usize,
-    /// `state_by_block_hash(parent)` latency.
+    /// `"sidechannel"` when the witness record was captured by the in-process engine-tree hook,
+    /// `"reexec"` when we fell back to re-executing the block (typically pipeline backfill or
+    /// startup race).
+    source: &'static str,
+    /// `state_by_block_hash(parent)` latency. Zero on the side-channel path.
     state_open_ms: u128,
-    /// `executor.execute_with_state_closure` latency (full re-execution).
+    /// `executor.execute_with_state_closure` latency (full re-execution). Zero on the side-channel
+    /// path (the record was harvested as a side effect of canonical execution).
     execute_ms: u128,
     /// `into_execution_witness` latency (proof generation + ancestor headers).
     witness_build_ms: u128,
@@ -91,23 +116,57 @@ struct BlockStats {
     e2e_ms: u128,
 }
 
+/// Side-channel cache of witness records produced by the canonical execution hook
+/// (`reth_engine_tree::tree::witness_sink`). The record arrives at `newPayload` validation time,
+/// some delta before the matching `ChainCommitted` notification — usually under a second on
+/// mainnet, but FCU lag can stretch it longer.
+///
+/// We use a `Mutex<HashMap>` rather than draining straight into the notification handler so the
+/// receive side is decoupled from the notification cadence: records keep accumulating between
+/// notifications without holding up the engine thread that wrote them.
+type PendingRecords = Mutex<HashMap<B256, ExecutionWitnessRecord>>;
+
 /// Configurable ExEx.
 pub(crate) struct WitnessEmitExEx<Node: FullNodeComponents> {
     ctx: ExExContext<Node>,
     out_dir: PathBuf,
     stats_path: Option<PathBuf>,
+    /// Drained on every notification, before emitting blocks. `None` only if the engine-tree
+    /// side-channel sender failed to install (e.g. another component already claimed it) — in
+    /// which case the ExEx falls back to V1 re-execution for every block.
+    record_rx: Option<mpsc::UnboundedReceiver<WitnessRecordEvent>>,
+    /// Side-channel records keyed by block hash. Shared so a future state-server / multi-task
+    /// reader can read concurrently without blocking the notification loop.
+    pending: Arc<PendingRecords>,
 }
 
 impl<Node> WitnessEmitExEx<Node>
 where
     Node: FullNodeComponents<Types: NodeTypes<Primitives = EthPrimitives>>,
 {
-    pub(crate) const fn new(
+    /// Builds the ExEx and tries to install the engine-tree side-channel sender. Safe to call
+    /// even if installation fails — the ExEx will simply use V1 re-execution for every block.
+    pub(crate) fn new(
         ctx: ExExContext<Node>,
         out_dir: PathBuf,
         stats_path: Option<PathBuf>,
     ) -> Self {
-        Self { ctx, out_dir, stats_path }
+        let (tx, rx) = mpsc::unbounded_channel::<WitnessRecordEvent>();
+        let record_rx = match witness_sink::install_sender(tx) {
+            Ok(()) => {
+                info!("witness-emit ExEx installed engine-tree side-channel sender");
+                Some(rx)
+            }
+            Err(_) => {
+                warn!(
+                    "witness-emit ExEx could not install the engine-tree side-channel sender \
+                     (already installed by another component). Falling back to V1 re-execution \
+                     for every block."
+                );
+                None
+            }
+        };
+        Self { ctx, out_dir, stats_path, record_rx, pending: Arc::new(Mutex::new(HashMap::new())) }
     }
 
     /// Main loop. Exits when the notification stream is closed.
@@ -145,11 +204,16 @@ where
                 let range = committed.range();
                 debug!(?range, "ChainCommitted");
 
+                // Drain everything the engine-tree hook has produced since the last notification.
+                // We do this once per notification (not per block) to amortise the lock cost.
+                self.drain_records();
+
                 let mut highest_durable: Option<alloy_eips::BlockNumHash> = None;
                 let mut had_failure = false;
                 for block in committed.blocks_iter() {
                     let block_started = Instant::now();
-                    match emit_block(&self.ctx, &self.out_dir, block, block_started) {
+                    match emit_block(&self.ctx, &self.out_dir, &self.pending, block, block_started)
+                    {
                         Ok(stats) => {
                             self.write_stats(&stats);
                             // Histograms accept f64 seconds; the recorder maps
@@ -248,12 +312,63 @@ where
             }
         }
     }
+
+    /// Move every available [`WitnessRecordEvent`] from the channel into [`Self::pending`], then
+    /// evict the oldest entries (by HashMap iteration order) until the map fits under
+    /// [`MAX_PENDING_RECORDS`]. We don't bother with strict LRU because the map is consumed within
+    /// 1-2 notifications; the cap exists purely to bound memory if FCU lags long enough to stack
+    /// up many newPayload runs against one canonical commit.
+    fn drain_records(&mut self) {
+        let Some(rx) = self.record_rx.as_mut() else {
+            return;
+        };
+        let mut received = 0usize;
+        // `try_recv` instead of `recv` so we don't block the engine loop. The channel is unbounded
+        // so try_recv only returns Empty/Disconnected, never blocks.
+        loop {
+            match rx.try_recv() {
+                Ok(event) => {
+                    let mut map = self.pending.lock().expect("pending records mutex poisoned");
+                    map.insert(event.block_hash, event.record);
+                    received += 1;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    warn!("witness_sink receiver disconnected; future blocks will re-execute");
+                    self.record_rx = None;
+                    break;
+                }
+            }
+        }
+
+        let evicted = {
+            let mut map = self.pending.lock().expect("pending records mutex poisoned");
+            let mut evicted = 0usize;
+            while map.len() > MAX_PENDING_RECORDS {
+                // Pop any entry — `HashMap` iteration order is randomized, so this is best-effort.
+                if let Some(key) = map.keys().next().copied() {
+                    map.remove(&key);
+                    evicted += 1;
+                }
+            }
+            metrics::gauge!(EMIT_PENDING_RECORDS).set(map.len() as f64);
+            evicted
+        };
+
+        if received > 0 || evicted > 0 {
+            debug!(received, evicted, "drain_records");
+        }
+        if evicted > 0 {
+            metrics::counter!(EMIT_RECORDS_EVICTED).increment(evicted as u64);
+        }
+    }
 }
 
 /// Emit one block's witness bundle. Returns per-stage timings on success.
 fn emit_block<Node>(
     ctx: &ExExContext<Node>,
     out_dir: &Path,
+    pending: &PendingRecords,
     block: &reth_ethereum::primitives::RecoveredBlock<
         <<Node::Types as NodeTypes>::Primitives as NodePrimitives>::Block,
     >,
@@ -266,31 +381,55 @@ where
     let block_hash = block.hash();
     let parent_hash = block.parent_hash();
 
-    // 1) Snapshot parent state via the in-process consistent provider.
-    let t_state = Instant::now();
-    let state_provider = ctx
-        .provider()
-        .state_by_block_hash(parent_hash)
-        .wrap_err_with(|| format!("state_by_block_hash({parent_hash})"))?;
-    let state_open_ms = t_state.elapsed().as_millis();
+    // 1) Try the side channel first. If the engine-tree hook already captured this block's read
+    // cache during canonical execution, we can skip BOTH `state_by_block_hash` AND the entire
+    // re-execution and save 150-650ms.
+    let cached_record = pending.lock().expect("pending records mutex poisoned").remove(&block_hash);
 
-    // 2) Re-execute. This populates the `State<DB>` cache with EVERY touched account/slot —
-    //    including reads that returned the original value, which are what we need a witness for.
-    let t_exec = Instant::now();
-    let evm_config = ctx.evm_config().clone();
-    let mut db = State::builder()
-        .with_database(StateProviderDatabase::new(&state_provider))
-        .with_bundle_update()
-        .build();
+    let (state_provider, witness_record, source, state_open_ms, execute_ms) =
+        if let Some(record) = cached_record {
+            debug!(block = block_number, "using side-channel witness record");
+            // We still need a state provider to walk the trie in `into_execution_witness`. Open it
+            // here so the cost is attributable.
+            let t_state = Instant::now();
+            let sp = ctx
+                .provider()
+                .state_by_block_hash(parent_hash)
+                .wrap_err_with(|| format!("state_by_block_hash({parent_hash})"))?;
+            let state_open_ms = t_state.elapsed().as_millis();
+            (sp, record, "sidechannel", state_open_ms, 0u128)
+        } else {
+            // Fallback: re-execute. Hit when the side-channel sender isn't installed, the record
+            // was evicted under FCU backpressure, the block came in via pipeline backfill, or a
+            // future BAL fast-path block went through reth's execute_block_bal (which can't emit a
+            // complete read cache today).
+            let t_state = Instant::now();
+            let sp = ctx
+                .provider()
+                .state_by_block_hash(parent_hash)
+                .wrap_err_with(|| format!("state_by_block_hash({parent_hash})"))?;
+            let state_open_ms = t_state.elapsed().as_millis();
 
-    let mut witness_record = ExecutionWitnessRecord::default();
-    let executor = evm_config.executor(&mut db);
-    executor
-        .execute_with_state_closure(block, |statedb: &State<_>| {
-            witness_record.record_executed_state(statedb, ExecutionWitnessMode::Canonical);
-        })
-        .wrap_err("execute_with_state_closure")?;
-    let execute_ms = t_exec.elapsed().as_millis();
+            let t_exec = Instant::now();
+            let evm_config = ctx.evm_config().clone();
+            let mut db = State::builder()
+                .with_database(StateProviderDatabase::new(&sp))
+                .with_bundle_update()
+                .build();
+            let mut witness_record = ExecutionWitnessRecord::default();
+            let executor = evm_config.executor(&mut db);
+            executor
+                .execute_with_state_closure(block, |statedb: &State<_>| {
+                    witness_record.record_executed_state(statedb, ExecutionWitnessMode::Canonical);
+                })
+                .wrap_err("execute_with_state_closure")?;
+            let execute_ms = t_exec.elapsed().as_millis();
+            (sp, witness_record, "reexec", state_open_ms, execute_ms)
+        };
+
+    metrics::counter!(EMIT_SOURCE_TOTAL, "source" => source).increment(1);
+
+    let mut witness_record = witness_record;
 
     // 3) Build the witness (proofs + ancestor headers).
     //
@@ -367,6 +506,7 @@ where
         state_nodes,
         codes: codes_count,
         keys: keys_count,
+        source,
         state_open_ms,
         execute_ms,
         witness_build_ms,
@@ -448,6 +588,12 @@ fn describe_metrics() {
     describe_counter!(EMIT_TOTAL, "ExEx per-block emit attempts");
     describe_counter!(EMIT_REORG_TOTAL, "ChainReverted notifications observed");
     describe_counter!(EMIT_STALE_MARKED_TOTAL, "Witness files renamed to .stale due to a reorg");
+    describe_counter!(
+        EMIT_SOURCE_TOTAL,
+        "Witness record source: sidechannel (V2 canonical hook) or reexec (V1 fallback)"
+    );
+    describe_counter!(EMIT_RECORDS_EVICTED, "Side-channel records evicted under map-size pressure");
+    describe_gauge!(EMIT_PENDING_RECORDS, "Side-channel records currently buffered");
     describe_histogram!(
         EMIT_E2E_SECONDS,
         Unit::Seconds,
