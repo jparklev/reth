@@ -62,6 +62,7 @@ pub mod precompile_cache;
 mod tests;
 mod trie_updates;
 pub mod types;
+pub mod witness_sink;
 
 use crate::{persistence::PersistenceResult, tree::error::AdvancePersistenceError};
 pub use block_buffer::BlockBuffer;

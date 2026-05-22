@@ -45,6 +45,7 @@ use crate::tree::{
     payload_processor::PayloadProcessor,
     precompile_cache::{CachedPrecompile, CachedPrecompileMetrics, PrecompileCacheMap},
     types::{InsertPayloadResult, ValidationOutput},
+    witness_sink::{self, WitnessRecordEvent},
     CacheWaitDurations, CachedStateProvider, EngineApiMetrics, EngineApiTreeState, ExecutionEnv,
     PayloadHandle, StateProviderBuilder, StateProviderDatabase, TreeConfig, WaitForCaches,
 };
@@ -90,8 +91,12 @@ use reth_provider::{
     StageCheckpointReader, StateProvider, StateProviderBox, StateProviderFactory, StateReader,
     StorageChangeSetReader, StorageSettingsCache,
 };
-use reth_revm::db::{states::bundle_state::BundleRetention, BundleAccount, State};
+use reth_revm::{
+    db::{states::bundle_state::BundleRetention, BundleAccount, State},
+    witness::ExecutionWitnessRecord,
+};
 use reth_trie::{trie_cursor::TrieCursorFactory, updates::TrieUpdates, HashedPostState};
+use reth_trie_common::ExecutionWitnessMode;
 use reth_trie_db::ChangesetCache;
 use reth_trie_parallel::root::{ParallelStateRoot, ParallelStateRootError};
 use revm_primitives::{Address, KECCAK_EMPTY};
@@ -573,7 +578,7 @@ where
         // The receipt root task is spawned before execution and receives receipts incrementally
         // as transactions complete, allowing parallel computation during execution.
         let execute_block_start = Instant::now();
-        let (output, senders, receipt_root_rx, built_bal) = if bal_eligible {
+        let (output, senders, receipt_root_rx, built_bal, witness_record) = if bal_eligible {
             let decoded_bal = env.decoded_bal.clone().expect("eligibility implies BAL is present");
             let built_bal = Some(decoded_bal.as_bal().clone().into());
             let provider_builder =
@@ -586,8 +591,12 @@ where
                 decoded_bal,
                 provider_builder,
             ) {
+                // BAL path does not surface a witness record: the canonical `State` here is
+                // populated from the decoded BAL + worker-local executor states (which are
+                // dropped), so its read cache is not a complete tx-level access list. Producers
+                // that need witnesses for BAL blocks must fall back to re-execution.
                 Ok((output, senders, receipt_root_rx)) => {
-                    (output, senders, receipt_root_rx, built_bal)
+                    (output, senders, receipt_root_rx, built_bal, None)
                 }
                 Err(err) => return self.handle_execution_error(input, err, &parent_block),
             }
@@ -854,6 +863,26 @@ where
             let _ = valid_block_tx.send(());
         }
 
+        // Block is fully validated. Ship the captured witness record to the side channel for any
+        // downstream ExEx that opted in via `witness_sink::install_sender`. Best-effort: a closed
+        // receiver or queue pressure is ignored, never blocks consensus.
+        if let Some(record) = witness_record &&
+            let Some(sender) = witness_sink::sender()
+        {
+            let event = WitnessRecordEvent {
+                block_hash: block.hash(),
+                block_number: block.header().number(),
+                record,
+            };
+            if let Err(err) = sender.send(event) {
+                debug!(
+                    target: "engine::tree::payload_validator",
+                    block = %err.0.block_hash,
+                    "witness_sink receiver dropped; record discarded"
+                );
+            }
+        }
+
         // Create the overlay provider NOW, while we're on the engine loop thread and trie changeset
         // eviction cannot race with us. If we deferred this to the background task, persistence
         // could advance and evict changeset cache entries between factory creation and the task
@@ -932,6 +961,10 @@ where
             Vec<Address>,
             ReceiptRootReceiver,
             Option<BlockAccessList>,
+            // Captured iff `witness_sink::is_installed()` returned true at the time of execution.
+            // Sent to the side channel by the caller after post-execution validation passes, so
+            // the channel never carries records for invalid blocks.
+            Option<ExecutionWitnessRecord>,
         ),
         InsertBlockErrorKind,
     >
@@ -1026,6 +1059,17 @@ where
         // Extract the built bal if payload has bal
         let built_bal = if has_bal { db.take_built_alloy_bal() } else { None };
 
+        // Optionally harvest the witness record before consuming the bundle state. We use the
+        // `Canonical` mode here, which reads from `db.cache.contracts`/`db.cache.accounts` —
+        // exactly the same data the V1 re-execution path observes after a full block re-execute.
+        // We skip the allocation entirely when no consumer is installed, so the default path is
+        // unchanged.
+        let witness_record = witness_sink::is_installed().then(|| {
+            debug_span!(target: "engine::tree", "record_witness").in_scope(|| {
+                ExecutionWitnessRecord::from_executed_state(&db, ExecutionWitnessMode::Canonical)
+            })
+        });
+
         let output = BlockExecutionOutput { result, state: db.take_bundle() };
 
         let execution_duration = execution_start.elapsed();
@@ -1033,7 +1077,7 @@ where
         self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
         debug!(target: "engine::tree::payload_validator", elapsed = ?execution_duration, "Executed block");
 
-        Ok((output, senders, result_rx, built_bal))
+        Ok((output, senders, result_rx, built_bal, witness_record))
     }
 
     /// Returns true when the BAL execute path should be used for this block.
