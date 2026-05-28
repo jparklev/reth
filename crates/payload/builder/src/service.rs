@@ -304,8 +304,8 @@ where
         let start = Instant::now();
         debug!(target: "payload_builder", %id, "resolving payload job");
 
-        if let Some((cached, _, payload)) = &*self.cached_payload_rx.borrow() &&
-            *cached == id
+        if let Some((cached, _, payload)) = &*self.cached_payload_rx.borrow()
+            && *cached == id
         {
             self.metrics.resolve_duration_seconds.record(start.elapsed());
             return Some(Box::pin(core::future::ready(Ok(payload.clone()))));
@@ -349,8 +349,8 @@ where
 
     /// Returns the payload timestamp for the given payload.
     fn payload_timestamp(&self, id: PayloadId) -> Option<Result<u64, PayloadBuilderError>> {
-        if let Some((cached_id, timestamp, _)) = *self.cached_payload_rx.borrow() &&
-            cached_id == id
+        if let Some((cached_id, timestamp, _)) = *self.cached_payload_rx.borrow()
+            && cached_id == id
         {
             return Some(Ok(timestamp));
         }
@@ -487,7 +487,7 @@ where
             }
 
             if !new_job {
-                return Poll::Pending
+                return Poll::Pending;
             }
         }
     }

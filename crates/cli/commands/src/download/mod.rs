@@ -512,11 +512,11 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> DownloadCo
             });
         }
 
-        let has_explicit_flags = self.with_txs ||
-            self.with_receipts ||
-            self.with_state_history ||
-            self.with_senders ||
-            self.with_rocksdb;
+        let has_explicit_flags = self.with_txs
+            || self.with_receipts
+            || self.with_state_history
+            || self.with_senders
+            || self.with_rocksdb;
 
         if has_explicit_flags {
             let mut selections = BTreeMap::new();
@@ -695,10 +695,10 @@ fn inject_archive_only_components(
     let is_all =
         |ty: SnapshotComponentType| selections.get(&ty).copied() == Some(ComponentSelection::All);
 
-    let is_archive = is_all(SnapshotComponentType::Transactions) &&
-        is_all(SnapshotComponentType::Receipts) &&
-        is_all(SnapshotComponentType::AccountChangesets) &&
-        is_all(SnapshotComponentType::StorageChangesets);
+    let is_archive = is_all(SnapshotComponentType::Transactions)
+        && is_all(SnapshotComponentType::Receipts)
+        && is_all(SnapshotComponentType::AccountChangesets)
+        && is_all(SnapshotComponentType::StorageChangesets);
 
     if !is_archive {
         return;
@@ -975,8 +975,8 @@ impl<R: Read> Read for ProgressReader<R> {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "download cancelled"));
         }
         let bytes = self.reader.read(buf)?;
-        if bytes > 0 &&
-            let Err(e) = self.progress.update(bytes as u64)
+        if bytes > 0
+            && let Err(e) = self.progress.update(bytes as u64)
         {
             return Err(io::Error::other(e));
         }
@@ -1178,8 +1178,8 @@ fn resumable_download(
     for attempt in 1..=MAX_DOWNLOAD_RETRIES {
         let existing_size = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
 
-        if let Some(total) = total_size &&
-            existing_size >= total
+        if let Some(total) = total_size
+            && existing_size >= total
         {
             return finalize_download(total);
         }
@@ -1426,15 +1426,15 @@ fn blocking_download_and_extract(
 ) -> Result<()> {
     let format = CompressionFormat::from_url(url)?;
 
-    if let Ok(parsed_url) = Url::parse(url) &&
-        parsed_url.scheme() == "file"
+    if let Ok(parsed_url) = Url::parse(url)
+        && parsed_url.scheme() == "file"
     {
         let file_path = parsed_url
             .to_file_path()
             .map_err(|_| eyre::eyre!("Invalid file:// URL path: {}", url))?;
         let result = extract_from_file(&file_path, format, target_dir);
-        if result.is_ok() &&
-            let Some(sp) = shared
+        if result.is_ok()
+            && let Some(sp) = shared
         {
             sp.archive_done();
         }
@@ -1444,8 +1444,8 @@ fn blocking_download_and_extract(
     } else {
         let result =
             streaming_download_and_extract(url, format, target_dir, shared.as_ref(), cancel_token);
-        if result.is_ok() &&
-            let Some(sp) = shared
+        if result.is_ok()
+            && let Some(sp) = shared
         {
             sp.archive_done();
         }
@@ -1766,8 +1766,8 @@ async fn fetch_manifest_from_source(source: &str) -> Result<SnapshotManifest> {
 }
 
 fn resolve_manifest_base_url(manifest: &SnapshotManifest, source: &str) -> Result<String> {
-    if let Some(base_url) = manifest.base_url.as_deref() &&
-        !base_url.is_empty()
+    if let Some(base_url) = manifest.base_url.as_deref()
+        && !base_url.is_empty()
     {
         return Ok(base_url.trim_end_matches('/').to_string());
     }
